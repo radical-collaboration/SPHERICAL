@@ -1,0 +1,476 @@
+{
+  "requests": 800,
+  "queue_tokens": 0,
+  "total_tokens": 13864000,
+  "errors": 0,
+  "t_start": 17035817.527840525,
+  "t_last": 17036021.954893246,
+  "last_requests": 791,
+  "last_tokens": 13846670,
+  "timeseries": [
+    {
+      "timestamp": 1769748488.8925216,
+      "dt": 34.09148097783327,
+      "requests": 48,
+      "tokens": 970480,
+      "req_per_sec": 1.4079763807037373,
+      "tok_per_sec": 28466.935790528398,
+      "total_tokens": 970480,
+      "queue_tokens": 12893520,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748498.8943093,
+      "dt": 10.001828759908676,
+      "requests": 44,
+      "tokens": 762520,
+      "req_per_sec": 4.39919549276524,
+      "tok_per_sec": 76238.05788962162,
+      "total_tokens": 1733000,
+      "queue_tokens": 12131000,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748508.8953404,
+      "dt": 10.001028209924698,
+      "requests": 45,
+      "tokens": 779850,
+      "req_per_sec": 4.499537353103699,
+      "tok_per_sec": 77976.9823292871,
+      "total_tokens": 2512850,
+      "queue_tokens": 11351150,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748518.8961613,
+      "dt": 10.000774789601564,
+      "requests": 43,
+      "tokens": 745190,
+      "req_per_sec": 4.299666866282181,
+      "tok_per_sec": 74513.2267926702,
+      "total_tokens": 3258040,
+      "queue_tokens": 10605960,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748528.897953,
+      "dt": 10.001842636615038,
+      "requests": 45,
+      "tokens": 779850,
+      "req_per_sec": 4.499170966284021,
+      "tok_per_sec": 77970.63284570209,
+      "total_tokens": 4037890,
+      "queue_tokens": 9826110,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748538.8992786,
+      "dt": 10.001335989683867,
+      "requests": 44,
+      "tokens": 762520,
+      "req_per_sec": 4.3994122430628195,
+      "tok_per_sec": 76241.81417227865,
+      "total_tokens": 4800410,
+      "queue_tokens": 9063590,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748548.899806,
+      "dt": 10.000525709241629,
+      "requests": 45,
+      "tokens": 779850,
+      "req_per_sec": 4.499763443277272,
+      "tok_per_sec": 77980.90047199513,
+      "total_tokens": 5580260,
+      "queue_tokens": 8283740,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748558.9004936,
+      "dt": 10.00067688152194,
+      "requests": 40,
+      "tokens": 693200,
+      "req_per_sec": 3.999729265716727,
+      "tok_per_sec": 69315.30817487088,
+      "total_tokens": 6273460,
+      "queue_tokens": 7590540,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748568.9014242,
+      "dt": 10.000942531973124,
+      "requests": 44,
+      "tokens": 762520,
+      "req_per_sec": 4.399585325016269,
+      "tok_per_sec": 76244.81368253194,
+      "total_tokens": 7035980,
+      "queue_tokens": 6828020,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748578.902706,
+      "dt": 10.001282323151827,
+      "requests": 44,
+      "tokens": 762520,
+      "req_per_sec": 4.399435850155437,
+      "tok_per_sec": 76242.22328319371,
+      "total_tokens": 7798500,
+      "queue_tokens": 6065500,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748588.9035614,
+      "dt": 10.000854298472404,
+      "requests": 42,
+      "tokens": 727860,
+      "req_per_sec": 4.199641225291659,
+      "tok_per_sec": 72779.78243430445,
+      "total_tokens": 8526360,
+      "queue_tokens": 5337640,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748598.9057655,
+      "dt": 10.002204809337854,
+      "requests": 45,
+      "tokens": 779850,
+      "req_per_sec": 4.499008054503035,
+      "tok_per_sec": 77967.8095845376,
+      "total_tokens": 9306210,
+      "queue_tokens": 4557790,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748609.2202272,
+      "dt": 10.31445936858654,
+      "requests": 42,
+      "tokens": 727860,
+      "req_per_sec": 4.071953604074892,
+      "tok_per_sec": 70566.95595861788,
+      "total_tokens": 10034070,
+      "queue_tokens": 3829930,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748619.2224283,
+      "dt": 10.002174317836761,
+      "requests": 44,
+      "tokens": 762520,
+      "req_per_sec": 4.39904350812356,
+      "tok_per_sec": 76235.4239957813,
+      "total_tokens": 10796590,
+      "queue_tokens": 3067410,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748629.2250495,
+      "dt": 10.002651788294315,
+      "requests": 44,
+      "tokens": 762520,
+      "req_per_sec": 4.398833522475646,
+      "tok_per_sec": 76231.78494450294,
+      "total_tokens": 11559110,
+      "queue_tokens": 2304890,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748639.2269156,
+      "dt": 10.001865863800049,
+      "requests": 45,
+      "tokens": 779850,
+      "req_per_sec": 4.499160517925899,
+      "tok_per_sec": 77970.45177565583,
+      "total_tokens": 12338960,
+      "queue_tokens": 1525040,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748649.2275338,
+      "dt": 10.000616520643234,
+      "requests": 44,
+      "tokens": 762520,
+      "req_per_sec": 4.3997287476402445,
+      "tok_per_sec": 76247.29919660544,
+      "total_tokens": 13101480,
+      "queue_tokens": 762520,
+      "work_queue_depth": 32,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    },
+    {
+      "timestamp": 1769748659.22804,
+      "dt": 10.000506944954395,
+      "requests": 43,
+      "tokens": 745190,
+      "req_per_sec": 4.2997820247197565,
+      "tok_per_sec": 74515.22248839338,
+      "total_tokens": 13846670,
+      "queue_tokens": 17330,
+      "work_queue_depth": 1,
+      "gpu_stats": {
+        "cuda:0": {
+          "processed": 201
+        },
+        "cuda:1": {
+          "processed": 199
+        },
+        "cuda:2": {
+          "processed": 199
+        },
+        "cuda:3": {
+          "processed": 201
+        }
+      }
+    }
+  ],
+  "gpu_stats": {
+    "cuda:0": {
+      "processed": 201
+    },
+    "cuda:1": {
+      "processed": 199
+    },
+    "cuda:2": {
+      "processed": 199
+    },
+    "cuda:3": {
+      "processed": 201
+    }
+  }
+}

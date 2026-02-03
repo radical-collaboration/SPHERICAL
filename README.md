@@ -1,44 +1,163 @@
+# Spherical
 
-Package radical.template
-========================
+Multi-GPU Inference Service Framework with Worker Pool Management.
 
-This Python package represents a template for new radical python projects.  It
-will place python modules into the `radical` namespace.  It provides an
-installer, testing stubs, module stubs, and a Makefile which supports the most
-common activities.   A Makefile is also used to customize this template to
-a specific project name.
+## Features
 
+- **Multi-GPU Support**: Automatic load balancing across multiple GPUs
+- **Automatic Device Detection**: Detects CUDA GPUs if available, falls back to CPU
+- **Worker Pool Management**: Configurable workers per device
+- **Async Architecture**: Built on asyncio for high throughput
+- **HTTP Server/Client**: aiohttp-based server with health checks
+- **Dragon/Asyncflow Integration**: Optional HPC runtime support for distributed execution
+- **Metrics Collection**: Real-time throughput and device utilization tracking
+- **Extensible**: Base classes for adding new model types
 
-License
--------
+## Installation
 
-This software is released under the
-[LGPL License v3.0](http://opensource.org/licenses/LGPL-3.0).
+```bash
+# Basic installation
+pip install -e .
 
+# With ESM2 model support
+pip install -e ".[esm2]"
 
-Usage
------
+# With Dragon/RADICAL support
+pip install -e ".[dragon]"
 
-* copy or clone this template into a fresh directory
-* call `NAME=my_module make templatize`
+# With development dependencies
+pip install -e ".[dev]"
 
-
-How it works:
--------------
-
-This repository comes with a make files `Makefile` and a set of files which are
-templatized.  The first Makefile will apply a module name to those templates,
-this converting this code tree into a viable, installable and testable python
-module.  This is done by calling:
-
-```
-  NAME=violet make templatize
+# Full installation
+pip install -e ".[esm2,dragon,dev,plotting]"
 ```
 
-The example invocation above would morph the current file hierarchy in this
-directory into a python module named `radical.violet`.
+## Quick Start
 
-Note that the call to `make templatize` will (re)move the original git
-repository, so that the slate is clean for setting up the module's actual git
-origin.  It will also remove the Makefile itself.
+### Running the ESM2 Example
 
+```bash
+# Start server mode (with HTTP endpoints)
+python example/esm2/run_esm2_inference.py --mode server --config_file example/esm2/config.yaml
+
+# Run local inference (no server)
+python example/esm2/run_esm2_inference.py --mode local --config_file example/esm2/config.yaml
+```
+
+### Configuration
+
+Edit `example/esm2/config.yaml` to configure:
+
+```yaml
+# Model Settings
+model_path: "facebook/esm2_t33_650M_UR50D"
+
+# GPU Configuration
+num_services: 1
+num_gpus_per_service: 4
+num_workers_per_gpu: 2
+
+# Server Settings
+server_port: 8000
+
+# Batch Settings
+num_batches: 200
+max_batch_tokens: 16000
+
+# Execution Settings
+debug: true
+engine: dragon      # Enable Dragon HPC runtime
+```
+
+## Architecture
+
+```
+spherical/
+├── src/                       # Core library
+│   ├── inference_service.py   # Base inference service + GPU workers
+│   ├── server.py              # HTTP server endpoints
+│   ├── orchestrator.py        # Multi-node coordination
+│   ├── logger.py              # Logging utilities
+│   └── utils.py               # Helper functions
+├── example/
+│   └── esm2/                  # ESM2 example
+│       ├── client.py          # HTTP client with load balancing
+│       ├── esm2_service.py    # ESM2 service (re-export)
+│       ├── run_esm2_inference.py  # Entry point
+│       └── config.yaml        # Configuration
+├── tests/                     # Unit tests
+└── doc/                       # Documentation
+```
+
+## Extending for New Models
+
+Create a new service by extending `InferenceService`:
+
+```python
+from src.inference_service import InferenceService
+
+class MyModelService(InferenceService):
+    def _load_models(self):
+        """Load your model onto GPUs."""
+        for device in self.devices:
+            self.models[device] = load_model().to(device)
+
+    def process_batch_sync(self, batch_id: int, device: str):
+        """Run inference on a batch."""
+        model = self.models[device]
+        # Process batch...
+        self.reply_store[batch_id] = results
+        self.processed_queue.put_nowait(batch_id)
+
+    async def generate_batch(self) -> tuple:
+        """Generate batches from input queue."""
+        seq = await self.input_queue.get()
+        if seq is None:
+            raise StopAsyncIteration
+        batch = tokenize(seq)
+        return len(batch), batch
+```
+
+## Dragon/Asyncflow Support
+
+For HPC environments, Spherical supports Dragon runtime with asyncflow:
+
+```yaml
+# Enable in config.yaml
+engine: dragon
+dragon_workers: 100
+```
+
+Run with Dragon:
+```bash
+dragon -w ssh --network-config slurm.yaml run_esm2_inference.py
+```
+
+## Metrics & Visualization
+
+Plot inference metrics:
+
+```bash
+python doc/plot_metrics.py --output_dir outputs
+```
+
+## Development
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest
+
+# Run tests with coverage
+pytest --cov=src --cov-report=html
+
+# Lint and format code
+ruff check .
+ruff format .
+```
+
+## License
+
+MIT License

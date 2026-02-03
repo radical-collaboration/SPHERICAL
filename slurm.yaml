@@ -1,0 +1,18 @@
+'0':
+    accelerators: null
+    cpu_devices: null
+    fabric_ep_addr_lens: null
+    fabric_ep_addrs: null
+    fabric_ep_addrs_available: false
+    h_uid: null
+    host_id: 3033758703869854979
+    host_name: r135.ib.bridges2.psc.edu
+    ip_addrs:
+    - 10.8.9.135:6565
+    is_primary: true
+    name: r135.ib.bridges2.psc.edu
+    num_cpus: 0
+    overlay_cd: ''
+    physical_mem: 0
+    shep_cd: ''
+    state: 4

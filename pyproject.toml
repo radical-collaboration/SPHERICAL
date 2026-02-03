@@ -1,6 +1,106 @@
-
 [build-system]
-    requires = ["setuptools"]
-
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "spherical"
+version = "0.1.0"
+description = "Multi-GPU Inference Service Framework with Worker Pool Management"
+
+authors = [
+    {name = "Masha", email = "masha@example.com"},
+]
+maintainers = [
+    {name = "Masha", email = "masha@example.com"},
+]
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "aiohttp>=3.8.0",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/masha/spherical"
+Issues = "https://github.com/masha/spherical/issues"
+
+[project.optional-dependencies]
+# ESM2 model support
+esm2 = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "numpy>=1.24.0",
+]
+
+# Dragon/RADICAL support
+dragon = [
+    "radical.asyncflow",
+    "dragonhpc"
+]
+
+# Development dependencies
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+]
+
+# Documentation
+doc = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.0.0",
+    "mkdocstrings[python]>=0.24.0",
+]
+
+# Plotting/metrics visualization
+plotting = [
+    "matplotlib>=3.7.0",
+    "numpy>=1.24.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+fix = true
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "N", "UP"]
+ignore = ["UP007", "UP045", "E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "gpu: marks tests that require GPU",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "example/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[tool.codespell]
+skip = ".git,.github,__pycache__,build,dist,*.egg-info,cache,outputs"
