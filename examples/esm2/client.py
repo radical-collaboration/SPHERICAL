@@ -278,15 +278,14 @@ class ESM2Client:
                 if self.endpoints:
                     endpoint = next(self.endpoint_cycle)
                     task = self.client_req(batch_id, endpoint)
-                    if batch_count == 1:
+                    if batch_count == 1 and self.debug:
                         # Debug: log the type of task object on first iteration
-                        if self.debug:
-                            self.logger.debug(
-                                f"[Client {self.rank}] Task type: {type(task)}, awaitable: {hasattr(task, '__await__')}"
-                            )
+                        self.logger.debug(
+                            f"[Client {self.rank}] Task type: {type(task)}, awaitable: {hasattr(task, '__await__')}"
+                        )
                     tasks.append(task)
 
-                    if self.debug and batch_count % 500 == 0:
+                    if self.debug and batch_count % 100 == 0:
                         self.logger.debug(f"[Client {self.rank}] Dispatched {batch_count} batches")
 
                     if len(tasks) >= self.max_concurrent:

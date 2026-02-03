@@ -193,14 +193,13 @@ class Logger:
             await asyncio.sleep(0.1)
         try:
             while not service.shutting_down.is_set():
-                await asyncio.sleep(self.metrics_log_interval)
-                # try:
-                #     await asyncio.wait_for(service.shutting_down.wait(), timeout=self.metrics_log_interval)
-                #     break
-                # except asyncio.TimeoutError:
-                #     print('start log')
-                #     pass
-                # print('n', now)
+                #await asyncio.sleep(self.metrics_log_interval)
+                try:
+                    await asyncio.wait_for(service.shutting_down.wait(), timeout=self.metrics_log_interval)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
                 now = time.monotonic()
                 dt = now - self.metrics["t_last"]
                 if dt <= 0:
@@ -211,6 +210,9 @@ class Logger:
                     d_tok = self.metrics["total_tokens"] - self.metrics["last_tokens"]
                     req_s = d_req / dt
                     tok_s = d_tok / dt
+
+                    if req_s == 0 and tok_s:
+                        continue
 
                     record = {
                         "timestamp": time.time(),

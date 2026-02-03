@@ -130,7 +130,7 @@ dragon_workers: 100
 
 Run with Dragon:
 ```bash
-dragon -w ssh --network-config slurm.yaml run_esm2_inference.py
+dragon -w ssh --network-config slurm.yaml run_esm2_infern.py
 ```
 
 ## Metrics & Visualization

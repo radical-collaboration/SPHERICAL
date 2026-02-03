@@ -48,6 +48,8 @@ class ESM2InferenceService(InferenceService):
         super().__init__(config, devices, rank, **kwargs)
 
         # ESM2-specific imports
+        from transformers.utils import logging as hf_logging
+        hf_logging.disable_progress_bar()
         from transformers import EsmModel, EsmTokenizer
 
         self._EsmTokenizer = EsmTokenizer
@@ -72,55 +74,49 @@ class ESM2InferenceService(InferenceService):
         use_cuda = any(isinstance(d, str) and d.startswith("cuda") for d in self.devices)
         dtype = torch.float16 if use_cuda else torch.float32
 
-        if self.model_path.exists() and self.model_path.is_dir():
-            self.logger.info(
-                f"[Service {self.rank}] Loading models from local path: {self.model_path}"
-            )
-            self.tokenizer = self._EsmTokenizer.from_pretrained(self.model_path, use_fast=True)
+        local = self.model_path.exists() and self.model_path.is_dir()
+        model_id = self.model_path if local else str(self.model_path)
+        cache_dir = None
 
-            for i, device in enumerate(self.devices):
-                self.logger.info(
-                    f"[Service {self.rank}] Loading model {i + 1}/{len(self.devices)} on {device}..."
-                )
-                model = self._EsmModel.from_pretrained(
-                    self.model_path,
-                    dtype=dtype,
-                    local_files_only=True,
-                    low_cpu_mem_usage=True,
-                )
-                model = model.to(device)
-                model.eval()
-                self.models[device] = model
-                self.model_initialized[device] = False
-                self.model_init_locks[device] = threading.Lock()
-                self.logger.info(f"[Service {self.rank}] Model loaded successfully on {device}")
+        if local:
+            self.logger.info(
+                f"[Service {self.rank}] Loading models from local path: {model_id}"
+            )
+            tokenizer_kwargs = {"use_fast": True}
+            model_kwargs = {
+                "dtype": dtype,
+                "local_files_only": True,
+                "low_cpu_mem_usage": True,
+            }
         else:
             cache_dir = Path(os.getenv("PROJECT", Path.cwd())) / "cache"
-            model_name = str(self.model_path)
-
             self.logger.info(
-                f"[Service {self.rank}] Loading models '{model_name}' from Hugging Face to {cache_dir}"
+                f"[Service {self.rank}] Loading models '{model_id}' from Hugging Face to {cache_dir}"
             )
-            self.tokenizer = self._EsmTokenizer.from_pretrained(
-                model_name, cache_dir=cache_dir, use_fast=True
+            tokenizer_kwargs = {"use_fast": True, "cache_dir": cache_dir}
+            model_kwargs = {
+                "dtype": dtype,
+                "low_cpu_mem_usage": True,
+                "cache_dir": cache_dir,
+            }
+
+        # tokenizer (once)
+        self.tokenizer = self._EsmTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
+
+        # models (one per device)
+        for i, device in enumerate(self.devices):
+            self.logger.info(
+                f"[Service {self.rank}] Loading model {i + 1}/{len(self.devices)} on {device}..."
             )
 
-            for i, device in enumerate(self.devices):
-                self.logger.info(
-                    f"[Service {self.rank}] Loading model {i + 1}/{len(self.devices)} on {device}..."
-                )
-                model = self._EsmModel.from_pretrained(
-                    model_name,
-                    dtype=dtype,
-                    low_cpu_mem_usage=True,
-                    cache_dir=cache_dir,
-                )
-                model = model.to(device)
-                model.eval()
-                self.models[device] = model
-                self.model_initialized[device] = False
-                self.model_init_locks[device] = threading.Lock()
-                self.logger.info(f"[Service {self.rank}] Model loaded successfully on {device}")
+            model = self._EsmModel.from_pretrained(model_id, **model_kwargs)
+            model.to(device).eval()
+
+            self.models[device] = model
+            self.model_initialized[device] = False
+            self.model_init_locks[device] = threading.Lock()
+
+            self.logger.info(f"[Service {self.rank}] Model loaded successfully on {device}")
 
         self.logger.info(
             f"[Service {self.rank}] Loaded {len(self.models)} models across "

@@ -21,7 +21,8 @@ from radical.asyncflow import WorkflowEngine
 
 from src.logger import Logger
 from src.server import get_app, init_server
-from src.utils import get_devices_for_node, get_slurm_nodes, init_collector
+from src.utils import get_devices_for_node, get_slurm_nodes
+from src.utils import ensure_dir, init_collector
 
 logger = Logger(use_colors=True)
 
@@ -373,9 +374,8 @@ async def init_clients(
         # Initialize telemetry collector if running with dragon
         collect_telemetry = config.get("collect_telemetry", False)
         if collect_telemetry:
-            collector_dir = f"{config['output_dir']}/telemetry-results"
+            collector_dir = ensure_dir(config.get("telemetry_dir", "telemetry-results"))
             collector = init_collector(collector_dir)
-
     else:
         from radical.asyncflow import DaskExecutionBackend
 

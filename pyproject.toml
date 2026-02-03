@@ -36,7 +36,8 @@ esm2 = [
 # Dragon/RADICAL support
 dragon = [
     "radical.asyncflow",
-    "dragonhpc"
+    "dragonhpc",
+    "nvidia-ml-py"
 ]
 
 # Development dependencies

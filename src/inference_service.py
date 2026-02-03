@@ -77,11 +77,12 @@ class InferenceService(ABC):
         self.max_batch_tokens = int(self.config.get("max_batch_tokens", 16000))
         self.num_workers_per_gpu = int(self.config.get("num_workers_per_gpu", 1))
         self.debug = self.config.get("debug", False)
+        self.cancel_io = self.config.get("cancel_io", True)  # Don't wait for all outputs to be saed to disk
         self.use_streaming = self.config.get("use_streaming", False)
-        self.output_dir = ensure_dir(Path(self.config.get("output_dir", "./")))
+        self.output_dir = Path(self.config.get("output_dir", "./"))
         self.results_dir = ensure_dir(
-            Path(self.output_dir, self.config.get("results_dir", "results"))
-        )
+                Path(self.config.get("results_dir", "results"))
+            )
 
         self.logger.info(
             f"[rank {self.rank}] Configuration: "
@@ -187,9 +188,17 @@ class InferenceService(ABC):
             f"[rank {self.rank}] Stopping {len(self.workers)} workers and metrics logging..."
         )
 
+
+        if self.cancel_io:
+            self.logger.info(f"[rank {self.rank}] Clearing queue and signaling exit...")
+            while not self.processed_queue.empty():
+                _ = self.processed_queue.get_nowait()
+                self.processed_queue.task_done()
+
         self.logger.info(f"[rank {self.rank}] Waiting for disk I/O to complete...")
         await self.processed_queue.join()
         await self.processed_queue.put(None)
+
 
         await self.work_queue.join()
         for _ in self.workers:
@@ -316,7 +325,7 @@ class InferenceService(ABC):
                 self.work_queue.put_nowait((batch_id, None))  # None request_id for local mode
                 batch_count += 1
 
-                if self.debug and batch_count % 500 == 0:
+                if self.debug and batch_count % 100 == 0:
                     self.logger.debug(
                         f"[rank {self.rank}] Dispatched {batch_count} batches, "
                         f"work_q depth: {self.work_queue.qsize()}"

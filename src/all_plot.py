@@ -124,14 +124,14 @@ def main(output_dirs: str, rank: int = 0):
 
         # GPU/CPU utilization
         if has_telemetry:
-            for gpu_util_skey in gpu_util_skeys:
+            for i, gpu_util_skey in enumerate(gpu_util_skeys):
                 if gpu_util_skey in gpu_utils and len(gpu_utils[gpu_util_skey]) > 0:
                     non_zero = np.count_nonzero(gpu_utils[gpu_util_skey])
                     print(
                         f"GPU {gpu_util_skey.split('_')[1]}: {non_zero} / {len(gpu_utils[gpu_util_skey])}"
                     )
                     # ax1.plot(ts2_f, gpu_utils[gpu_util_skey], label=f"GPU {gpu_util_skey.split('_')[1]}")
-                    ax1.plot(ts2_f, gpu_utils[gpu_util_skey], label="GPU")
+                    ax1.plot(ts2_f, gpu_utils[gpu_util_skey], label=f"GPU {(i+1)}")
             if cpu_util is not None:
                 ax1.plot(ts2_f, cpu_util, label="CPU")
             ax1.set_ylabel("Utilization (%)")
@@ -159,9 +159,6 @@ def main(output_dirs: str, rank: int = 0):
     means = [tok_per_secs[n][0] for n in gpus]
     stds = [tok_per_secs[n][1] for n in gpus]
 
-    print(means)
-    print(stds)
-
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(
         gpus,
@@ -169,7 +166,6 @@ def main(output_dirs: str, rank: int = 0):
         color=(0.25, 0.25, 0.25),  # dim black
         marker="o",
         linestyle=":",
-        #  label='Mean'
     )
 
     ax.bar(

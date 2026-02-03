@@ -72,7 +72,7 @@ def load_config(config_path: str) -> dict[str, Any]:
     return config
 
 
-def ensure_dir(path: Path) -> Path:
+def ensure_dir(path: Path, clean: bool = True) -> Path:
     """
     Ensure directory exists, creating if necessary and clearing contents.
 
@@ -242,9 +242,21 @@ def init_collector(collector_dir: str) -> Optional[Any]:
         Collector instance or None if not available
     """
     try:
-        from dragon.telemetry import TelemetryCollector
+        from radical.asyncflow import DragonTelemetryCollector
 
         Path(collector_dir).mkdir(parents=True, exist_ok=True)
-        return TelemetryCollector(output_dir=collector_dir)
+
+        collector = DragonTelemetryCollector(
+                    collection_rate=5.0,              # Collect every second
+                    checkpoint_interval=30.0,         # Checkpoint every 30 seconds
+                    checkpoint_dir=collector_dir,     # Save checkpoints here
+                    checkpoint_count=10,              # Keep last 10 checkpoints
+                    enable_cpu=True,
+                    enable_gpu=True,
+                    enable_memory=False,
+                    metric_prefix="SPHERICAL-inference"   # Prefix all metrics
+                )
+        return collector
+
     except ImportError:
         return None
