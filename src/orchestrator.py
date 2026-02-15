@@ -6,6 +6,7 @@ Manages multi-node deployment of inference services.
 
 Features:
 - Launch servers on multiple nodes
+- Dragon process placement for true multi-node deployment
 - Wait for servers to become healthy
 - Create clients for remote inference
 - Graceful shutdown coordination
@@ -37,6 +38,91 @@ __all__ = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Remote server process entry point (Dragon)
+# ---------------------------------------------------------------------------
+
+
+def _server_node_main(config, node_rank, hostname, port, service_class, use_https):
+    """
+    Entry point for a remote server process on a single node.
+
+    Runs a complete, self-contained inference server:
+    1. Detects local GPUs
+    2. Loads model onto devices
+    3. Starts GPU workers (via aiohttp startup handler)
+    4. Starts HTTP server for /health, /generate, etc.
+    5. Blocks until SIGTERM/SIGINT
+
+    Batch preprocessing is handled client-side. The server accepts
+    pre-tokenized batch data in /generate requests.
+
+    Spawned by Dragon with placement policy.
+    """
+    import asyncio
+    import signal
+
+    from aiohttp import web as _web
+
+    from src.logger import Logger as _Logger
+    from src.server import get_app as _get_app, init_server as _init_server
+    from src.utils import get_devices_for_node as _get_devices
+
+    log = _Logger(use_colors=True)
+
+    async def _run():
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+
+        devices = _get_devices(config)
+        if not devices:
+            log.error(f"[Server {node_rank}] No devices found on {hostname}")
+            return
+
+        node_name = f"node{node_rank}_{hostname.split('.')[0]}"
+        log.info(
+            f"[Server {node_rank}] Dragon process starting on {hostname}:{port} "
+            f"with devices {devices}"
+        )
+
+        # 1. Initialize service (loads model onto devices -- slowest step)
+        svc = _init_server(
+            config, devices, node_rank, node_name, hostname, port, service_class
+        )
+
+        # 2. Create HTTP app and trigger startup (starts GPU workers)
+        app = _get_app()
+        runner = _web.AppRunner(app)
+        await runner.setup()
+
+        # 3. Start accepting HTTP connections so health checks pass
+        #    while init_queue runs. Workers are started but idle until
+        #    batch data is ready and /generate requests arrive.
+        site = _web.TCPSite(runner, host="0.0.0.0", port=port)
+        await site.start()
+
+        protocol = "https" if use_https else "http"
+        log.info(f"[Server {node_rank}] HTTP server listening at {protocol}://{hostname}:{port}")
+        log.info(f"[Server {node_rank}] Server ready, waiting for requests")
+
+        # Block until termination signal
+        await stop.wait()
+
+        log.info(f"[Server {node_rank}] Shutting down...")
+        if svc:
+            await svc.shutdown()
+        await runner.cleanup()
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Single server launch (in-process, for non-Dragon path)
+# ---------------------------------------------------------------------------
+
+
 async def launch_server(
     config: dict[str, Any],
     node_rank: int,
@@ -46,7 +132,7 @@ async def launch_server(
     use_https: bool = False,
 ) -> tuple[Optional[str], Optional[Any], Optional[web.AppRunner]]:
     """
-    Launch an inference server on a single node.
+    Launch an inference server on a single node (in-process).
 
     Args:
         config: Configuration dictionary
@@ -59,7 +145,7 @@ async def launch_server(
     Returns:
         Tuple of (endpoint_url, inference_service, app_runner) or (None, None, None) if failed
     """
-    engine = config.get("engine", False).lower()
+    engine = config.get("engine", "").lower()
     if "dragon" in engine and hostname:
         fqdn = hostname
     else:
@@ -102,15 +188,24 @@ async def launch_server(
         return None, None, None
 
 
+# ---------------------------------------------------------------------------
+# Multi-node launch
+# ---------------------------------------------------------------------------
+
+
 async def launch_servers(
     config: dict[str, Any],
     service_class: type[Any],
     nodes: Optional[list[str]] = None,
     base_port: int = 8000,
     use_https: bool = False,
-) -> list[tuple[str, Any, web.AppRunner]]:
+) -> list[tuple[str, Any, Any]]:
     """
-    Launch servers on all available nodes concurrently.
+    Launch servers on all available nodes.
+
+    For Dragon engine: spawns one process per node using Dragon process
+    placement, so each server runs on actual target hardware.
+    Otherwise: launches servers concurrently in the current process.
 
     Args:
         config: Configuration dictionary
@@ -120,7 +215,7 @@ async def launch_servers(
         use_https: Whether to use HTTPS in endpoint URLs
 
     Returns:
-        List of (endpoint, inference_service, runner) tuples for successful launches
+        List of (endpoint, service_or_None, runner_or_process) tuples
     """
     if nodes is None:
         nodes = get_slurm_nodes(config)
@@ -135,6 +230,129 @@ async def launch_servers(
     num_services = config.get("num_services", len(nodes))
     nodes = nodes[:num_services]
 
+    engine = config.get("engine", "").lower()
+
+    if "dragon" in engine:
+        return await _launch_servers_dragon(
+            config, service_class, nodes, base_port, use_https
+        )
+    else:
+        return await _launch_servers_async(
+            config, service_class, nodes, base_port, use_https
+        )
+
+
+async def _launch_servers_dragon(
+    config: dict[str, Any],
+    service_class: type[Any],
+    nodes: list[str],
+    base_port: int,
+    use_https: bool,
+) -> list[tuple[str, None, Any]]:
+    """
+    Launch one server per node using Dragon process placement.
+
+    Each node gets a dedicated Dragon process that:
+    - Runs on the target node's hardware (via placement policy)
+    - Loads the model onto that node's GPUs
+    - Starts GPU workers and HTTP server
+    - Prepares batch data via init_queue
+
+    To avoid pickle errors ("No module named 'src'"), we use subprocess.run
+    as the Dragon Process target (stdlib, always picklable) and have it
+    execute dragon_launcher.py which handles sys.path setup before importing.
+    The launcher uses prctl(PR_SET_PDEATHSIG) so it receives SIGTERM when
+    the parent (subprocess.run) process is terminated by Dragon.
+    """
+    import inspect
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    try:
+        from dragon.native.process import Process
+        from dragon.infrastructure.policy import Policy
+    except ImportError:
+        logger.error(
+            "Dragon is not available. Install Dragon or set engine to 'concurrent'."
+        )
+        return []
+
+    logger.info(f"Using Dragon process placement for {len(nodes)} nodes")
+
+    # Path to the standalone launcher script (avoids pickling src objects)
+    launcher_script = str(Path(__file__).resolve().parent / "dragon_launcher.py")
+
+    # Resolve the directory containing the service module so remote nodes
+    # can import it (e.g. examples/esm2/ for esm2_service.py)
+    service_module_name = service_class.__module__
+    service_class_name = service_class.__name__
+    try:
+        service_file = inspect.getfile(service_class)
+        script_dir = str(Path(service_file).resolve().parent)
+    except (TypeError, OSError):
+        script_dir = os.getcwd()
+
+    # Write config to shared filesystem so remote processes can read it
+    config_dir = Path(config.get("output_dir", "."))
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_json_path = str(config_dir / f"_dragon_config_{os.getpid()}.json")
+    with open(config_json_path, "w") as f:
+        json.dump(config, f)
+    logger.info(f"Config written to {config_json_path}")
+
+    servers = []
+    for rank, hostname in enumerate(nodes):
+        port = base_port + rank
+        protocol = "https" if use_https else "http"
+        endpoint = f"{protocol}://{hostname}:{port}"
+
+        policy = Policy(
+            placement=Policy.Placement.HOST_NAME,
+            host_name=hostname,
+        )
+
+        cmd = [
+            sys.executable,
+            launcher_script,
+            "--config-json", config_json_path,
+            "--node-rank", str(rank),
+            "--hostname", hostname,
+            "--port", str(port),
+            "--service-module", service_module_name,
+            "--service-class", service_class_name,
+            "--script-dir", script_dir,
+        ]
+        if use_https:
+            cmd.append("--use-https")
+
+        # subprocess.run is from stdlib (always picklable by Dragon).
+        # The launcher script uses prctl(PR_SET_PDEATHSIG) to receive
+        # SIGTERM when this parent process is terminated by Dragon.
+        proc = Process(
+            target=subprocess.run,
+            args=(cmd,),
+            policy=policy,
+        )
+        proc.start()
+
+        logger.info(f"[Server {rank}] Dragon process spawned on {hostname}")
+        servers.append((endpoint, None, proc))
+
+    logger.info(f"Spawned {len(servers)} Dragon server processes")
+    return servers
+
+
+async def _launch_servers_async(
+    config: dict[str, Any],
+    service_class: type[Any],
+    nodes: list[str],
+    base_port: int,
+    use_https: bool,
+) -> list[tuple[str, Any, web.AppRunner]]:
+    """Launch servers concurrently in the current process (non-Dragon)."""
     launch_tasks = []
     for rank, hostname in enumerate(nodes):
         port = base_port + rank
@@ -152,6 +370,11 @@ async def launch_servers(
 
     logger.info(f"Successfully launched {len(servers)}/{len(nodes)} servers")
     return servers
+
+
+# ---------------------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------------------
 
 
 async def wait_for_healthy(
@@ -185,21 +408,14 @@ async def wait_for_healthy(
             async with aiohttp.ClientSession() as session:
                 async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        logger.info(
-                            f"{endpoint} - healthy "
-                            f"({data.get('total_workers', 0)} workers, "
-                            f"{len(data.get('devices', []))} GPUs)"
-                        )
                         return True
-                    else:
-                        logger.debug(f"{endpoint} - unhealthy (HTTP {resp.status})")
-                        return False
-        except Exception as e:
-            logger.debug(f"{endpoint} - unreachable ({e})")
+                    return False
+        except Exception:
             return False
 
     healthy = []
+    prev_healthy = -1
+    last_log_time = 0
     while (time.time() - start_time) < timeout:
         health_checks = [check_endpoint(ep) for ep in endpoints]
         health_results = await asyncio.gather(*health_checks)
@@ -210,10 +426,13 @@ async def wait_for_healthy(
             logger.info(f"All {len(healthy)} servers are healthy!")
             return healthy
 
-        if healthy:
-            logger.info(f"{len(healthy)}/{len(endpoints)} servers ready, waiting...")
-        else:
-            logger.info(f"No servers ready yet, waiting {check_interval}s...")
+        elapsed = int(time.time() - start_time)
+        now = time.time()
+        # Log when status changes or every 30s to avoid flooding
+        if len(healthy) != prev_healthy or (now - last_log_time) >= 30:
+            logger.info(f"{len(healthy)}/{len(endpoints)} servers ready, waiting... ({elapsed}s/{timeout}s)")
+            prev_healthy = len(healthy)
+            last_log_time = now
 
         await asyncio.sleep(check_interval)
 
@@ -225,11 +444,18 @@ async def wait_for_healthy(
     return healthy
 
 
+# ---------------------------------------------------------------------------
+# Service handle with Dragon process lifecycle support
+# ---------------------------------------------------------------------------
+
+
 class ServiceHandle:
     """
     Wrapper for a running inference service with its endpoint.
 
-    Provides a clean interface for managing the service lifecycle.
+    Supports two modes:
+    - In-process: holds local service + aiohttp runner
+    - Remote (Dragon): holds client-mode service + remote process reference
     """
 
     def __init__(
@@ -237,26 +463,40 @@ class ServiceHandle:
         endpoint: Optional[str],
         service: Optional[Any],
         runner: Optional[web.AppRunner] = None,
+        dragon_process: Optional[Any] = None,
     ):
         self.endpoint = endpoint
         self.service = service
         self.runner = runner
+        self.dragon_process = dragon_process
 
     async def close(self):
         """Shutdown the service and cleanup resources."""
         logger.separator(title="SHUTTING DOWN SERVERS")
         try:
             logger.info(f"Shutting down {self.endpoint}...")
-            if self.service:
-                await self.service.shutdown()
-            if self.runner:
-                await self.runner.cleanup()
+            if self.dragon_process is not None:
+                # Remote mode (Dragon): terminate the server process
+                self.dragon_process.terminate()
+                self.dragon_process.join(timeout=30)
+                logger.info(f"Remote process for {self.endpoint} terminated")
+            else:
+                # In-process mode: shutdown service and runner locally
+                if self.service and hasattr(self.service, "shutdown"):
+                    await self.service.shutdown()
+                if self.runner:
+                    await self.runner.cleanup()
         except Exception as e:
             logger.error(f"Error shutting down {self.endpoint}: {e}")
 
     def __iter__(self):
         """Allow unpacking as (endpoint, service) for backward compatibility."""
         return iter((self.endpoint, self.service))
+
+
+# ---------------------------------------------------------------------------
+# Service orchestration
+# ---------------------------------------------------------------------------
 
 
 async def start_services_local(
@@ -297,6 +537,10 @@ async def start_services(
     """
     Launch servers on all nodes and wait for them to be healthy.
 
+    For Dragon engine: spawns remote processes, then creates lightweight
+    client-mode service instances for client-side preprocessing.
+    For other engines: launches servers in-process.
+
     Args:
         config: Configuration dictionary
         service_class: service_class subclass to instantiate
@@ -323,17 +567,38 @@ async def start_services(
 
     endpoints = [ep for ep, _, _ in servers]
 
-    healthy_endpoints = await wait_for_healthy(endpoints, timeout=60)
+    health_timeout = config.get("health_check_timeout", 300)
+    healthy_endpoints = await wait_for_healthy(endpoints, timeout=health_timeout)
     if not healthy_endpoints:
         logger.error("No healthy servers available!")
         return []
 
-    handles = [
-        ServiceHandle(ep, svc, runner) for ep, svc, runner in servers if ep in healthy_endpoints
-    ]
+    engine = config.get("engine", "").lower()
+    is_remote = "dragon" in engine
+
+    handles = []
+    for rank, (ep, svc, proc_or_runner) in enumerate(servers):
+        if ep in healthy_endpoints:
+            if is_remote:
+                # Remote mode (Dragon): service lives in remote process.
+                # Create a lightweight client-mode service for client-side
+                # preprocessing (loads tokenizer only, no model/GPU).
+                client_svc = service_class(
+                    config=config, devices=["cpu"], rank=rank, client_mode=True
+                )
+                handles.append(
+                    ServiceHandle(ep, client_svc, None, dragon_process=proc_or_runner)
+                )
+            else:
+                handles.append(ServiceHandle(ep, svc, proc_or_runner))
 
     logger.info(f"{len(handles)} services ready")
     return handles
+
+
+# ---------------------------------------------------------------------------
+# Client initialization
+# ---------------------------------------------------------------------------
 
 
 async def init_clients(

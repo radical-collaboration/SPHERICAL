@@ -24,7 +24,7 @@ inference_service: Optional[InferenceService] = None
 config: dict[str, Any] = {}
 server_info: dict[str, Any] = {}
 
-DEBUG = True
+DEBUG = False
 
 
 async def startup_handler(app: web.Application):
@@ -119,9 +119,13 @@ async def generate_handler(request: web.Request) -> web.Response:
     """
     HTTP POST endpoint for batch inference.
 
-    Request:
+    Request (local mode — batch data pre-stored on server):
         POST /generate
         {"batch_ids": [0, 1, 2, ...], "timeout": 600}
+
+    Request (remote mode — client sends batch data directly):
+        POST /generate
+        {"batch_id": 0, "batch": {"input_ids": [[...]], "attention_mask": [[...]]}, "timeout": 600}
 
     Response:
         {"status": "success", "total": N, "successful": M, "failed": K}
@@ -130,28 +134,35 @@ async def generate_handler(request: web.Request) -> web.Response:
     """
     try:
         data = await request.json()
-        batch_ids = data.get("batch_ids", [])
+        batch_data = data.get("batch", None)
         request_timeout = data.get("timeout", 600)
+
+        # Determine batch IDs: either from "batch_ids" list or single "batch_id"
+        if batch_data is not None:
+            batch_id = data.get("batch_id", 0)
+            batch_ids = [batch_id]
+        else:
+            batch_ids = data.get("batch_ids", [])
 
         if not batch_ids:
             return web.json_response(
-                {"status": "error", "message": "batch_ids is required"}, status=400
+                {"status": "error", "message": "batch_ids or batch_id+batch is required"}, status=400
             )
 
         if DEBUG:
             logger.info(f"[Server] Processing {len(batch_ids)} batches via HTTP POST")
 
         queue_depth = inference_service.work_queue.qsize()
-        if queue_depth > 50:
+        if DEBUG and queue_depth > 50:
             logger.warning(
                 f"[Server] High queue depth: {queue_depth} batches waiting. "
                 f"Consider increasing num_workers_per_gpu or reducing client concurrency."
             )
 
-        async def process_single_batch(batch_id: int) -> dict[str, Any]:
+        async def process_single_batch(batch_id: int, bd: dict = None) -> dict[str, Any]:
             """Process a single batch and return result."""
             try:
-                future = inference_service.submit_batch(batch_id)
+                future = inference_service.submit_batch(batch_id, batch_data=bd)
 
                 inference_timeout = config.get("inference_timeout", 600)
                 timeout = min(request_timeout, inference_timeout)
@@ -175,7 +186,7 @@ async def generate_handler(request: web.Request) -> web.Response:
                 logger.error(f"[Server] Error processing batch {batch_id}: {e}")
                 return {"batch_id": batch_id, "status": "error", "error": str(e)}
 
-        tasks = [process_single_batch(bid) for bid in batch_ids]
+        tasks = [process_single_batch(bid, batch_data) for bid in batch_ids]
         results = await asyncio.gather(*tasks)
 
         failed = [r for r in results if r.get("status") == "error"]

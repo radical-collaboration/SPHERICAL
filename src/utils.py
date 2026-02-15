@@ -20,7 +20,7 @@ from typing import Any, Optional
 import yaml
 
 
-def load_hosts(path: str | Path) -> dict[str, Any]:
+def read_slurm_config(path: str | Path) -> dict[str, Any]:
     with open(path) as f:
         data = yaml.safe_load(f)
 
@@ -58,7 +58,7 @@ def load_config(config_path: str) -> dict[str, Any]:
         "metrics_file_prefix": "metrics",
         "metrics_log_interval": 10,
         "debug": False,
-        "use_dragon": False,
+        "engine": "concurrent",
         "SEQUENCES": [],
     }
 
@@ -85,7 +85,9 @@ def ensure_dir(path: Path, clean: bool = True) -> Path:
     path = Path(path)
 
     if path.exists():
-        shutil.rmtree(path)
+        # ignore_errors: multiple nodes may clean the same shared-filesystem
+        # directory concurrently, so files can disappear mid-iteration.
+        shutil.rmtree(path, ignore_errors=True)
 
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -179,22 +181,19 @@ def get_slurm_nodes(config: dict[str, Any]) -> list[str]:
         List of node hostnames, or ['localhost'] if not in SLURM
     """
 
-    use_dragon = config.get("use_dragon", False)
-    if use_dragon:
+    engine = config.get("engine", "").lower()
+    if "dragon" in engine:
+        # Dragon reads node hostnames from its own slurm.yaml config
         slurm_config = config.get("slurm_config", "slurm.yaml")
-        hosts = load_hosts(slurm_config)
-
-        nodes = []
-        for host in hosts.values():
-            nodes.append(host["host_name"])
-
+        hosts = read_slurm_config(slurm_config)
+        nodes = [host["host_name"] for host in hosts.values()]
         return nodes
 
     else:
+        # Non-Dragon engines: use SLURM env vars directly
         nodelist = os.environ.get("SLURM_JOB_NODELIST")
 
         if not nodelist:
-            print("SLURM_JOB_NODELIST not found, using single node")
             return [socket.getfqdn()]
 
         import subprocess
@@ -259,4 +258,8 @@ def init_collector(collector_dir: str) -> Optional[Any]:
         return collector
 
     except ImportError:
+        return None
+    except Exception as e:
+        # DragonTelemetryCollector requires Dragon runtime (e.g. GS_CD launch param).
+        print(f"[WARN] Telemetry collector unavailable (Dragon runtime not active): {e}")
         return None

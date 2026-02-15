@@ -47,6 +47,7 @@ class InferenceService(ABC):
         config: Optional[dict[str, Any]] = None,
         devices: Optional[list[str]] = None,
         rank: int = 0,
+        client_mode: bool = False,
         **kwargs,
     ):
         """
@@ -56,11 +57,13 @@ class InferenceService(ABC):
             config: Configuration dictionary
             devices: List of GPU devices (e.g., ['cuda:0', 'cuda:1'])
             rank: Process rank
+            client_mode: If True, skip heavy initialization (for client-side preprocessing only)
             **kwargs: Additional configuration
         """
 
         self.rank = rank
         self.config = config or {}
+        self.client_mode = client_mode
         self.logger = Logger(use_colors=True, config=config, rank=rank, devices=devices)
 
         # Multi-GPU device management
@@ -80,7 +83,10 @@ class InferenceService(ABC):
         self.cancel_io = self.config.get("cancel_io", True)  # Don't wait for all outputs to be saed to disk
         self.use_streaming = self.config.get("use_streaming", False)
         self.output_dir = Path(self.config.get("output_dir", "./"))
-        self.results_dir = ensure_dir(
+        if client_mode:
+            self.results_dir = Path(self.config.get("results_dir", "results"))
+        else:
+            self.results_dir = ensure_dir(
                 Path(self.config.get("results_dir", "results"))
             )
 
@@ -127,13 +133,15 @@ class InferenceService(ABC):
         pass
 
     @abstractmethod
-    def process_batch_sync(self, batch_id: int, device: str):
+    def process_batch_sync(self, batch_id: int, device: str, batch_data: Optional[dict] = None):
         """
         Process a single batch synchronously.
 
         Args:
             batch_id: Batch identifier
             device: GPU device to use
+            batch_data: Optional pre-tokenized batch data (for remote mode).
+                        If provided, used directly instead of looking up from storage.
 
         Must be implemented by subclass.
         """
@@ -187,7 +195,6 @@ class InferenceService(ABC):
         self.logger.info(
             f"[rank {self.rank}] Stopping {len(self.workers)} workers and metrics logging..."
         )
-
 
         if self.cancel_io:
             self.logger.info(f"[rank {self.rank}] Clearing queue and signaling exit...")
@@ -285,13 +292,14 @@ class InferenceService(ABC):
             for batch_id in range(self.num_batches):
                 await self.seq_queue.put(batch_id)
 
-            self.logger.info(
-                f"[rank {self.rank}] Pre-allocating batches for {len(self.devices)} devices..."
-            )
-            for device in self.devices:
-                self.device_batches[device] = {
-                    k: v.to(device, non_blocking=True) for k, v in self.single_batch.items()
-                }
+            if not self.client_mode:
+                self.logger.info(
+                    f"[rank {self.rank}] Pre-allocating batches for {len(self.devices)} devices..."
+                )
+                for device in self.devices:
+                    self.device_batches[device] = {
+                        k: v.to(device, non_blocking=True) for k, v in self.single_batch.items()
+                    }
 
         self.shutdown_init.set()
         await asyncio.gather(producer_task)
@@ -322,7 +330,7 @@ class InferenceService(ABC):
                     self.logger.info(f"[rank {self.rank}] Received shutdown sentinel")
                     break
 
-                self.work_queue.put_nowait((batch_id, None))  # None request_id for local mode
+                self.work_queue.put_nowait((batch_id, None, None))  # None request_id, None batch_data for local mode
                 batch_count += 1
 
                 if self.debug and batch_count % 100 == 0:
@@ -340,12 +348,15 @@ class InferenceService(ABC):
         await self.work_queue.join()
         self.logger.info(f"[rank {self.rank}] All work completed")
 
-    def submit_batch(self, batch_id: int) -> asyncio.Future:
+    def submit_batch(self, batch_id: int, batch_data: Optional[dict] = None) -> asyncio.Future:
         """
         Submit a single batch for processing.
 
         Args:
             batch_id: Batch identifier
+            batch_data: Optional pre-tokenized batch data (for remote mode).
+                        If provided, passed through to process_batch_sync instead
+                        of looking up from storage.
 
         Returns:
             Future that resolves with {"status": "success"} or {"status": "error", "error": "..."}
@@ -360,7 +371,7 @@ class InferenceService(ABC):
         request_id = self._request_counter
 
         self.pending_requests[request_id] = future
-        self.work_queue.put_nowait((batch_id, request_id))
+        self.work_queue.put_nowait((batch_id, request_id, batch_data))
 
         return future
 
@@ -415,7 +426,7 @@ class GPUWorker:
                             self.logger.info(f"[Worker {self.worker_id}] Received shutdown signal")
                         break
 
-                    batch_id, request_id = item
+                    batch_id, request_id, batch_data = item
                     self.is_busy = True
 
                     if self.debug:
@@ -426,7 +437,7 @@ class GPUWorker:
                     try:
                         loop = asyncio.get_running_loop()
                         await loop.run_in_executor(
-                            None, self.service.process_batch_sync, batch_id, self.device
+                            None, self.service.process_batch_sync, batch_id, self.device, batch_data
                         )
                         self.processed_count += 1
 

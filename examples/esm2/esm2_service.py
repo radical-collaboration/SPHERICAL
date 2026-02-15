@@ -42,10 +42,11 @@ class ESM2InferenceService(InferenceService):
         config: Optional[dict[str, Any]] = None,
         devices: Optional[list[str]] = None,
         rank: int = 0,
+        client_mode: bool = False,
         **kwargs,
     ):
         """Initialize ESM2 inference service."""
-        super().__init__(config, devices, rank, **kwargs)
+        super().__init__(config, devices, rank, client_mode=client_mode, **kwargs)
 
         # ESM2-specific imports
         from transformers.utils import logging as hf_logging
@@ -62,10 +63,33 @@ class ESM2InferenceService(InferenceService):
         self.tokenizer = None
         self.models: dict[str, Any] = {}
 
-        # Load models
-        self._load_models()
+        if client_mode:
+            self._load_tokenizer()
+        else:
+            self._load_models()
 
         self.logger.info(f"[Service {self.rank}] ESM2InferenceService initialized")
+
+    def _resolve_model_id(self):
+        """Resolve model path and return (model_id, tokenizer_kwargs, cache_dir)."""
+        local = self.model_path.exists() and self.model_path.is_dir()
+        model_id = self.model_path if local else str(self.model_path)
+
+        if local:
+            tokenizer_kwargs = {"use_fast": True}
+            cache_dir = None
+        else:
+            cache_dir = Path(os.getenv("PROJECT", Path.cwd())) / "cache"
+            tokenizer_kwargs = {"use_fast": True, "cache_dir": cache_dir}
+
+        return model_id, tokenizer_kwargs, cache_dir, local
+
+    def _load_tokenizer(self):
+        """Load only the ESM2 tokenizer (for client-side preprocessing)."""
+        model_id, tokenizer_kwargs, _, _ = self._resolve_model_id()
+        self.logger.info(f"[Service {self.rank}] Loading tokenizer only (client mode)")
+        self.tokenizer = self._EsmTokenizer.from_pretrained(model_id, **tokenizer_kwargs)
+        self.logger.info(f"[Service {self.rank}] Tokenizer loaded")
 
     def _load_models(self):
         """Load ESM2 tokenizer and one model instance per GPU."""
@@ -74,26 +98,21 @@ class ESM2InferenceService(InferenceService):
         use_cuda = any(isinstance(d, str) and d.startswith("cuda") for d in self.devices)
         dtype = torch.float16 if use_cuda else torch.float32
 
-        local = self.model_path.exists() and self.model_path.is_dir()
-        model_id = self.model_path if local else str(self.model_path)
-        cache_dir = None
+        model_id, tokenizer_kwargs, cache_dir, local = self._resolve_model_id()
 
         if local:
             self.logger.info(
                 f"[Service {self.rank}] Loading models from local path: {model_id}"
             )
-            tokenizer_kwargs = {"use_fast": True}
             model_kwargs = {
                 "dtype": dtype,
                 "local_files_only": True,
                 "low_cpu_mem_usage": True,
             }
         else:
-            cache_dir = Path(os.getenv("PROJECT", Path.cwd())) / "cache"
             self.logger.info(
                 f"[Service {self.rank}] Loading models '{model_id}' from Hugging Face to {cache_dir}"
             )
-            tokenizer_kwargs = {"use_fast": True, "cache_dir": cache_dir}
             model_kwargs = {
                 "dtype": dtype,
                 "low_cpu_mem_usage": True,
@@ -123,20 +142,25 @@ class ESM2InferenceService(InferenceService):
             f"{len(self.devices)} GPUs in {time.time() - t_start:.2f}s"
         )
 
-    def process_batch_sync(self, batch_id: int, device: str):
+    def process_batch_sync(self, batch_id: int, device: str, batch_data: Optional[dict] = None):
         """
         Run ESM2 model inference on a batch (synchronous).
 
         Args:
             batch_id: Batch identifier
             device: GPU device to use
+            batch_data: Optional pre-tokenized batch data from client (lists of ints).
+                        If provided, used directly instead of looking up from storage.
         """
         if isinstance(device, str) and device.startswith("cuda:"):
             device_id = int(device.split(":")[1])
             torch.cuda.set_device(device_id)
 
         with torch.no_grad():
-            if self.use_streaming:
+            if batch_data is not None:
+                # Remote mode: batch data sent by client
+                batch = {k: torch.tensor(v).to(device) for k, v in batch_data.items()}
+            elif self.use_streaming:
                 batch = self.batch_storage.get(batch_id)
                 if batch is None:
                     raise ValueError(f"Batch {batch_id} not found in storage")
@@ -227,6 +251,9 @@ class ESM2InferenceService(InferenceService):
                     )
                     break
 
+                # Benchmarking optimization: only save first N batches to disk
+                # to avoid I/O bottlenecks during throughput measurement.
+                # Remove or increase this limit for production use.
                 if batch_id > 10:
                     continue
 
@@ -264,8 +291,3 @@ class ESM2InferenceService(InferenceService):
             tasks.append(loop.run_in_executor(self.save_executor, fn))
 
         await asyncio.gather(*tasks)
-
-    # Backwards compatibility alias
-    def embed_sync(self, batch_id: int, device: str):
-        """Alias for process_batch_sync for backwards compatibility."""
-        return self.process_batch_sync(batch_id, device)

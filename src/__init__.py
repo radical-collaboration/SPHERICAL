@@ -16,6 +16,7 @@ from .orchestrator import (
     launch_server,
     launch_servers,
     start_services,
+    start_services_local,
     wait_for_healthy,
 )
 from .server import create_app, get_app, init_server
@@ -34,6 +35,7 @@ __all__ = [
     "launch_servers",
     "wait_for_healthy",
     "start_services",
+    "start_services_local",
     "init_clients",
     "ServiceHandle",
     "load_config",

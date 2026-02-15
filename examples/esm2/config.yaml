@@ -13,7 +13,7 @@ cache_dir: "cache"
 # -----------------------------------------------------------------------------
 num_services: 2   # Not to exceed number of requested nodes
 num_gpus_per_service: 8
-num_workers_per_gpu: 4
+num_workers_per_gpu: 2
 
 # -----------------------------------------------------------------------------
 # Server Settings
@@ -21,10 +21,11 @@ num_workers_per_gpu: 4
 server_port: 8000
 use_https: false
 
+
 # -----------------------------------------------------------------------------
 # Inference Settings
 # -----------------------------------------------------------------------------
-max_concurrent: 400
+max_concurrent: 3200
 timeout: 600
 inference_timeout: 300
 max_retries: 3
@@ -32,9 +33,10 @@ max_retries: 3
 # -----------------------------------------------------------------------------
 # Batch Settings
 # -----------------------------------------------------------------------------
-num_batches: 1600
-max_batch_tokens: 12000
+num_batches: 3200
+max_batch_tokens: 20000
 use_streaming: false
+health_check_timeout: 300  # seconds to wait for servers (default 300)
 
 # -----------------------------------------------------------------------------
 # Output Settings
@@ -56,7 +58,7 @@ SEQUENCES:
   - MVHLTPEEKSAVTALWGKV
 
 # -----------------------------------------------------------------------------
-# Execution Settings
+# Execution Settings (concurrent, dragon)
 # -----------------------------------------------------------------------------
 debug: false
 engine: dragon

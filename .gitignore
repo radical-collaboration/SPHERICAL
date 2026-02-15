@@ -38,3 +38,14 @@ nosetests.xml
 .project
 .pydevproject
 .idea
+
+# Python cache
+__pycache__/
+.pytest_cache/
+
+# Runtime temp files
+_dragon_config_*.json
+
+# Outputs
+plots/
+outputs/

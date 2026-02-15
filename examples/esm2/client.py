@@ -91,6 +91,7 @@ class ESM2Client:
             endpoint: str,
             request_timeout: int,
             retries: int,
+            batch_data: dict = None,
         ) -> dict[str, Any]:
             """
             Submit a single batch for inference via HTTP POST.
@@ -99,10 +100,17 @@ class ESM2Client:
             Returns result dict for aggregation by caller.
             """
             url = f"{endpoint}/generate"
-            payload = {
-                "batch_ids": [batch_id],
-                "timeout": request_timeout,
-            }
+            if batch_data is not None:
+                payload = {
+                    "batch_id": batch_id,
+                    "batch": batch_data,
+                    "timeout": request_timeout,
+                }
+            else:
+                payload = {
+                    "batch_ids": [batch_id],
+                    "timeout": request_timeout,
+                }
 
             last_error = None
             retry_count = 0
@@ -196,9 +204,9 @@ class ESM2Client:
         # Store the task function and create a wrapper
         self._client_req_task = client_req
 
-        def submit_request(batch_id: int, endpoint: str):
+        def submit_request(batch_id: int, endpoint: str, batch_data: dict = None):
             """Wrapper that calls the asyncflow task with proper parameters."""
-            return client_req(batch_id, endpoint, timeout, max_retries)
+            return client_req(batch_id, endpoint, timeout, max_retries, batch_data)
 
         self.client_req = submit_request
 
@@ -264,6 +272,14 @@ class ESM2Client:
         batch_count = 0
         tasks = []
 
+        # For remote mode: prepare batch data to send with requests
+        batch_data_json = None
+        if self.endpoints and hasattr(self.service, "client_mode") and self.service.client_mode:
+            if not self.service.use_streaming and self.service.single_batch is not None:
+                # Non-streaming: same batch for all requests, convert once
+                batch_data_json = {k: v.tolist() for k, v in self.service.single_batch.items()}
+                self.logger.info(f"[Client {self.rank}] Prepared batch data for remote requests")
+
         while True:
             batch_id = await self.service.seq_queue.get()
 
@@ -277,9 +293,19 @@ class ESM2Client:
                 batch_count += 1
                 if self.endpoints:
                     endpoint = next(self.endpoint_cycle)
-                    task = self.client_req(batch_id, endpoint)
+
+                    # Get batch data to send with request
+                    if batch_data_json is not None:
+                        bd = batch_data_json
+                    elif (hasattr(self.service, "client_mode") and self.service.client_mode
+                          and self.service.use_streaming
+                          and batch_id in self.service.batch_storage):
+                        bd = {k: v.tolist() for k, v in self.service.batch_storage[batch_id].items()}
+                    else:
+                        bd = None
+
+                    task = self.client_req(batch_id, endpoint, bd)
                     if batch_count == 1 and self.debug:
-                        # Debug: log the type of task object on first iteration
                         self.logger.debug(
                             f"[Client {self.rank}] Task type: {type(task)}, awaitable: {hasattr(task, '__await__')}"
                         )
@@ -293,7 +319,7 @@ class ESM2Client:
                         tasks = []
                 else:
                     # Local mode - submit directly to work queue
-                    self.service.work_queue.put_nowait((batch_id, None))
+                    self.service.work_queue.put_nowait((batch_id, None, None))
 
             finally:
                 self.service.seq_queue.task_done()
