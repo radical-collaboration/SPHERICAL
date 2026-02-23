@@ -1,6 +1,6 @@
 """Tests for utils module."""
 
-from utils import ensure_dir, get_gpus_for_node, load_config
+from src.inference.utils import ensure_dir, get_gpus_for_node, load_config
 
 
 class TestLoadConfig:

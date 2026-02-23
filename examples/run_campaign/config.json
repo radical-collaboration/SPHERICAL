@@ -1,0 +1,13 @@
+{
+    "run_description": {
+        "nodes": 1
+    },
+    "node_description": {
+        "cores": 64,
+        "gpus":  8
+    },
+    "settings": {
+        "batch_size":  500,
+        "dry_run":     false
+    }
+}

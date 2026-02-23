@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from inference_service import GPUWorker, InferenceService
+from src.inference.inference_service import GPUWorker, InferenceService
 
 
 class ConcreteInferenceService(InferenceService):

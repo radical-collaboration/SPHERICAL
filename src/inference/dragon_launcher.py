@@ -81,7 +81,7 @@ def main():
     service_class = getattr(mod, args.service_class)
 
     # Now import and run the server
-    from src.orchestrator import _server_node_main
+    from src.inference.orchestrator import _server_node_main
     _server_node_main(
         config, args.node_rank, args.hostname, args.port,
         service_class, args.use_https,

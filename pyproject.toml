@@ -62,10 +62,13 @@ plotting = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["src*"]
 
-[tool.setuptools.package-dir]
-"" = "src"
+[tool.pyright]
+pythonVersion = "3.9"
+include = ["."]
+extraPaths = ["."]
 
 [tool.ruff]
 line-length = 100

@@ -12,12 +12,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from client import ESM2Client
-from esm2_service import ESM2InferenceService
-
-from src.logger import Logger
-from src.orchestrator import init_clients, start_services, start_services_local
-from src.utils import load_config
+from src.inference.esm2_service import ESM2Client, ESM2InferenceService
+from src.inference.logger import Logger
+from src.inference.orchestrator import init_clients, start_services, start_services_local
+from src.inference.utils import load_config
 
 logger = Logger(use_colors=True)
 

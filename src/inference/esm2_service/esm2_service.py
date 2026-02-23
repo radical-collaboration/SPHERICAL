@@ -20,7 +20,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
-from src.inference_service import InferenceService
+from ..inference_service import InferenceService
 
 # -----------------------------------------------------------------------------
 # ESM2 Inference Service

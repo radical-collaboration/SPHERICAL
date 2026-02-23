@@ -17,8 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-from src.logger import Logger
-from src.utils import ensure_dir, export_metrics
+from .logger import Logger
+from .utils import ensure_dir, export_metrics
 
 # -----------------------------------------------------------------------------
 # Base Inference Service

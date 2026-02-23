@@ -6,8 +6,8 @@ import pytest
 from aiohttp import web
 
 # Import server module functions (mocking dependencies)
-with patch.dict("sys.modules", {"inference_service": MagicMock()}):
-    from server import create_app, health_handler, info_handler, root_handler
+with patch.dict("sys.modules", {"src.inference.inference_service": MagicMock()}):
+    from src.inference.server import create_app, health_handler, info_handler, root_handler
 
 
 class TestServerHandlers:

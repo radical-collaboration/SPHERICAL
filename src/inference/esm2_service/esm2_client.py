@@ -12,8 +12,8 @@ from typing import Any, Optional
 
 import aiohttp
 
-from src.logger import Logger
-from src.utils import export_metrics
+from ..logger import Logger
+from ..utils import export_metrics
 
 
 class ESM2Client:

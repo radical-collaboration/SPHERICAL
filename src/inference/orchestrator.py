@@ -20,10 +20,9 @@ from typing import Any, Optional
 from aiohttp import web
 from radical.asyncflow import WorkflowEngine
 
-from src.logger import Logger
-from src.server import get_app, init_server
-from src.utils import get_devices_for_node, get_slurm_nodes
-from src.utils import ensure_dir, init_collector
+from .logger import Logger
+from .server import get_app, init_server
+from .utils import get_devices_for_node, get_slurm_nodes, ensure_dir, init_collector
 
 logger = Logger(use_colors=True)
 
@@ -64,9 +63,9 @@ def _server_node_main(config, node_rank, hostname, port, service_class, use_http
 
     from aiohttp import web as _web
 
-    from src.logger import Logger as _Logger
-    from src.server import get_app as _get_app, init_server as _init_server
-    from src.utils import get_devices_for_node as _get_devices
+    from src.inference.logger import Logger as _Logger
+    from src.inference.server import get_app as _get_app, init_server as _init_server
+    from src.inference.utils import get_devices_for_node as _get_devices
 
     log = _Logger(use_colors=True)
 
