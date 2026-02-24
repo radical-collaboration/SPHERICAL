@@ -9,7 +9,6 @@ A framework for building multi-GPU inference services with:
 """
 
 from .inference_service import GPUWorker, InferenceService
-from .logger import Logger
 from .orchestrator import (
     ServiceHandle,
     init_clients,
@@ -27,7 +26,6 @@ __version__ = "0.1.0"
 __all__ = [
     "InferenceService",
     "GPUWorker",
-    "Logger",
     "init_server",
     "create_app",
     "get_app",

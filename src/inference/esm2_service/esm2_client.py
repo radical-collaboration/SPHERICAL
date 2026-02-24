@@ -3,17 +3,29 @@
 ESM2 Inference Client
 
 HTTP client for remote ESM2 inference with load balancing and retry logic.
+
+Resource-aware execution
+------------------------
+An optional ``ResourceManager`` can be passed at construction time.  When
+present, a resource slot is requested from the manager before each
+``client_req`` is submitted.  The asyncio event loop is bridged to the
+thread-safe ``ResourceManager`` callbacks via
+``loop.call_soon_threadsafe``.  If the slot is preempted before being
+granted, ``asyncio.CancelledError`` propagates out of ``run_inference``.
 """
 
 import asyncio
 import itertools
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import aiohttp
 
-from ..logger import Logger
+from ...utils.logger import Logger
 from ..utils import export_metrics
+
+# if TYPE_CHECKING:
+#     from ...campaign.resource_manager import ResourceManager
 
 
 class ESM2Client:
@@ -35,6 +47,7 @@ class ESM2Client:
         service: Optional[Any] = None,
         config: Optional[dict[str, Any]] = None,
         asyncflow: Optional[Any] = None,
+        resource_manager: Optional[Any] = None,
     ):
         """
         Initialize ESM2 client.
@@ -45,6 +58,11 @@ class ESM2Client:
             service: Optional InferenceService for batch generation
             config: Optional configuration dictionary
             asyncflow: Optional AsyncFlow workflow engine
+            resource_manager: Optional ResourceManager for resource-aware
+                scheduling.  When provided, a resource slot is requested
+                before each ``client_req`` is submitted and released after
+                the request completes.  Parameters are read from
+                ``config["resource_manager"]``.
         """
         self.config = config or {}
         self.endpoints = endpoints
@@ -55,6 +73,8 @@ class ESM2Client:
         self.max_retries = self.config.get("max_retries", 3)
         self.service = service
         self.metrics_dir = self.config.get("metrics_dir", "outputs")
+
+        self.tasks_config = config.get("tasks_config", {})
 
         self.flow = asyncflow
         self.logger = Logger(use_colors=True)
@@ -73,6 +93,10 @@ class ESM2Client:
         )
 
         self.debug = config.get("debug", False)
+
+        # ---- resource manager ----------------------------------------
+        self._rm = resource_manager
+
         # Use asyncflow if provided, otherwise use pure asyncio
         if self.flow:
             self._register_client()
@@ -91,7 +115,7 @@ class ESM2Client:
             endpoint: str,
             request_timeout: int,
             retries: int,
-            batch_data: dict = None,
+            batch_data: Optional[dict] = None,
         ) -> dict[str, Any]:
             """
             Submit a single batch for inference via HTTP POST.
@@ -244,8 +268,46 @@ class ESM2Client:
         if self.flow:
             await self.flow.shutdown()
 
-    async def run(self):
-        """Run inference workflow with batch generation and remote submission."""
+    async def init_queue(self) -> None:
+        """
+        Batch-generation stage: populate the sequence queue via the service.
+
+        Call this before :meth:`run_inference` when you want to control the
+        two stages separately (e.g. to interleave with other async work or
+        to gate inference on resource availability).
+        """
+        if self.service is None:
+            self.logger.error(f"[Client {self.rank}] No service provided for batch generation")
+            return
+        self.logger.task_started(f"[rank {self.rank}] Batch generation")
+        await self.service.init_queue()
+        self.logger.task_completed(f"[rank {self.rank}] Batch generation")
+
+    async def run_inference(self) -> None:
+        """
+        Inference stage: drain the sequence queue and dispatch requests.
+
+        If a ``ResourceManager`` was supplied at construction time, a
+        resource slot is requested from it before each ``client_req`` call
+        and released once that request completes.  The slot is identified
+        by ``"batch_<batch_id>"`` and uses the parameters from
+        ``config["resource_manager"]``.
+
+        Raises ``asyncio.CancelledError`` if any resource slot is preempted
+        before being granted.
+        """
+        self.logger.task_started(f"[rank {self.rank}] Remote inference")
+        await self._process_queue()
+        self.logger.task_completed(f"[rank {self.rank}] Remote inference")
+
+    async def run(self) -> None:
+        """
+        Run the full inference workflow: :meth:`init_queue` then
+        :meth:`run_inference`.
+
+        Kept for backwards compatibility; prefer calling the two stages
+        individually when you need finer-grained control.
+        """
         self.logger.info(f"[Client {self.rank}] Starting remote inference")
 
         if self.service is None:
@@ -253,24 +315,65 @@ class ESM2Client:
             return
 
         try:
-            self.logger.task_started(f"[rank {self.rank}] Batch generation")
-            await self.service.init_queue()
-            self.logger.task_completed(f"[rank {self.rank}] Batch generation")
-
-            self.logger.task_started(f"[rank {self.rank}] Remote inference")
-            await self._process_queue()
-            self.logger.task_completed(f"[rank {self.rank}] Remote inference")
-
+            await self.init_queue()
+            await self.run_inference()
         except Exception as e:
             self.logger.error(f"[Client {self.rank}] Error in run(): {e}")
             raise
         finally:
             self.logger.info(f"[Client {self.rank}] Cleanup complete")
 
+    async def _wait_for_resource(self, task_id: str, task_type: str) -> None:
+        """
+        Request a resource slot from the ResourceManager and suspend until
+        it is granted.
+
+        Bridges the thread-safe ResourceManager callbacks to the asyncio
+        event loop via ``loop.call_soon_threadsafe``.
+
+        Raises
+        ------
+        asyncio.CancelledError
+            If the slot is preempted before being granted.
+        """
+        assert self._rm is not None, "_wait_for_resource called without a ResourceManager"
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+
+        def on_granted() -> None:
+            loop.call_soon_threadsafe(fut.set_result, None)
+
+        def on_preempted() -> None:
+            loop.call_soon_threadsafe(
+                fut.set_exception,
+                asyncio.CancelledError(
+                    f"[Client {self.rank}] resource slot {task_id} was preempted"
+                ),
+            )
+
+        cfg = self.tasks_config[task_type]
+        priority    = int(cfg.get("priority", 10))
+        task_cpus        = int(cfg.get("cpus",     1))
+        task_gpus        = float(cfg.get("gpus",   (1.0/self.max_concurrent)))
+
+        self._rm.request(
+            task_id      = task_id,
+            workflow_id  = "infern_workflow",
+            task_type    = task_type,
+            priority     = priority,
+            cpus         = task_cpus,
+            gpus         = task_gpus,
+            on_granted   = on_granted,
+            on_preempted = on_preempted,
+        )
+
+        await fut
+
     async def _process_queue(self):
         """Process batches from seq_queue and dispatch to remote servers."""
         batch_count = 0
-        tasks = []
+        tasks: list     = []
+        task_ids: list[str] = []   # parallel to tasks; populated when _rm is set
 
         # For remote mode: prepare batch data to send with requests
         batch_data_json = None
@@ -287,7 +390,7 @@ class ESM2Client:
                 if batch_id is None:
                     self.logger.info(f"[Client {self.rank}] Received shutdown sentinel")
                     if tasks:
-                        await self._flush_tasks(tasks)
+                        await self._flush_tasks(tasks, task_ids or None)
                     break
 
                 batch_count += 1
@@ -304,6 +407,12 @@ class ESM2Client:
                     else:
                         bd = None
 
+                    # Wait for a resource slot before submitting the request
+                    if self._rm is not None:
+                        tid = f"batch_{batch_id}"
+                        await self._wait_for_resource(tid, 'client_req')
+                        task_ids.append(tid)
+
                     task = self.client_req(batch_id, endpoint, bd)
                     if batch_count == 1 and self.debug:
                         self.logger.debug(
@@ -315,8 +424,9 @@ class ESM2Client:
                         self.logger.debug(f"[Client {self.rank}] Dispatched {batch_count} batches")
 
                     if len(tasks) >= self.max_concurrent:
-                        await self._flush_tasks(tasks)
-                        tasks = []
+                        await self._flush_tasks(tasks, task_ids or None)
+                        tasks    = []
+                        task_ids = []
                 else:
                     # Local mode - submit directly to work queue
                     self.service.work_queue.put_nowait((batch_id, None, None))
@@ -326,8 +436,18 @@ class ESM2Client:
 
         self.logger.info(f"[Client {self.rank}] Dispatched {batch_count} batches total")
 
-    async def _flush_tasks(self, tasks: list):
-        """Wait for a batch of tasks to complete and aggregate metrics."""
+    async def _flush_tasks(
+        self,
+        tasks: list,
+        task_ids: "Optional[list[str]]" = None,
+    ):
+        """
+        Wait for a batch of tasks to complete and aggregate metrics.
+
+        If *task_ids* is provided (parallel list to *tasks*) and a
+        ResourceManager is configured, each slot is released via
+        ``rm.release(task_id)`` after its task finishes.
+        """
         if not tasks:
             return
 
@@ -374,6 +494,9 @@ class ESM2Client:
 
                 self.logger.debug(f"[Client {self.rank}] Traceback: {traceback.format_exc()}")
                 results.append({"status": "error", "error": str(e), "failed": 1})
+            finally:
+                if self._rm is not None and task_ids is not None:
+                    self._rm.release(task_ids[i])
 
         # Aggregate metrics from results
         for r in results:

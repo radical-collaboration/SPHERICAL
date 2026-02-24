@@ -47,5 +47,6 @@ __pycache__/
 _dragon_config_*.json
 
 # Outputs
-plots/
+#plots/
 outputs/
+*out

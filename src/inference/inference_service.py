@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-from .logger import Logger
+from ..utils.logger import Logger
 from .utils import ensure_dir, export_metrics
 
 # -----------------------------------------------------------------------------

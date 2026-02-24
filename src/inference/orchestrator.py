@@ -20,7 +20,7 @@ from typing import Any, Optional
 from aiohttp import web
 from radical.asyncflow import WorkflowEngine
 
-from .logger import Logger
+from ..utils.logger import Logger
 from .server import get_app, init_server
 from .utils import get_devices_for_node, get_slurm_nodes, ensure_dir, init_collector
 
@@ -604,6 +604,7 @@ async def init_clients(
     config: dict[str, Any],
     services: list[ServiceHandle],
     client_class: type,
+    resource_manager=None,
 ) -> tuple[Optional[list[Any]], Optional[Any]]:
     """
     Initialize clients for the given services.
@@ -612,6 +613,7 @@ async def init_clients(
         config: Configuration dictionary
         services: List of ServiceHandle objects from start_services()
         client_class: Client class to instantiate
+        resource_manager: Optional ResourceManager for priority-based resource allocation
 
     Returns:
         Tuple of (list of client instances, telemetry collector or None)
@@ -623,12 +625,12 @@ async def init_clients(
     if "concurrent" in engine:
         from concurrent.futures import ProcessPoolExecutor
 
-        from radical.asyncflow import ConcurrentExecutionBackend
+        from rhapsody.backends import ConcurrentExecutionBackend
 
         engine = await ConcurrentExecutionBackend(ProcessPoolExecutor())
         engine_name = "ConcurrentExecutionBackend"
     elif "dragon" in engine:
-        from radical.asyncflow import DragonExecutionBackendV3
+        from rhapsody.backends import DragonExecutionBackendV3
 
         dragon_workers = config.get("dragon_workers", 100)
         engine = await DragonExecutionBackendV3(
@@ -641,7 +643,7 @@ async def init_clients(
             collector_dir = ensure_dir(config.get("telemetry_dir", "telemetry-results"))
             collector = init_collector(collector_dir)
     else:
-        from radical.asyncflow import DaskExecutionBackend
+        from rhapsody.backends import DaskExecutionBackend
 
         engine = await DaskExecutionBackend()
         engine_name = "DaskExecutionBackend"
@@ -665,6 +667,7 @@ async def init_clients(
                     service=service,
                     config=config,
                     asyncflow=asyncflow,
+                    resource_manager=resource_manager,
                 )
                 clients.append(client)
             else:
@@ -675,6 +678,7 @@ async def init_clients(
                         service=service,
                         config=config,
                         asyncflow=asyncflow,
+                        resource_manager=resource_manager,
                     )
                     clients.append(client)
                     await service.start_workers()

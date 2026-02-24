@@ -87,6 +87,8 @@ class Logger:
         return f"{color}{text}{Colors.RESET}" if self.use_colors else text
 
     def _format_message(self, level, component, message, task_name=None):
+        if task_name is None:
+            task_name=self.name
         timestamp = self._colorize(datetime.now().strftime("%H:%M:%S.%f")[:-3], Colors.DIM)
         colored_level = self._colorize(
             f"[{level.value}]", self.level_colors.get(level, Colors.WHITE)
@@ -111,22 +113,32 @@ class Logger:
         stream.flush()
 
     def debug(self, message, component="manager", task_name=None):
+        if task_name is None:
+            task_name=self.name
         formatted = self._format_message(LogLevel.DEBUG, component, message, task_name)
         self._write_log(formatted)
 
     def info(self, message, component="manager", task_name=None):
+        if task_name is None:
+            task_name=self.name
         formatted = self._format_message(LogLevel.INFO, component, message, task_name)
         self._write_log(formatted)
 
     def warning(self, message, component="manager", task_name=None):
+        if task_name is None:
+            task_name=self.name
         formatted = self._format_message(LogLevel.WARNING, component, message, task_name)
         self._write_log(formatted)
 
     def error(self, message, component="manager", task_name=None):
+        if task_name is None:
+            task_name=self.name
         formatted = self._format_message(LogLevel.ERROR, component, message, task_name)
         self._write_log(formatted, to_stderr=True)
 
     def critical(self, message, component="manager", task_name=None):
+        if task_name is None:
+            task_name=self.name
         formatted = self._format_message(LogLevel.CRITICAL, component, message, task_name)
         self._write_log(formatted, to_stderr=True)
 
