@@ -255,6 +255,7 @@ class ESM2InferenceService(InferenceService):
                 # to avoid I/O bottlenecks during throughput measurement.
                 # Remove or increase this limit for production use.
                 if batch_id > 10:
+                    self.reply_store.pop(batch_id, None)
                     continue
 
                 if batch_id in self.reply_store:

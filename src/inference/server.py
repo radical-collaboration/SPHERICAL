@@ -61,7 +61,7 @@ async def root_handler(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "service": "Inference Server",
-            "version": "2.0",
+            "version": "1.0",
             "endpoints": {
                 "health": "/health",
                 "info": "/info",

@@ -89,6 +89,8 @@ class Logger:
     def _format_message(self, level, component, message, task_name=None):
         if task_name is None:
             task_name=self.name
+        if component == "manager":
+            component = self.name
         timestamp = self._colorize(datetime.now().strftime("%H:%M:%S.%f")[:-3], Colors.DIM)
         colored_level = self._colorize(
             f"[{level.value}]", self.level_colors.get(level, Colors.WHITE)
@@ -218,13 +220,15 @@ class Logger:
                     continue
 
                 async with self.metrics_lock:
+
+                    if self.metrics["requests"] == self.metrics["last_requests"] and \
+                        self.metrics["total_tokens"] == self.metrics["last_tokens"]:
+                        continue
+
                     d_req = self.metrics["requests"] - self.metrics["last_requests"]
                     d_tok = self.metrics["total_tokens"] - self.metrics["last_tokens"]
                     req_s = d_req / dt
                     tok_s = d_tok / dt
-
-                    if req_s == 0 and tok_s:
-                        continue
 
                     record = {
                         "timestamp": time.time(),

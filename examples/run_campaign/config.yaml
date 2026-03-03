@@ -12,21 +12,21 @@ cache_dir: "cache"
 # GPU / Service Configuration
 # -----------------------------------------------------------------------------
 num_services: 1   # Not to exceed number of requested nodes
-num_gpus_per_service: 1
+num_gpus_per_service: 4
 num_cpus_per_service: 64
-num_workers_per_gpu: 1
+num_workers_per_gpu: 4
 
 # -----------------------------------------------------------------------------
 # Server Settings
 # -----------------------------------------------------------------------------
-server_port: 8000
+server_port: 8001
 use_https: false
 
 
 # -----------------------------------------------------------------------------
 # Inference Settings
 # -----------------------------------------------------------------------------
-max_concurrent: 3200
+max_concurrent: 800
 timeout: 600
 inference_timeout: 300
 max_retries: 3
@@ -34,7 +34,7 @@ max_retries: 3
 # -----------------------------------------------------------------------------
 # Batch Settings
 # -----------------------------------------------------------------------------
-num_batches: 32
+num_batches: 1600
 max_batch_tokens: 20000
 use_streaming: false
 health_check_timeout: 300  # seconds to wait for servers (default 300)

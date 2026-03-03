@@ -41,6 +41,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple
 from ..utils.logger import Logger
 
+# Guard against floating-point rounding when comparing GPU amounts.
+# Many small additions/subtractions (e.g. 800 × 0.00125) accumulate error
+# that can make an "essentially equal" value compare as strictly less-than.
+_GPU_EPS: float = 1e-9
+
 
 # ---------------------------------------------------------------------------
 # Internal dataclasses
@@ -97,6 +102,7 @@ class ResourceManager:
 
         self._running: Dict[str, _RunningTask] = {}
         self._pending: List[_Request]          = []   # min-heap
+        self._logged_pending: set              = set()  # task_ids already logged as queued
 
         self._lock = threading.Lock()
         self._seq  = itertools.count()
@@ -106,7 +112,7 @@ class ResourceManager:
         self._log.info(
             f"ResourceManager initialised: total_cpus={total_cpus} total_gpus={total_gpus}"
         )
-        self.debug = True
+        self.debug = False
 
     # ------------------------------------------------------------------
     # Properties
@@ -130,9 +136,8 @@ class ResourceManager:
         with self._lock:
             return self._avail_gpus
 
-    @property
-    def running_tasks(self) -> List[dict]:
-        """Snapshot of all currently running tasks (safe to iterate)."""
+    def running_tasks(self, workflow_id: str = None) -> List[dict]:
+        """Snapshot of running tasks, optionally filtered by *workflow_id*."""
         with self._lock:
             return [
                 {
@@ -144,8 +149,8 @@ class ResourceManager:
                     "gpus":       t.gpus,
                 }
                 for t in self._running.values()
+                if workflow_id is None or t.workflow_id == workflow_id
             ]
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -185,14 +190,13 @@ class ResourceManager:
             Called if this task is preempted after being granted.
             Resources are freed automatically; do **not** call ``release``.
         """
-        self._log.debug(
-            f"request: task_id={task_id} wf={workflow_id} type={task_type} "
-            f"priority={priority} cpus={cpus} gpus={gpus} "
-            f"[avail cpus={self.available_cpus} gpus={self.available_gpus} ")
+
         if self.debug:
             self._log.debug(
-            f"running={self._running.keys()} pending={self._pending}]"
-        )
+                f"request: task_id={task_id} wf={workflow_id} type={task_type} "
+                f"priority={priority} cpus={cpus} gpus={gpus} "
+                f"[avail cpus={self.available_cpus} gpus={self.available_gpus}]"
+            )
         req = _Request(
             neg_priority = -priority,
             seq          = next(self._seq),
@@ -213,9 +217,37 @@ class ResourceManager:
 
         No-op if the task was already preempted or is unknown.
         """
-        self._log.debug(f"release: task_id={task_id}")
         granted, preempted = self._release_locked(task_id)
         _fire(granted, preempted)
+
+    def release_by_workflow(self, workflow_id: str) -> int:
+        """
+        Release all *running* tasks for ``workflow_id``.
+
+        Use this when a workflow exits without calling ``release`` for each
+        task (e.g. the workflow completed normally but never cleaned up its
+        RM slots).  Returns the number of tasks released.
+        """
+        with self._lock:
+            to_release = [t for t in list(self._running.values())
+                          if t.workflow_id == workflow_id]
+            for task in to_release:
+                self._avail_cpus += task.cpus
+                self._avail_gpus += task.gpus
+                del self._running[task.task_id]
+                if self.debug:
+                    self._log.debug(
+                        f"release_by_workflow: released task_id={task.task_id} "
+                        f"cpus={task.cpus} gpus={task.gpus} "
+                        f"→ avail cpus={self._avail_cpus} gpus={self._avail_gpus}"
+                    )
+            granted, preempted = self._try_dispatch_locked()
+        _fire(granted, preempted)
+        if self.debug:
+            self._log.debug(
+                f"release_by_workflow: workflow_id={workflow_id} released={len(to_release)}"
+            )
+        return len(to_release)
 
     def cancel(self, task_id: str) -> bool:
         """
@@ -229,6 +261,7 @@ class ResourceManager:
             removed = len(self._pending) < before
             if removed:
                 heapq.heapify(self._pending)
+                self._logged_pending.discard(task_id)
         if removed:
             self._log.debug(f"cancel: removed pending task_id={task_id}")
         else:
@@ -243,14 +276,64 @@ class ResourceManager:
         """
         with self._lock:
             before = len(self._pending)
+            removed_ids = {r.task_id for r in self._pending if r.workflow_id == workflow_id}
             self._pending = [r for r in self._pending if r.workflow_id != workflow_id]
             removed = before - len(self._pending)
             if removed:
                 heapq.heapify(self._pending)
+                self._logged_pending -= removed_ids
         self._log.info(
             f"cancel_by_workflow: workflow_id={workflow_id} removed={removed}"
         )
         return removed
+
+    def close(self) -> None:
+        """
+        Shut down the ResourceManager.
+
+        - Cancels all *pending* requests: their ``on_preempted`` callbacks
+          are fired so that any coroutines blocked in ``_wait_for_resource``
+          are unblocked and can clean up.
+        - Preempts all *running* tasks: their ``on_preempted`` callbacks are
+          fired so the callers know the slot has been reclaimed.
+        - Resets available resources back to totals.
+
+        After ``close`` the manager is in a clean idle state and must not
+        be used for new requests.
+        """
+        self._log.info(
+            f"close: cancelling {len(self._pending)} pending, "
+            f"preempting {len(self._running)} running"
+        )
+
+        with self._lock:
+            # Collect pending requests — fire on_preempted to unblock waiters.
+            pending_to_notify = list(self._pending)
+            self._pending.clear()
+            self._logged_pending.clear()
+
+            # Collect running tasks — fire on_preempted to notify callers.
+            running_to_notify = list(self._running.values())
+            self._running.clear()
+
+            # Reset resource counters.
+            self._avail_cpus = self._total_cpus
+            self._avail_gpus = self._total_gpus
+
+        # Fire callbacks outside the lock.
+        for req in pending_to_notify:
+            try:
+                req.on_preempted()
+            except Exception as exc:
+                self._log.warning(f"close: on_preempted error for pending {req.task_id}: {exc}")
+
+        for task in running_to_notify:
+            try:
+                task.on_preempted()
+            except Exception as exc:
+                self._log.warning(f"close: on_preempted error for running {task.task_id}: {exc}")
+
+        self._log.info("close: done")
 
     # ------------------------------------------------------------------
     # Internal — lock-acquiring wrappers
@@ -271,11 +354,14 @@ class ResourceManager:
             if task is not None:
                 self._avail_cpus += task.cpus
                 self._avail_gpus += task.gpus
-                self._log.debug(
-                    f"released: task_id={task_id} cpus={task.cpus} gpus={task.gpus} → avail cpus={self._avail_cpus} gpus={self._avail_gpus}",
-                )
+                if self.debug:
+                    self._log.debug(
+                        f"released: task_id={task_id} cpus={task.cpus} gpus={task.gpus} → avail cpus={self._avail_cpus} gpus={self._avail_gpus}",
+                    )
             else:
-                self._log.debug(f"release: task_id={task_id} not in running (already preempted?)")
+                if self.debug:
+                    self._log.warning(f"release: task_id={task_id} not in running (already preempted?)")
+
             return self._try_dispatch_locked()
 
     # ------------------------------------------------------------------
@@ -296,7 +382,7 @@ class ResourceManager:
         while self._pending:
             req = self._pending[0]
 
-            if self._avail_cpus >= req.cpus and self._avail_gpus >= req.gpus:
+            if self._avail_cpus >= req.cpus and self._avail_gpus >= req.gpus - _GPU_EPS:
                 heapq.heappop(self._pending)
                 self._grant_locked(req)
                 granted.append(req)
@@ -321,22 +407,31 @@ class ResourceManager:
                     self._grant_locked(req)
                     granted.append(req)
                 else:
-                    self._log.debug(
-                        f"queued: task_id={req.task_id} wf={req.workflow_id} type={req.task_type} priority={-req.neg_priority} "
-                        f"(need cpus={req.cpus} gpus={req.gpus}, avail cpus={self._avail_cpus} gpus={self._avail_gpus}, no eligible victims)",
-                    )
+                    if req.task_id not in self._logged_pending:
+                        self._logged_pending.add(req.task_id)
+                        if self.debug:
+                            self._log.debug(
+                                f"queued: task_id={req.task_id} wf={req.workflow_id} type={req.task_type} priority={-req.neg_priority} "
+                                f"(need cpus={req.cpus} gpus={req.gpus}, avail cpus={self._avail_cpus} gpus={self._avail_gpus}, no eligible victims)",
+                            )
                     break   # head can't run; lower-priority items won't either
 
         return granted, preempted
 
     def _grant_locked(self, req: _Request) -> None:
         """Reserve resources and record as running.  Lock MUST be held."""
+        self._logged_pending.discard(req.task_id)
         self._avail_cpus -= req.cpus
         self._avail_gpus -= req.gpus
-        self._log.info(
-            f"granted: task_id={req.task_id} wf={req.workflow_id} type={req.task_type} priority={-req.neg_priority} cpus={req.cpus} gpus={req.gpus} "
-            f"→ avail cpus={self._avail_cpus} gpus={self._avail_gpus}",
-        )
+        # Snap tiny negative values to 0 to prevent floating-point drift
+        # accumulation (e.g. 800 × 0.00125 = 1.0 but introduces ~1e-16 error).
+        if self._avail_gpus < 0 and abs(self._avail_gpus) < _GPU_EPS:
+            self._avail_gpus = 0.0
+        if self.debug:
+            self._log.debug(
+                f"granted: task_id={req.task_id} wf={req.workflow_id} type={req.task_type} priority={-req.neg_priority} cpus={req.cpus} gpus={req.gpus} "
+                f"→ avail cpus={self._avail_cpus} gpus={self._avail_gpus}",
+            )
         self._running[req.task_id] = _RunningTask(
             task_id      = req.task_id,
             workflow_id  = req.workflow_id,
@@ -373,7 +468,7 @@ class ResourceManager:
             freed_cpus += task.cpus
             freed_gpus += task.gpus
             if (self._avail_cpus + freed_cpus >= cpus_need and
-                    self._avail_gpus + freed_gpus >= gpus_need):
+                    self._avail_gpus + freed_gpus >= gpus_need - _GPU_EPS):
                 return victims
 
         return []   # cannot satisfy even by preempting all candidates
