@@ -12,33 +12,23 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.campaign import ResourceManager
 from src.inference.esm2_service import ESM2Client, ESM2InferenceService
 from src.utils.logger import Logger
 from src.inference.orchestrator import init_clients, start_services, start_services_local
 from src.inference.utils import load_config
-from radical.asyncflow import WorkflowEngine
 
 logger = Logger(use_colors=True)
 
 
 async def main(config_file: str, mode: str):
     config = load_config(config_file)
-    ddsim_config = config.get("ddsim_config", {})
-
-    num_services = config.get("num_services", 1)
-    num_gpus_per_service = config.get("num_gpus_per_service", 1)
-    num_cpus_per_service = config.get("num_cpus_per_service", 1)
-    total_gpus = num_gpus_per_service * num_services
-    total_cpus = num_cpus_per_service * num_services
-    rm = ResourceManager(total_cpus=total_cpus, total_gpus=total_gpus)
 
     if mode == "server":
         services = await start_services(config, ESM2InferenceService)
     else:
         services = await start_services_local(config, ESM2InferenceService)
 
-    clients, collector = await init_clients(config, services, ESM2Client, resource_manager=rm)
+    clients, collector = await init_clients(config, services, ESM2Client)
     if collector:
         collector.start()
 
@@ -46,7 +36,6 @@ async def main(config_file: str, mode: str):
         if clients is None:
             logger.error("Unable to initiate clients")
         else:
-
             await asyncio.gather(
                 asyncio.gather(*(client.run() for client in clients)),
             )
@@ -66,8 +55,6 @@ async def main(config_file: str, mode: str):
 
         if collector:
             collector.stop()
-
-        rm.close()
 
     print("All work has been completed...")
 

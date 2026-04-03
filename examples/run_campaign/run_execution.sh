@@ -1,7 +1,8 @@
 #!/bin/sh -l
 
-export BASE_DIR="/ocean/projects/dmr170002p/goliyad/DeepDriveSim"
-export WORK_DIR="${BASE_DIR}/pipelines/ddmd_pipeline"
+export BASE_DIR="${PROJECT}"
+export DDSim_DIR="${BASE_DIR}/DeepDriveSim"
+export WORK_DIR="${DDSim_DIR}/pipelines/ddmd_pipeline"
 export CONDA_ENV="${WORK_DIR}/conda_env"
 export INPUT_DIR="${WORK_DIR}/data"
 
@@ -23,8 +24,8 @@ source activate base
 
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
-conda activate /ocean/projects/dmr170002p/goliyad/conda_env/test_inf
-cd /ocean/projects/dmr170002p/goliyad/htp/SPHERICAL/examples/run_campaign
+conda activate ${BASE_DIR}/conda_env/test_inf
+cd ${BASE_DIR}/htp/SPHERICAL/examples/run_campaign
 
 python run_esm2_infern.py
 

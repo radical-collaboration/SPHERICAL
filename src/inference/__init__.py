@@ -8,18 +8,22 @@ A framework for building multi-GPU inference services with:
 - Multi-node orchestration
 """
 
-from .inference_service import GPUWorker, InferenceService
-from .orchestrator import (
-    ServiceHandle,
-    init_clients,
-    launch_server,
-    launch_servers,
-    start_services,
-    start_services_local,
-    wait_for_healthy,
-)
-from .server import create_app, get_app, init_server
 from .utils import ensure_dir, export_metrics, get_devices_for_node, get_slurm_nodes, load_config
+
+try:
+    from .inference_service import GPUWorker, InferenceService
+    from .orchestrator import (
+        ServiceHandle,
+        init_clients,
+        launch_server,
+        launch_servers,
+        start_services,
+        start_services_local,
+        wait_for_healthy,
+    )
+    from .server import create_app, get_app, init_server
+except (ModuleNotFoundError, AttributeError):
+    pass
 
 __version__ = "0.1.0"
 

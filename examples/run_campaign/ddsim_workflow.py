@@ -1,134 +1,83 @@
 """
-DDSimWorkflow — DeepDriveMD-style simulation campaign workflow.
+DDSimWorkflow — runs DummyWorkflow as a subprocess using dummy_workflow conda env.
 
-Pipeline
---------
-    simulation → train_model → training → selection → inference
-
-Each stage is a method on this class.  The first stage (simulation) uses
-an ``after_simulation`` override to demonstrate conditional branching before
-the chain continues.  All other stages chain automatically via TaskSpec
-on_completion strings.
+DummyWorkflow depends on rose (ML surrogate library) which lives only in the
+dummy_workflow env.  DDSimWorkflow launches run_dummy.py via dummy_workflow
+Python and communicates the ready signal via a sentinel file.
 """
 
-import time
+import asyncio
+import json
+import sys
+import tempfile
+from pathlib import Path
 
-from src.campaign import BaseWorkflow, TaskSpec
+from src.campaign import BaseWorkflow
+
+_DDSIM_ROOT = Path("/ocean/projects/dmr170002p/goliyad/DeepDriveSim")
+_RUN_DUMMY  = _DDSIM_ROOT / "workflows/dummy_workflow/run_dummy.py"
+_DUMMY_PYTHON = Path("/ocean/projects/dmr170002p/goliyad/conda_env/dummy_workflow/bin/python")
 
 
 class DDSimWorkflow(BaseWorkflow):
     """
-    Five-stage iterative ML/simulation workflow.
+    Async wrapper that runs one DummyWorkflow replica in a subprocess.
 
-    Stage order  (priority 9 → 5):
-      simulation → train_model → training → selection → inference
+    The subprocess uses dummy_workflow Python (which has rose/rhapsody).
+    The CM ready signal is communicated via a sentinel file that this wrapper
+    watches and forwards to self._on_ready().
     """
 
     workflow_id = "ddsim"
-    init_tasks  = ["simulation"]
 
-    def task_specs(self):
-        return {
-            "simulation": TaskSpec(
-                priority       = 9,
-                ranks          = 1,
-                cores_per_rank = 1,
-                gpus_per_rank  = 1,
-                on_completion  = "train_model",
-            ),
-            "train_model": TaskSpec(
-                priority       = 8,
-                ranks          = 1,
-                cores_per_rank = 1,
-                gpus_per_rank  = 1,
-                on_completion  = "training",
-            ),
-            "training": TaskSpec(
-                priority       = 7,
-                ranks          = 1,
-                cores_per_rank = 4,
-                gpus_per_rank  = 1,
-                on_completion  = "selection",
-            ),
-            "selection": TaskSpec(
-                priority       = 6,
-                ranks          = 1,
-                cores_per_rank = 2,
-                gpus_per_rank  = 0,
-                on_completion  = "inference",
-            ),
-            "inference": TaskSpec(
-                priority       = 5,
-                ranks          = 1,
-                cores_per_rank = 1,
-                gpus_per_rank  = 0,
-            ),
-        }
+    async def run(self, replica_id: str) -> None:
+        cfg  = self.config or {}
+        base_home    = Path(cfg.get("home_dir", Path.home() / "DDSim")).expanduser()
+        replica_home = base_home / replica_id
+        replica_home.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Executors  (run_<task_type>)
-    # ------------------------------------------------------------------
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, prefix=f"dummy_{replica_id}_"
+        ) as f:
+            json.dump(cfg, f)
+            config_json = f.name
 
-    def run_simulation(self, task_desc: dict) -> dict:
-        """Run molecular dynamics / physics simulation."""
-        print(f"  [simulation] starting  — {task_desc['ranks']} rank(s), "
-              f"{task_desc['gpus_per_rank']} GPU/rank")
-        time.sleep(0.05)
-        result = {"trajectories": 100, "converged": True}
-        print(f"  [simulation] done → {result}")
-        return result
+        ready_signal = replica_home / ".ready"
+        ready_signal.unlink(missing_ok=True)
 
-    def run_train_model(self, task_desc: dict) -> dict:
-        """Train a surrogate model on simulation outputs."""
-        print(f"  [train_model] starting  — {task_desc['gpus_per_rank']} GPU/rank")
-        time.sleep(0.05)
-        result = {"model_path": "/tmp/surrogate_v1.pt", "val_loss": 0.012}
-        print(f"  [train_model] done → {result}")
-        return result
+        cmd = [
+            str(_DUMMY_PYTHON), str(_RUN_DUMMY),
+            "--config-json",       config_json,
+            "--home-dir",          str(replica_home),
+            "--replica-id",        replica_id,
+            "--ready-signal-path", str(ready_signal),
+        ]
 
-    def run_training(self, task_desc: dict) -> dict:
-        """Full training pass (more cores, longer)."""
-        print(f"  [training] starting  — {task_desc['cores_per_rank']} core(s), "
-              f"{task_desc['gpus_per_rank']} GPU/rank")
-        time.sleep(0.05)
-        result = {"model_path": "/tmp/model_final.pt", "val_loss": 0.008}
-        print(f"  [training] done → {result}")
-        return result
+        proc = await asyncio.create_subprocess_exec(*cmd)
 
-    def run_selection(self, task_desc: dict) -> dict:
-        """Select next batch of candidates from surrogate predictions."""
-        print("  [selection] starting")
-        time.sleep(0.02)
-        result = {"selected": 50, "batch_file": "/tmp/candidates.csv"}
-        print(f"  [selection] done → {result}")
-        return result
+        # Watch for ready sentinel in parallel with the subprocess.
+        async def _watch_ready():
+            while not ready_signal.exists():
+                if proc.returncode is not None:
+                    return
+                await asyncio.sleep(1.0)
+            if self._on_ready is not None:
+                result = self._on_ready()
+                if asyncio.iscoroutine(result):
+                    await result
 
-    def run_inference(self, task_desc: dict) -> dict:
-        """Run model inference on selected candidates."""
-        print("  [inference] starting")
-        time.sleep(0.02)
-        result = {"scored": 50, "output": "/tmp/scores.csv"}
-        print(f"  [inference] done → {result}")
-        return result
+        watch_task = asyncio.get_running_loop().create_task(_watch_ready())
+        try:
+            await proc.wait()
+        finally:
+            watch_task.cancel()
+            try:
+                await watch_task
+            except asyncio.CancelledError:
+                pass
+            Path(config_json).unlink(missing_ok=True)
 
-    # ------------------------------------------------------------------
-    # on_completion override  (after_<task_type>)
-    # Overrides the TaskSpec string chain for 'simulation' only.
-    # Demonstrates conditional branching: abort on failure.
-    # ------------------------------------------------------------------
-
-    def after_simulation(
-        self, final_state: str, cm, workflow_id: str
-    ) -> None:
-        """
-        Called after simulation completes.
-
-        Demonstrates conditional branching: only proceed if the simulation
-        converged.  When final_state == 'done' we manually submit the next
-        task (same behaviour as the string chain, but with full control).
-        """
-        print(f"  [after_simulation] state={final_state!r}")
-        if final_state == "done":
-            cm.submit("train_model", workflow_id)
-        else:
-            print("  [after_simulation] simulation failed — aborting ddsim workflow")
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"DummyWorkflow subprocess for {replica_id!r} exited with code {proc.returncode}"
+            )

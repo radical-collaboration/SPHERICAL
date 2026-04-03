@@ -202,7 +202,8 @@ class InferenceService(ABC):
                 _ = self.processed_queue.get_nowait()
                 self.processed_queue.task_done()
 
-        self.logger.info(f"[rank {self.rank}] Waiting for disk I/O to complete...")
+        if self.debug:
+            self.logger.info(f"[rank {self.rank}] Waiting for disk I/O to complete...")
         await self.processed_queue.join()
         await self.processed_queue.put(None)
 
@@ -219,7 +220,8 @@ class InferenceService(ABC):
         await export_metrics(self.logger.metrics_output, self.logger.metrics)
 
         self.save_executor.shutdown(wait=True)
-        self.logger.info(f"[rank {self.rank}] All workers and metrics logging stopped")
+        if self.debug:
+            self.logger.info(f"[rank {self.rank}] All workers and metrics logging stopped")
 
     async def close(self):
         """Gracefully shutdown the inference service (alias for shutdown)."""
@@ -232,9 +234,18 @@ class InferenceService(ABC):
     async def sequence_source(self):
         """Async generator for sequences. Override in subclass if needed."""
         sequences = self.config.get("SEQUENCES", [])
+        if not sequences:
+            self.logger.warning(
+                f"[rank {self.rank}] No SEQUENCES in config — sequence_source produces nothing"
+            )
+            return
         while not self.shutdown_init.is_set():
             for seq in sequences:
                 yield seq
+            # Cooperatively yield to the event loop after each cycle so that
+            # generate_batch() can consume sequences concurrently instead of
+            # waiting for sequence_producer to exhaust its entire threshold.
+            await asyncio.sleep(0)
 
     async def sequence_producer(self):
         """Pull sequences from generator and enqueue."""
@@ -257,10 +268,11 @@ class InferenceService(ABC):
         num_workers = len(self.devices) * self.num_workers_per_gpu
         min_batches_in_flight = num_workers * 3
 
-        self.logger.info(
-            f"[rank {self.rank}] Target: {min_batches_in_flight}+ batches in flight "
-            f"to saturate {num_workers} workers"
-        )
+        if self.debug:
+            self.logger.info(
+                f"[rank {self.rank}] Target: {min_batches_in_flight}+ batches in flight "
+                f"to saturate {num_workers} workers"
+            )
 
         if self.use_streaming:
             prefetch = min(int(min_batches_in_flight), int(self.num_batches))
@@ -282,20 +294,32 @@ class InferenceService(ABC):
             ]
             await asyncio.gather(*tasks)
         else:
-            num_tokens, batch = await self.generate_batch()
+            try:
+                num_tokens, batch = await self.generate_batch()
+            except StopAsyncIteration:
+                self.logger.warning(
+                    f"[rank {self.rank}] generate_batch returned no sequences "
+                    f"— SEQUENCES may be empty in config; skipping init_queue"
+                )
+                self.shutdown_init.set()
+                await asyncio.gather(producer_task)
+                await self.seq_queue.put(None)
+                return
             self.single_batch = batch
 
             async with self.logger.metrics_lock:
                 self.logger.metrics["queue_tokens"] += num_tokens * self.num_batches
 
-            self.logger.info(f"[rank {self.rank}] Enqueuing {self.num_batches} batch IDs...")
+            if self.debug:
+                self.logger.info(f"[rank {self.rank}] Enqueuing {self.num_batches} batch IDs...")
             for batch_id in range(self.num_batches):
                 await self.seq_queue.put(batch_id)
 
             if not self.client_mode:
-                self.logger.info(
-                    f"[rank {self.rank}] Pre-allocating batches for {len(self.devices)} devices..."
-                )
+                if self.debug:
+                    self.logger.info(
+                        f"[rank {self.rank}] Pre-allocating batches for {len(self.devices)} devices..."
+                    )
                 for device in self.devices:
                     self.device_batches[device] = {
                         k: v.to(device, non_blocking=True) for k, v in self.single_batch.items()
@@ -305,10 +329,11 @@ class InferenceService(ABC):
         await asyncio.gather(producer_task)
         await self.seq_queue.put(None)
 
-        self.logger.info(
-            f"[rank {self.rank}] init_queue completed: {self.num_batches} batches "
-            f"in {time.time() - t_start:.2f}s"
-        )
+        if self.debug:
+            self.logger.info(
+                f"[rank {self.rank}] init_queue completed: {self.num_batches} batches "
+                f"in {time.time() - t_start:.2f}s"
+            )
 
     # -------------------------------------------------------------------------
     # Direct Inference (Local Mode)

@@ -242,6 +242,7 @@ def main(output_dirs: str):
         if not output_dir.is_dir():
             continue
 
+        print(f'calling with {output_dir}')
         result = plot_per_run(output_dir, plots_dir)
         if result is not None:
             num_gpus, mean_val, std_val = result

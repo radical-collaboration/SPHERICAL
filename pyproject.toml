@@ -14,12 +14,14 @@ maintainers = [
     {name = "Masha", email = "masha@example.com"},
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 
 dependencies = [
     "aiohttp>=3.8.0",
     "pyyaml>=6.0",
-    "radical.asyncflow==0.3.0",
+    "radical.asyncflow>=0.3.0",
+    "rhapsody-py",
+    "nvidia-ml-py"
 ]
 
 [project.urls]
@@ -66,13 +68,13 @@ where = ["."]
 include = ["src*"]
 
 [tool.pyright]
-pythonVersion = "3.9"
+pythonVersion = "3.10"
 include = ["."]
 extraPaths = ["."]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 fix = true
 
 [tool.ruff.lint]

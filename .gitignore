@@ -29,6 +29,7 @@ pip-log.txt
 nosetests.xml
 *.log
 *.prof
+examples/*/slurm*
 
 # Translations
 *.mo

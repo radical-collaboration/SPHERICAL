@@ -40,7 +40,7 @@ class LogLevel(Enum):
 class Logger:
     def __init__(
         self,
-        name="InferenceService",
+        name="workflow",
         use_colors=True,
         output_stream=None,
         config=None,
@@ -104,7 +104,7 @@ class Logger:
         colored_component = self._colorize(f"[{component.upper()}]", component_color)
 
         task_part = ""
-        if task_name:
+        if task_name and task_name.upper() != component.upper():
             task_part = f" {self._colorize(f'[{task_name}]', Colors.BRIGHT_WHITE)}"
 
         return f"{timestamp} {colored_level} {colored_component}{task_part} {message}"

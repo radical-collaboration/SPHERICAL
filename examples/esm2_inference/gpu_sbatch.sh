@@ -1,6 +1,6 @@
 #!/bin/sh -l
 
-#SBATCH -A dmr170002p
+#SBATCH -A ***
 #SBATCH --partition=GPU-shared
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -15,9 +15,9 @@
 module load cuda
 module load gcc
 module load anaconda3
-conda activate /ocean/projects/dmr170002p/goliyad/conda_env/test_inf
+conda activate $PROJECT/conda_env/test_inf
 
-cd /ocean/projects/dmr170002p/goliyad/htp/SPHERICAL/examples/esm2_inference
+cd $PROJECT/htp/SPHERICAL/examples/esm2_inference
 
 # dragon-network-config --output-to-yaml 
 

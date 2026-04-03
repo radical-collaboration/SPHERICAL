@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None  # type: ignore[assignment]  # only needed in envs that run the service
 
 from ..inference_service import InferenceService
 

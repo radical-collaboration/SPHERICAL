@@ -15,6 +15,7 @@ Features:
 import asyncio
 import itertools
 import socket
+import sys
 from typing import Any, Optional
 
 from aiohttp import web
@@ -63,7 +64,7 @@ def _server_node_main(config, node_rank, hostname, port, service_class, use_http
 
     from aiohttp import web as _web
 
-    from src.inference.logger import Logger as _Logger
+    from src.utils.logger import Logger as _Logger
     from src.inference.server import get_app as _get_app, init_server as _init_server
     from src.inference.utils import get_devices_for_node as _get_devices
 
@@ -313,8 +314,9 @@ async def _launch_servers_dragon(
             host_name=hostname,
         )
 
+        service_python = config.get("service_python", sys.executable)
         cmd = [
-            sys.executable,
+            service_python,
             launcher_script,
             "--config-json", config_json_path,
             "--node-rank", str(rank),
@@ -351,7 +353,62 @@ async def _launch_servers_async(
     base_port: int,
     use_https: bool,
 ) -> list[tuple[str, Any, web.AppRunner]]:
-    """Launch servers concurrently in the current process (non-Dragon)."""
+    """Launch servers concurrently.
+
+    If ``service_python`` is set in config and differs from ``sys.executable``,
+    each server is launched as a plain subprocess (same launcher as the Dragon
+    path) so the service runs in its own conda environment.  Otherwise the
+    server runs in-process as before.
+    """
+    service_python = config.get("service_python", sys.executable)
+    use_subprocess = service_python != sys.executable
+
+    if use_subprocess:
+        # Reuse the Dragon-path subprocess launch logic (no Dragon placement).
+        import inspect, json, os
+        from pathlib import Path
+        launcher_script = str(Path(__file__).parent / "dragon_launcher.py")
+        service_module_name = service_class.__module__
+        service_class_name = service_class.__name__
+        try:
+            script_dir = str(Path(inspect.getfile(service_class)).resolve().parent)
+        except (TypeError, OSError):
+            script_dir = os.getcwd()
+        config_dir = Path(config.get("output_dir", "."))
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_json_path = str(config_dir / f"_async_config_{os.getpid()}.json")
+        with open(config_json_path, "w") as f:
+            json.dump(config, f)
+
+        procs = []
+        servers = []
+        for rank, hostname in enumerate(nodes):
+            port = base_port + rank
+            protocol = "https" if use_https else "http"
+            fqdn = socket.getfqdn(hostname) if hostname else socket.getfqdn()
+            endpoint = f"{protocol}://{fqdn}:{port}"
+            cmd = [
+                service_python,
+                launcher_script,
+                "--config-json", config_json_path,
+                "--node-rank", str(rank),
+                "--hostname", hostname,
+                "--port", str(port),
+                "--service-module", service_module_name,
+                "--service-class", service_class_name,
+                "--script-dir", script_dir,
+            ]
+            if use_https:
+                cmd.append("--use-https")
+            proc = await asyncio.create_subprocess_exec(*cmd)
+            procs.append(proc)
+            servers.append((endpoint, None, proc))
+            logger.info(f"Launched service subprocess (rank={rank}) on {endpoint} pid={proc.pid}")
+
+        logger.info(f"Successfully launched {len(servers)}/{len(nodes)} servers (subprocess mode)")
+        return servers
+
+    # In-process path (original behaviour).
     launch_tasks = []
     for rank, hostname in enumerate(nodes):
         port = base_port + rank
@@ -513,16 +570,44 @@ async def start_services_local(
     """
 
     num_services = config.get("num_services", 1)
-
     num_gpus_per_service = config.get("num_gpus_per_service", 1)
-    devices = get_devices_for_node(config)
-    devices_cycle = itertools.cycle(devices)
+
+    # Build device list: prefer CM-injected GPU IDs (assigned_gpu_ids) so that
+    # each service uses exactly the GPU the campaign manager allocated to it,
+    # rather than defaulting to cuda:0.  Falls back to auto-detection when no
+    # assignment is present (e.g. local testing without the CM).
+    from .utils import get_available_device_count, detect_device_type
+    device_type = detect_device_type()
+    if device_type == "cuda":
+        # Prefer group_gpu_ids (all GPUs held by the inference group) so that
+        # each service is placed on a distinct CM-assigned GPU.  Fall back to
+        # assigned_gpu_ids (single replica) or full auto-detection.
+        group_ids    = config.get("group_gpu_ids")
+        assigned_ids = config.get("assigned_gpu_ids")
+        if group_ids:
+            all_devices = [f"cuda:{i}" for i in group_ids]
+            logger.info(f"Using CM group GPU IDs for services: {group_ids}")
+        elif assigned_ids:
+            all_devices = [f"cuda:{i}" for i in assigned_ids]
+            logger.info(f"Using CM-assigned GPU IDs for services: {assigned_ids}")
+        else:
+            total_gpus = get_available_device_count()
+            all_devices = [f"cuda:{i}" for i in range(total_gpus)]
+    else:
+        all_devices = ["cpu"] * (num_services * num_gpus_per_service)
+    devices_cycle = itertools.cycle(all_devices)
     handles = []
 
     for rank in range(num_services):
         devices = [next(devices_cycle) for _ in range(num_gpus_per_service)]
 
-        service = service_class(config=config, devices=devices, rank=rank)
+        # Run the constructor in a thread so that synchronous model loading
+        # (tokenizer + model weights, possibly downloading from HuggingFace)
+        # does not block the asyncio event loop.
+        _rank, _devices = rank, devices  # capture loop variables
+        service = await asyncio.to_thread(
+            lambda: service_class(config=config, devices=_devices, rank=_rank)
+        )
         handles.append(ServiceHandle(endpoint=None, service=service))
         logger.info(f"[Server {rank}] Local Inference service initialized on devices: {devices}")
 
@@ -578,10 +663,10 @@ async def start_services(
     handles = []
     for rank, (ep, svc, proc_or_runner) in enumerate(servers):
         if ep in healthy_endpoints:
-            if is_remote:
-                # Remote mode (Dragon): service lives in remote process.
-                # Create a lightweight client-mode service for client-side
-                # preprocessing (loads tokenizer only, no model/GPU).
+            if is_remote or svc is None:
+                # Remote mode (Dragon) or subprocess mode: service lives in a
+                # separate process.  Create a lightweight client-mode service
+                # for client-side preprocessing (loads tokenizer only, no model/GPU).
                 client_svc = service_class(
                     config=config, devices=["cpu"], rank=rank, client_mode=True
                 )
@@ -604,7 +689,6 @@ async def init_clients(
     config: dict[str, Any],
     services: list[ServiceHandle],
     client_class: type,
-    resource_manager=None,
 ) -> tuple[Optional[list[Any]], Optional[Any]]:
     """
     Initialize clients for the given services.
@@ -613,7 +697,6 @@ async def init_clients(
         config: Configuration dictionary
         services: List of ServiceHandle objects from start_services()
         client_class: Client class to instantiate
-        resource_manager: Optional ResourceManager for priority-based resource allocation
 
     Returns:
         Tuple of (list of client instances, telemetry collector or None)
@@ -623,11 +706,9 @@ async def init_clients(
     asyncflow = None
 
     if "concurrent" in engine:
-        from concurrent.futures import ProcessPoolExecutor
-
         from rhapsody.backends import ConcurrentExecutionBackend
 
-        engine = await ConcurrentExecutionBackend(ProcessPoolExecutor())
+        engine = await ConcurrentExecutionBackend
         engine_name = "ConcurrentExecutionBackend"
     elif "dragon" in engine:
         from rhapsody.backends import DragonExecutionBackendV3
@@ -645,7 +726,7 @@ async def init_clients(
     else:
         from rhapsody.backends import DaskExecutionBackend
 
-        engine = await DaskExecutionBackend()
+        engine = await DaskExecutionBackend
         engine_name = "DaskExecutionBackend"
 
     asyncflow = await WorkflowEngine.create(engine)
@@ -667,7 +748,6 @@ async def init_clients(
                     service=service,
                     config=config,
                     asyncflow=asyncflow,
-                    resource_manager=resource_manager,
                 )
                 clients.append(client)
             else:
@@ -678,7 +758,6 @@ async def init_clients(
                         service=service,
                         config=config,
                         asyncflow=asyncflow,
-                        resource_manager=resource_manager,
                     )
                     clients.append(client)
                     await service.start_workers()

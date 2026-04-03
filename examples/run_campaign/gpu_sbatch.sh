@@ -1,30 +1,68 @@
 #!/bin/sh -l
 
-#SBATCH -A dmr170002p
-#SBATCH --partition=GPU-shared
+#SBATCH -A *** 
+#SBATCH --partition=GPU   #-shared
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#xSBATCH --gpus=v100-32:16
-#SBATCH --gpus=4
-#SBATCH --time=00:25:00
-#SBATCH --job-name=spher
-#SBATCH --mail-user=mariya.goliyad@rutgers.edu
-#SBATCH --mail-type=ALL
+#SBATCH --tasks-per-node=4
+#SBATCH --cpus-per-task=1
+#xSBATCH --gpus=v100-32:8
+#SBATCH --gpus=8
+#SBATCH --exclusive
+#SBATCH --export    NONE
+#SBATCH --time=02:30:00
+#SBATCH --job-name sphr
+#SBATCH --mail-user=mg2347@soe.rutgers.edu
+#SBATCH --mail-type=ALL      # When to send emails (BEGIN, END, FAIL, ALL)
 
-export BASE_DIR="/ocean/projects/dmr170002p/goliyad/htp/SPHERICAL"
-export WORK_DIR="${BASE_DIR}//examples/esm2_inference"
-export CONDA_ENV="${WORK_DIR}/conda_env"
 
-module load cuda
-module load gcc
+export BASE_DIR="${PROJECT}"
+export WORK_DIR="${BASE_DIR}/DeepDriveSim/workflows/ddmd_workflow"
+export CONDA_ENV="${BASE_DIR}/conda_env"
+export INPUT_DIR="${WORK_DIR}/data"
+export DUMMY_DIR="${BASE_DIR}/DeepDriveSim/workflows/dummy_workflow"
+export INF_DIR="${BASE_DIR}/htp/SPHERICAL/examples/esm2_inference"
+export MINAPPS_DIR="${BASE_DIR}/DeepDriveSim/workflows/miniapps_workflow"
+export MD_DIR="${WORK_DIR}"
+
+#WARNING: this directory has to be empty before running new experiment!
+export EXPRMNT_DIR=$WORK_DIR/ddmd_test_experiments
+# Remove the following line if you want to keep data from previous experiments.
+rm -rf $EXPRMNT_DIR
+
+unset SLURM_EXPORT_ENV
 module load anaconda3
-conda activate $(CONDA_ENV)/campaing_manager
+#module load anaconda
+source activate base
+conda activate   $CONDA_ENV/campaign_manager
 
-cd /ocean/projects/dmr170002p/goliyad/htp/SPHERICAL/examples/campaing_manager
+export CUDA_HOME=/opt/packages/cuda/v12.6.1
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
-python run_campaign.py
+export TF_FORCE_GPU_ALLOW_GROWTH=true
 
-# dragon-network-config --output-to-yaml 
+cp  $INPUT_DIR/lassen-keras-dbscan.yaml $INPUT_DIR/new_lassen-keras-dbscan.yaml
+sed -i "s|\${EXPRMNT_DIR}|$EXPRMNT_DIR|g" $INPUT_DIR/new_lassen-keras-dbscan.yaml
+sed -i "s|\${CONDA_ENV}|$CONDA_ENV|g" $INPUT_DIR/new_lassen-keras-dbscan.yaml
+sed -i "s|\${WORK_DIR}|$WORK_DIR|g" $INPUT_DIR/new_lassen-keras-dbscan.yaml
 
-# dragon -w ssh --network-config slurm.yaml run_campaign.py
+cp  $WORK_DIR/template_config.yaml $WORK_DIR/config.yaml
+sed -i "s|\${PROJECT}|$PROJECT|g" $WORK_DIR/config.yaml
+
+cp  template_config.yaml config.yaml
+sed -i "s|\${MD_DIR}|$MD_DIR|g" config.yaml
+sed -i "s|\${MINAPPS_DIR}|$MINAPPS_DIR|g" config.yaml
+sed -i "s|\${INF_DIR}|$INF_DIR|g" config.yaml
+sed -i "s|\${DUMMY_DIR}|$DUMMY_DIR|g" config.yaml
+
+cp  $MINAPPS_DIR/template_config.yaml $MINAPPS_DIR/config.yaml
+sed -i "s|\${PROJECT}|$PROJECT|g" $MINAPPS_DIR/config.yaml
+cp  $DUMMY_DIR/template_config.yaml $DUMMY_DIR/config.yaml
+sed -i "s|\${PROJECT}|$PROJECT|g" $DUMMY_DIR/config.yaml
+
+cd $BASE_DIR/htp/SPHERICAL/examples/run_campaign
+rm -rf data/telemetry-results
+rm -rf data/nvml-telemetry
+
+dragon -s run_campaing.py
+#python run_campaing.py
+#python -m run_workflow -c $INPUT_DIR/new_lassen-keras-dbscan.yaml
