@@ -1,6 +1,6 @@
 """Tests for logger module."""
 
-from src.inference.logger import Colors, Logger, LogLevel
+from src.utils.logger import Colors, Logger, LogLevel
 
 
 class TestColors:

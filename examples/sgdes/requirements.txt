@@ -1,36 +1,110 @@
 # =============================================================================
-# TRILL / SGDES pip requirements
-# Install AFTER conda packages (see env_setup.sh for conda install commands).
+# SGDES workflow — pip requirements
+#
+# Install order matters.  Follow the steps below rather than running
+# `pip install -r requirements.txt` blindly, because:
+#   - PyTorch must be installed from the CUDA-specific index URL.
+#   - PyG wheels are pre-built per (torch_version, cuda_version, python_version).
+#   - foldseek and seqkit are standalone binaries (see delta_env_setup.sh).
+#   - TRILL (SGDES fork) and SPHERICAL require editable installs from local repos.
+#
+# Quick install (Delta / CUDA 12.1):
+#   Step 1: pip install torch==2.3.0+cu121 torchvision==0.18.0+cu121 torchaudio==2.3.0+cu121 \
+#               --index-url https://download.pytorch.org/whl/cu121
+#   Step 2: install PyG wheels (see delta_env_setup.sh step 3b)
+#   Step 3: pip install -r requirements.txt
+#   Step 4: pip install -e $SGDES_DIR          # TRILL fork (editable)
+#   Step 5: pip install -e $SPHERICAL_DIR[sgdes,dragon,dev]
+#   Step 6: download foldseek GPU binary and seqkit (see delta_env_setup.sh steps 9-10)
+#
+# For a fully automated install use delta_env_setup.sh or bridges2_env_setup.sh.
 # =============================================================================
 
-# ── SPHERICAL ─────────────────────────────────────────────────────────────────
-pydantic-settings
+# ── Core HPC / asyncflow ──────────────────────────────────────────────────────
+radical.asyncflow==0.3.1
+rhapsody-py==0.1.2
+dragonhpc==0.13.1
+nvidia-ml-py
 
-# ── PyPI dependencies from TRILL pixi.toml [pypi-dependencies] ───────────────
-antipickle>=0.2.0,<0.3
-biobb-vs>=5.1.0,<6
-# cuequivariance-ops-cu12 requires nvidia-cublas-cu12>=12.5 — incompatible with cu121 stack
-# cuequivariance-ops-torch-cu12>=0.5.1,<0.6
-# cuequivariance-torch>=0.5.1,<0.6
-fairscale>=0.4.13,<0.5
-pytorch_lightning<=2.5.0
-reprint>=0.6.0,<0.7
-rna-fm>=0.2.2,<0.3
-biotite
-ninja
-torch-nl
+# ── ML framework ─────────────────────────────────────────────────────────────
+# PyTorch installed separately with CUDA index URL (see note above)
+accelerate==1.13.0
+transformers==4.57.6
+huggingface_hub==0.36.2
+safetensors==0.7.0
+datasets==2.21.0
+tokenizers==0.22.2
+pytorch-lightning==2.6.1
+deepspeed==0.17.6
+fair-esm==2.0.0
 
-# ── Git-based dependencies ────────────────────────────────────────────────────
-git+https://github.com/martinez-zacharya/CaLM.git
-git+https://github.com/martinez-zacharya/ECPICK.git
-git+https://github.com/martinez-zacharya/lightdock.git@7472aea30bae7f18cf4570ad5ec559196f3b5752
-git+https://github.com/chemosim-lab/ProLIF.git
-git+https://github.com/martinez-zacharya/SCASA.git
+# ── TF / JAX (DES / amortized_bo) ────────────────────────────────────────────
+tensorflow==2.16.2
+tf-keras==2.16.0
+tensorflow-io-gcs-filesystem==0.37.1
+jax[cuda12]==0.4.25
+jaxlib==0.4.25
+ml-dtypes==0.3.2
 
-# ── PyG wheels (pinned to torch-2.3.*+cu121 / cp311) ─────────────────────────
-# If your pytorch version differs, replace with matching wheels from:
-#   https://data.pyg.org/whl/
-https://data.pyg.org/whl/torch-2.3.0%2Bcu121/torch_sparse-0.6.18%2Bpt23cu121-cp311-cp311-linux_x86_64.whl
-https://data.pyg.org/whl/torch-2.3.0%2Bcu121/torch_cluster-1.6.3%2Bpt23cu121-cp311-cp311-linux_x86_64.whl
-https://data.pyg.org/whl/torch-2.3.0%2Bcu121/torch_spline_conv-1.2.2%2Bpt23cu121-cp311-cp311-linux_x86_64.whl
-https://data.pyg.org/whl/torch-2.3.0%2Bcu121/pyg_lib-0.4.0%2Bpt23cu121-cp311-cp311-linux_x86_64.whl
+# ── Bio / chem / structure ────────────────────────────────────────────────────
+biopython==1.81
+biotite==0.39.0
+scikit-learn==1.4.1.post1
+scipy==1.17.1
+numpy>=1.26.3,<2.0.0
+pandas
+rdkit==2024.9.6
+e3nn==0.5.9
+torch-geometric
+xgboost==1.7.6
+umap-learn==0.5.7
+pynndescent==0.6.0
+
+# ── Model utilities ───────────────────────────────────────────────────────────
+einops==0.8.2
+ema-pytorch==0.7.9
+rotary-embedding-torch==0.8.9
+vit-pytorch==1.19.1
+x-transformers==2.17.9
+torchmetrics==1.9.0
+rna-fm==0.2.2
+sentencepiece==0.1.99
+
+# ── Config / logging ─────────────────────────────────────────────────────────
+gin-config==0.5.0
+absl-py==2.4.0
+PyYAML==6.0.3
+tqdm==4.67.3
+rich==14.3.0
+icecream==2.2.0
+pyfiglet==0.8.post1
+GitPython==3.1.46
+psutil==7.2.2
+autograd==1.8.0
+autograd-gamma==0.5.0
+click==8.3.2
+
+# ── Serialisation / IO ────────────────────────────────────────────────────────
+h5py==3.14.0
+pillow==12.2.0
+fsspec[http]==2024.6.1
+requests==2.33.1
+
+# ── Visualisation ────────────────────────────────────────────────────────────
+matplotlib
+seaborn==0.13.2
+plotly==6.6.0
+bokeh==3.9.0
+tensorboard>=2.16,<2.17
+tensorboardX==2.6.4
+
+# ── Misc build / typing ──────────────────────────────────────────────────────
+setuptools<71
+hydra-core==1.3.2
+omegaconf
+pydantic==2.12.5
+typing_extensions==4.15.0
+python-dateutil>=2.7
+tornado>=6.1
+poetry-core
+sympy

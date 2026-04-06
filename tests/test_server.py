@@ -31,7 +31,7 @@ class TestServerHandlers:
         """Test health endpoint when service not initialized."""
         request = MagicMock()
 
-        with patch("server.inference_service", None):
+        with patch("src.inference.server.inference_service", None):
             response = await health_handler(request)
 
         assert response.status == 503
@@ -41,7 +41,7 @@ class TestServerHandlers:
         """Test info endpoint when service not initialized."""
         request = MagicMock()
 
-        with patch("server.inference_service", None):
+        with patch("src.inference.server.inference_service", None):
             response = await info_handler(request)
 
         assert response.status == 503

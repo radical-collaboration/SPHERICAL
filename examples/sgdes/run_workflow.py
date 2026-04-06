@@ -1,27 +1,55 @@
 #!/usr/bin/env python3
 """
-SGDES runner for MAYV mutations.
+SGDES workflow runner for MAYV mutations.
 
 Usage
 -----
-    python run_with_cm.py [--config config.yaml]
+    # Single-node interactive (Dragon):
+    dragon -s run_workflow.py [--config config.yaml]
 
-Runs all mutations listed in config.yaml via SGDESWorkflow.
-Up to total_gpus mutations run concurrently; each calls `trill workflow sgdes`.
+    # Multi-node via SLURM (Dragon):
+    sbatch delta_gpu_sbatch.sh
+
+    # Local asyncio (no Dragon, no GPU affinity):
+    python run_workflow.py --config config.yaml   # engine: concurrent in config
+
+Execution backends (set via `engine:` in config.yaml)
+------------------------------------------------------
+dragon     — DragonExecutionBackendV3; tasks are distributed across nodes using
+             per-mutation Policy objects (HOST_NAME + gpu_affinity).  Each mutation
+             runs on its own dedicated node/GPU; tasks within a mutation are
+             sequential so at most len(mutations) workers run at once.  Capped at
+             total_gpus to avoid the Dragon GS bottleneck.
+concurrent — LocalExecutionBackend backed by ProcessPoolExecutor; no GPU affinity,
+             useful for quick testing without Dragon.
+
+Telemetry (set via config.yaml)
+--------------------------------
+collect_nvml_telemetry   — GPU utilisation via NVML; a NvmlMonitor is started on
+                           each worker node via Dragon function tasks so all nodes
+                           are captured.  Output: nvml_dir/ (default nvml-telemetry/).
+collect_dragon_telemetry — Dragon runtime metrics via DragonTelemetryCollector;
+                           only active when engine=dragon.  Output: dragon_telemetry_dir/
+                           (default dragon-telemetry/).
+
+Required environment variables (set in *_gpu_sbatch.sh)
+--------------------------------------------------------
+SPHERICAL_DIR — root of the SPHERICAL repo (used to extend sys.path)
+SGDES_DIR     — root of the SGDES/TRILL fork (used inside the workflow)
+CUDA_HOME     — CUDA toolkit root; lib64/ is added to LD_LIBRARY_PATH so that
+                foldseek's ggml-CUDA backend can find libcudart on every node.
 """
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
-from radical.asyncflow import WorkflowEngine
-from dragon.infrastructure.policy import Policy
-from dragon.native.machine import Node, System
-from src.utils.nvml_monitor import NvmlMonitor
 
 import yaml
+from radical.asyncflow import WorkflowEngine
 
-_SPHERICAL_ROOT = Path("/ocean/projects/dmr170002p/goliyad/htp/SPHERICAL")
+_SPHERICAL_ROOT = Path(os.environ.get("SPHERICAL_DIR", Path(__file__).resolve().parents[2]))
 if str(_SPHERICAL_ROOT) not in sys.path:
     sys.path.insert(0, str(_SPHERICAL_ROOT))
 
@@ -34,69 +62,107 @@ def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f) or {}
 
+
 def find_gpus():
+    """Return [(hostname, gpu_id), ...] for every GPU visible to Dragon.
+
+    Uses Dragon's native machine API to enumerate all nodes and their GPUs.
+    node.gpus may be None on CPU-only nodes (e.g. login nodes), so we guard
+    with `or []` to skip them safely.
+    """
+    from dragon.native.machine import Node, System
 
     all_gpus = []
-    # loop through all nodes Dragon is running on
     for huid in System().nodes:
         node = Node(huid)
-        # loop through however many GPUs it may have
-        for gpu_id in node.gpus:
+        for gpu_id in node.gpus or []:
             all_gpus.append((node.hostname, gpu_id))
     return all_gpus
 
 
 def make_policies(all_gpus, nprocs=32):
-    """Create per-process policies with round-robin GPU assignment."""
+    """Create one Policy per mutation slot with round-robin GPU assignment.
+
+    Each policy pins a worker to a specific node (HOST_NAME) and GPU
+    (gpu_affinity) so that Dragon routes each mutation to the correct
+    node/GPU in multi-node runs.
+
+    HOST_NAME must be the actual compute node hostname (e.g. 'gpub001').
+    Using 'localhost' resolves to host_id=-1 on single-node Dragon (-s)
+    and causes a ~54 s scheduling timeout — always pass the real hostname
+    returned by find_gpus().
+    """
+    from dragon.infrastructure.policy import Policy
+
     policies = []
     i = 0
-    for _worker in range(nprocs):
+    for _ in range(nprocs):
+        hostname, gpu_id = all_gpus[i]
         policies.append(
             Policy(
                 placement=Policy.Placement.HOST_NAME,
-                host_name=all_gpus[i][0],
-                gpu_affinity=[all_gpus[i][1]],
+                host_name=hostname,
+                gpu_affinity=[gpu_id],
             )
         )
-        i += 1
-        if i == len(all_gpus):
-            i = 0
+        i = (i + 1) % len(all_gpus)
     return policies
+
 
 async def main(config_file: str) -> None:
     config = load_config(config_file)
 
-    backend = config.get("engine", "concurrent") 
+    backend = config.get("engine", "concurrent")
+    print(f"Using execution backend: {backend}")
+
+    # TOTAL_GPUS is set by delta_gpu_sbatch.sh as SLURM_NNODES * SLURM_GPUS_PER_NODE.
+    # It is not in config.yaml to avoid confusion — always comes from the sbatch env.
+    if "TOTAL_GPUS" not in os.environ:
+        raise RuntimeError(
+            "TOTAL_GPUS env var not set. "
+            "Run via delta_gpu_sbatch.sh or set: export TOTAL_GPUS=<nodes x gpus-per-node>"
+        )
+    config["total_gpus"] = int(os.environ["TOTAL_GPUS"])
+    print(f"Total GPUs: {config['total_gpus']}")
+
+    # ── Dragon telemetry (dragon engine only) ─────────────────────────────────
+    dragon_collector = None
+    if backend == "dragon" and config.get("collect_dragon_telemetry", False):
+        from src.inference.utils import init_collector
+
+        dragon_telemetry_dir = config.get("dragon_telemetry_dir", "dragon-telemetry")
+        dragon_collector = init_collector(dragon_telemetry_dir)
+        if dragon_collector:
+            dragon_collector.start()
+            print(f"DragonTelemetryCollector started → {dragon_telemetry_dir}")
 
     if backend == "dragon":
+        import multiprocessing as mp
+
+        mp.set_start_method("dragon")
         from rhapsody.backends import DragonExecutionBackendV3
-        engine_dragon = await DragonExecutionBackendV3(num_workers=16)
+
+        num_mutations = len(list(config["mutations"]))
+        total_gpus = int(config.get("total_gpus", 1))
+        policies = make_policies(find_gpus(), nprocs=num_mutations)
+
+        engine_dragon = await DragonExecutionBackendV3()
         asyncflow = await WorkflowEngine.create(engine_dragon)
-        policies = make_policies(find_gpus(), nprocs=len(list(config["mutations"])))
+
     else:  # concurrent
-        #from rhapsody.backends import ConcurrentExecutionBackend
-        engine_dragon = None
-        #engine_concurrent = await ConcurrentExecutionBackend()
-        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import ProcessPoolExecutor
+
         from radical.asyncflow import LocalExecutionBackend
-        engine_concurrent = LocalExecutionBackend(executor=ThreadPoolExecutor())
+
+        engine_concurrent = LocalExecutionBackend(executor=ProcessPoolExecutor())
         asyncflow = await WorkflowEngine.create(engine_concurrent)
+        policies = None
 
-    wf = SGDESWorkflow(config, asyncflow=asyncflow)
+    wf = SGDESWorkflow(config, asyncflow=asyncflow, policies=policies)
 
-    collect_telemetry = config.get("collect_telemetry", True)
-    if collect_telemetry:
-        nvml_dir = config.get("nvml_telemetry_dir", "data/nvml-telemetry")
-        nvml_rate = float(config.get("nvml_collection_rate", 1.0))
-        nvml_checkpoint = float(config.get("nvml_checkpoint_interval", 30.0))
-
-        nvml_dir = 'nvml-telemetry'
-        nvml_monitor = NvmlMonitor(
-            output_dir=nvml_dir,
-            collection_rate=nvml_rate,
-            checkpoint_interval=nvml_checkpoint,
-        )
-        nvml_monitor.start()
+    # NvmlMonitor is started per-node inside SGDESWorkflow._sgdes_async via
+    # Dragon function tasks (start_node_telemetry / stop_node_telemetry), so
+    # all worker nodes are captured automatically.  No head-node monitor needed.
 
     print(
         f"Starting {len(wf.mutations)} mutations "
@@ -106,9 +172,10 @@ async def main(config_file: str) -> None:
         await wf.run()
         print("Done.")
     finally:
-        if collect_telemetry:
-            nvml_monitor.stop()
         await asyncflow.shutdown()
+        if dragon_collector:
+            dragon_collector.stop()
+            print("DragonTelemetryCollector stopped")
 
 
 if __name__ == "__main__":
@@ -119,4 +186,5 @@ if __name__ == "__main__":
         help="Path to YAML config file (default: config.yaml next to this script)",
     )
     args = parser.parse_args()
+    print(f"Using config file: {args.config}")
     asyncio.run(main(args.config))

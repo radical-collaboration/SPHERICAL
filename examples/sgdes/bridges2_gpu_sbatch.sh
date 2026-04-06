@@ -25,7 +25,10 @@ conda activate $CONDA_ENV/sgdes
 export CUDA_HOME=/opt/packages/cuda/v12.6.1
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
-cd $PROJECT/htp/SPHERICAL/examples/sgdes
+export SGDES_DIR=$PROJECT/sgdes/SGDES
+export SPHERICAL_DIR=$PROJECT/htp/SPHERICAL
+
+cd $SPHERICAL_DIR/examples/sgdes
 rm -rf nvml-telemetry
 rm -rf mayv_output
 rm -rf tmp*

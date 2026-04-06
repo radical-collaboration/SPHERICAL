@@ -3,21 +3,22 @@
 # =============================================================================
 
 # ── Telemetry ─────────────────────────────────────────────────────────────────
-collect_telemetry: true
-telemetry_dir: "telemetry-results"
-nvml_collection_rate: 1.0
-nvml_checkpoint_interval: 30.0
+collect_nvml_telemetry:    true          # per-node GPU util via NVML (all nodes)
+collect_dragon_telemetry:  true          # Dragon runtime metrics (dragon engine only)
+nvml_dir:                  "nvml-telemetry"
+dragon_telemetry_dir:      "dragon-telemetry"
+nvml_collection_rate:      1.0
+nvml_checkpoint_interval:  30.0
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # outdir: base directory; the workflow appends {mutation}_wd automatically.
-outdir:    "/ocean/projects/dmr170002p/goliyad/htp/SPHERICAL/examples/sgdes/mayv_output"
-query_dir: "/ocean/projects/dmr170002p/goliyad/sgdes/SGDES/results/mayv/splited_mayv"
-wt_query:  "/ocean/projects/dmr170002p/goliyad/sgdes/SGDES/data/mayv_ori.fasta"
+outdir:    "/scratch/bblj/mgoliyad1/SPHERICAL/examples/sgdes/mayv_output"
+query_dir: "/scratch/bblj/mgoliyad1/SGDES/results/mayv/splited_mayv"
+wt_query:  "/scratch/bblj/mgoliyad1/SGDES/data/mayv_ori.fasta"
 
 # ── Execution ─────────────────────────────────────────────────────────────────
-engine:          dragon  # concurrent (asyncio) or dragon
-total_gpus:      8          # GPUs on node: caps concurrent mutations and assigns CUDA_VISIBLE_DEVICES
-total_cpus:      192         # CPUs on node: used to cap foldseek threads per concurrent mutation
+engine:          dragon # concurrent (asyncio) or dragon
+# total_gpus is set automatically by delta_gpu_sbatch.sh via TOTAL_GPUS env var (nodes × gpus-per-node)
 foldtune_rounds: 3
 fast_folding:    true
 fold_batch_size: 1
@@ -33,9 +34,9 @@ topk:              10
 # ── All 50 MAYV mutations (from run_sgdes_for_mayv.sh) ───────────────────────
 mutations:
   - T365F
-  # - Y155T
-  # - Y198I
-  # - A272I
+  - Y155T
+  - Y198I
+  - A272I
   # - V266A
   # - A226C
   # - Y155H

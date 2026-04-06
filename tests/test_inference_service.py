@@ -15,7 +15,7 @@ class ConcreteInferenceService(InferenceService):
         """Mock model loading."""
         self.models = {device: MagicMock() for device in self.devices}
 
-    def process_batch_sync(self, batch_id: int, device: str):
+    def process_batch_sync(self, batch_id: int, device: str, batch_data=None):
         """Mock batch processing."""
         self.logger.metrics["total_tokens"] += 100
         self.reply_store[batch_id] = [f"result_{batch_id}"]
@@ -136,7 +136,7 @@ class TestInferenceServiceAsync:
 
         # Check batch was added to work queue
         item = await service.work_queue.get()
-        batch_id, request_id = item
+        batch_id, request_id, batch_data = item
         assert batch_id == 1
         assert request_id == 1  # First request
 
@@ -241,7 +241,7 @@ class TestGPUWorker:
         worker = GPUWorker(device="cuda:0", worker_id=0, service=service)
 
         # Put a batch with request_id and shutdown signal
-        await service.work_queue.put((1, 42))  # batch_id=1, request_id=42
+        await service.work_queue.put((1, 42, None))  # batch_id=1, request_id=42, batch_data=None
         await service.work_queue.put(None)
 
         # Create a future for the request
@@ -273,7 +273,7 @@ class TestGPUWorker:
         worker = GPUWorker(device="cuda:0", worker_id=0, service=service)
 
         # Put a batch with None request_id (local mode)
-        await service.work_queue.put((1, None))
+        await service.work_queue.put((1, None, None))  # batch_id=1, request_id=None, batch_data=None
         await service.work_queue.put(None)
 
         # Run worker
