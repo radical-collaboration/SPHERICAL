@@ -103,18 +103,23 @@ correctly in a SLURM multi-node allocation.
 
 ## 3. Running
 
-### 3a. Single node — interactive or sbatch
+### 3a. Single node — interactive node
 
-Use `dragon -s` (single-node mode):
+On an already-allocated interactive GPU node run:
 
 ```bash
-source /u/$USER/ve/sgdes/bin/activate                 # Delta
-# source $PROJECT/conda_env/sgdes/bin/activate         # Bridges-2
-export TOTAL_GPUS=4   # nodes × gpus-per-node
-dragon -s run_workflow.py --config config.yaml
+bash run_interactive.sh --gpus 4
+# or with a custom config:
+bash run_interactive.sh --gpus 1 --config config_test.yaml
 ```
 
-Or submit via SLURM:
+`run_interactive.sh` activates the venv, sets `TOTAL_GPUS`, and launches
+`dragon -s` automatically.  Pass `--gpus N` to match the number of GPUs
+allocated to the node.
+
+### 3b. Single node — sbatch
+
+Submit via SLURM:
 ```bash
 sbatch delta_gpu_sbatch.sh      # Delta
 # sbatch bridges2_gpu_sbatch.sh  # Bridges-2
@@ -126,7 +131,7 @@ sbatch delta_gpu_sbatch.sh      # Delta
 #SBATCH --gpus-per-node=4
 ```
 
-### 3b. Multi-node — sbatch only
+### 3c. Multi-node — sbatch only
 
 Dragon distributes one mutation worker per GPU; each mutation runs on its
 own dedicated GPU.
@@ -146,7 +151,7 @@ The sbatch script automatically sets `TOTAL_GPUS = nodes × gpus-per-node`
 and selects `dragon -s` (single node) or `dragon -m` (multi-node) based on
 `SLURM_NNODES`.  No manual edits needed when switching between node counts.
 
-### 3c. Environment variables in the sbatch script
+### 3d. Environment variables in the sbatch script
 
 No paths are hardcoded in the Python files.  Set these exports in your sbatch
 script before the `dragon` launch line:
