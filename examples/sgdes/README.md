@@ -158,7 +158,7 @@ script before the `dragon` launch line:
 
 | Variable        | Purpose                                                        |
 |-----------------|----------------------------------------------------------------|
-| `CUDA_HOME`     | CUDA toolkit root; `$CUDA_HOME/lib64` is prepended to `LD_LIBRARY_PATH` so foldseek's ggml-CUDA backend can find `libcudart` on every node, including remote Dragon workers |
+| `CUDA_HOME`     | CUDA toolkit root; `$CUDA_HOME/lib64` is prepended to `LD_LIBRARY_PATH` on every node, including remote Dragon workers |
 | `SGDES_DIR`     | Root of the SGDES/TRILL fork; used to add `amortized_bo` to `sys.path` |
 | `SPHERICAL_DIR` | Root of the SPHERICAL repo; added to `sys.path`                |
 | `TOTAL_GPUS`    | Total GPUs across all nodes (`nodes × gpus-per-node`); set automatically by the sbatch script from SLURM variables; controls mutation concurrency |
@@ -292,12 +292,6 @@ documentation.
 
 ## 7. Design Notes
 
-**foldseek as `function_task` (not `executable_task`)**
-Launching foldseek as a direct Dragon executable subprocess causes ggml-CUDA
-initialisation to fail silently (empty `_ss` files) or hang inside Dragon's
-CUDA IPC context.  Running via `subprocess.run()` inside a Python worker thread
-avoids that context entirely.
-
 **Three `task_description` policy tiers: `_TD_GPU`, `_TD_HOST`, `_TD_CPU`**
 
 Every task in `_register_tasks` is pinned to the correct node and/or GPU via
@@ -308,23 +302,6 @@ one of three policy templates:
 | `_TD_GPU`  | `HOST_NAME` | `[gpu_id]`     | `embed`, `fold`, `foldseek_createdb` |
 | `_TD_HOST` | `HOST_NAME` | *(none)*       | `foldseek_search`                    |
 | `_TD_CPU`  | default     | *(none)*       | `seqkit_grep`, `seqkit_stats`        |
-| *(none)*   | —           | —              | `run_des`                            |
-
-`_TD_HOST` was designed to pin `run_des` to the correct node via `HOST_NAME`
-placement without `gpu_affinity` (so Dragon would not pre-initialise a CUDA IPC
-context that deadlocks TensorFlow).  However, `_TD_HOST` on `run_des` causes
-Dragon to spawn a **new managed process** on the remote node to satisfy the
-policy.  That process imports the module, initialising JAX (which is
-multithreaded), and then `_run_des` calls `os.fork()` internally via
-multiprocessing inside `amortized_bo` / TF model evaluation.  `fork()` after a
-multithreaded JAX init deadlocks reliably.
-
-`run_des` is therefore left **unbound** (no `task_description`).  Dragon runs it
-as a thread inside an existing worker — no new process, no fork-after-JAX
-problem.  `CUDA_VISIBLE_DEVICES` is set manually to point TF at the right GPU.
-
-`foldseek_search` is safe with `_TD_HOST` because it only calls `subprocess.run`
-with no fork/multiprocessing involved.
 
 **`JAX_PLATFORMS=cpu`**
 Forced at import time.  The system cuDNN may be older than what jaxlib was
@@ -347,7 +324,7 @@ All runs on Delta (NCSA) with identical config (`des_rounds=3`,
 
 ### 8a. 1 GPU per node (2026-04-05)
 
-| Nodes | GPUs/node | Mutations | Workflow | Wall   | Mut/min |
+| Nodes | GPUs/node | Mutations | Workflow | Wall   | Throughput (mut/min) |
 |------:|----------:|----------:|---------:|-------:|--------:|
 |     1 |         1 |         1 |    443 s |  ~8 m  |    0.14 |
 |     2 |         1 |         2 |    484 s |  ~9 m  |    0.25 |
@@ -357,7 +334,7 @@ Per-mutation speedup: 2 nodes → 1.8×; 4 nodes → 3.4× (91% / 85% efficiency
 
 ### 8b. 4 GPUs per node (2026-04-07)
 
-| Nodes | GPUs/node | Mutations | Workflow       | Wall    | Mut/min |
+| Nodes | GPUs/node | Mutations | Workflow       | Wall    | Throughput (mut/min) |
 |------:|----------:|----------:|---------------:|--------:|--------:|
 |     1 |         4 |         4 | 545 s (avg×2)  |   9:05  |    0.44 |
 |     2 |         4 |         8 |         710 s  |  12:47  |    0.68 |
