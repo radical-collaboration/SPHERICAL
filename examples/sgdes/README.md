@@ -338,75 +338,116 @@ first use, which would starve subsequent trill embed calls on the same GPU.
 
 ## 8. Dragon Scaling
 
-Three concurrent runs on Delta (NCSA) compared on **2026-04-05** with identical
-config (`des_rounds=3`, `des_batch_size=100`, `des_num_sequences=50`,
-`foldtune_rounds=3`, `fast_folding=true`):
+All runs on Delta (NCSA) with identical config (`des_rounds=3`,
+`des_batch_size=100`, `des_num_sequences=50`, `foldtune_rounds=3`,
+`fast_folding=true`).  Two GPU allocation strategies are compared:
 
-| Nodes | Mutations | Wall time | Per-mutation |
-|------:|----------:|----------:|-------------:|
-|     1 |         1 |     443 s |        443 s |
-|     2 |         2 |     484 s |        242 s |
-|     4 |         4 |     517 s |        129 s |
+- **1 GPU/node** — one mutation per node, dedicated CPUs/memory per mutation
+- **4 GPU/node** — four mutations per node, shared CPUs/memory/Lustre per node
 
-**Throughput scaling:** 2 nodes → 1.8× speedup per mutation; 4 nodes → 3.4× —
-roughly linear efficiency (91% at 2 nodes, 85% at 4 nodes).
+### 8a. 1 GPU per node (2026-04-05)
 
-### Round-by-round breakdown
+| Nodes | GPUs/node | Mutations | Workflow | Wall   | Mut/min |
+|------:|----------:|----------:|---------:|-------:|--------:|
+|     1 |         1 |         1 |    443 s |  ~8 m  |    0.14 |
+|     2 |         1 |         2 |    484 s |  ~9 m  |    0.25 |
+|     4 |         1 |         4 |    517 s |  ~9 m  |    0.46 |
 
-Each mutation runs three foldtune rounds (embed → DES → foldseek).  Times shown
-are per-mutation wall times, averaged across mutations when multiple ran in
-parallel (all mutations within a run execute concurrently and finish within ~1 s
-of each other):
+Per-mutation speedup: 2 nodes → 1.8×; 4 nodes → 3.4× (91% / 85% efficiency).
 
-| Round        | Component       | 1 node  | 2 nodes | 4 nodes |
-|:-------------|:----------------|--------:|--------:|--------:|
-| R1           | Input embed     |    33 s |    28 s |    59 s |
-| R1           | DES             |    47 s |    48 s |    58 s |
-| R1           | Generated embed |    31 s |    32 s |    31 s |
-| R1           | Foldseek search |    40 s |    44 s |    50 s |
-| **R1 total** |                 | **189 s** | **195 s** | **249 s** |
-| R2           | DES             |    29 s |    28 s |    28 s |
-| R2           | Generated embed |    33 s |    33 s |    32 s |
-| R2           | Foldseek search |    35 s |    33 s |    34 s |
-| **R2 total** |                 | **136 s** | **132 s** | **133 s** |
-| R3           | DES             |    29 s |    28 s |    28 s |
-| R3           | Generated embed |    32 s |    37 s |    32 s |
-| R3           | Foldseek search |    27 s |    40 s |    35 s |
-| **R3 total** |                 | **119 s** | **155 s** | **131 s** |
+### 8b. 4 GPUs per node (2026-04-07)
 
-### Observations
+| Nodes | GPUs/node | Mutations | Workflow       | Wall    | Mut/min |
+|------:|----------:|----------:|---------------:|--------:|--------:|
+|     1 |         4 |         4 | 545 s (avg×2)  |   9:05  |    0.44 |
+|     2 |         4 |         8 |         710 s  |  12:47  |    0.68 |
+|     4 |         4 |        16 |         952 s  |  16:54  |    1.01 |
 
-**Round 1 overhead at 4 nodes (+60 s vs 1 node)**
-Input embed takes 59 s on 4 nodes vs 33 s on 1 node.  The extra ~26 s is Dragon
-inter-node dispatch latency: the first embed call on a remote node incurs Dragon
-GS (Global Services) round-trips to establish the managed process and load ESM2
-weights into GPU memory.  Rounds 2–3 reuse the already-warm worker and run at
-the same speed regardless of node count.
+Two 1n×4g runs on the same node (gpub053): 492 s and 597 s — ~20% run-to-run variance
+from shared-node load.  All other configs are single runs.
 
-**DES is node-count-independent after R1**
-R2–R3 DES times (28–29 s) are identical across all three runs.  DES runs
-unbound inside an existing Dragon worker thread — no inter-node scheduling
-overhead — and TF model weights are already loaded from R1.
+Throughput scaling: 2n×4g → 1.5×; 4n×4g → 2.3× over 1n×4g (77% / 57% efficiency).
 
-**Foldseek varies more at scale**
-R1 foldseek search grows from 40 s (1 node) to 50 s (4 nodes) because four
-concurrent `foldseek easy-search` processes compete for Lustre I/O bandwidth
-when reading the reference DB.  R2–R3 foldseek is near-identical (33–35 s)
-since the Lustre metadata is cached.
+### 8c. Round-by-round breakdown
+
+Times shown are per-mutation wall times (all mutations synchronized, finish
+within ~1 s of each other).  `4n×1g` = avg of 3 runs; `1n×4g` = avg of 2 runs.
+
+| Round        | 1n×1g | 4n×1g (avg) | 1n×4g (avg) | 2n×4g | 4n×4g |
+|:-------------|------:|------------:|------------:|------:|------:|
+| **R1 total** | 189 s |       227 s |       230 s | 329 s | 447 s |
+| **R2 total** | 136 s |       153 s |       147 s | 195 s | 262 s |
+| **R3 total** | 119 s |       149 s |       169 s | 186 s | 242 s |
+| **Total**    | **443 s** | **528 s** | **545 s** | **710 s** | **952 s** |
+
+### 8d. Observations
+
+**1n×4g ≈ 4n×1g — foldseek CPU contention offsets Dragon overhead**
+
+Running 4 mutations on 1 node (4 GPUs) takes 492–597 s across two runs (avg 545 s),
+comparable to the 4-node × 1-GPU average of 528 s.  Two opposing effects cancel:
+
+- On 4 separate nodes, each mutation has all 64 CPUs to itself → foldseek runs
+  at full speed, but Dragon incurs ~20–30 s of inter-node dispatch overhead per
+  round.
+- On 1 node with 4 mutations sharing 64 CPUs, each foldseek process gets ~16
+  CPUs → foldseek slows by roughly the same amount that Dragon overhead saves.
+
+**R1 grows with mutations-per-node, not just node count**
+
+R1 is 230 s avg for 1n×4g (4 mutations, 1 node) vs 189 s for 1n×1g (1 mutation).
+Adding GPUs per node means more concurrent foldseek processes and more
+simultaneous ESM2 weight loads competing for Lustre bandwidth — even on the
+same node.  The R1 overhead in 4n×4g (447 s) reflects both Dragon inter-node
+latency and per-node 4-way resource contention.
+
+**R2/R3 grow with GPUs per node, not with node count**
+
+For 1-GPU-per-node runs, R2/R3 are flat across 1–4 nodes (~130–155 s) because
+each node handles one foldseek process with full CPU resources and warm Lustre
+cache.  For 4-GPU-per-node runs, R2/R3 grow (147→195→262 s) because 4
+concurrent foldseek processes per node compete for CPUs even in warm rounds.
+
+**Throughput vs. per-mutation latency trade-off**
+
+| Goal | Best config |
+|------|-------------|
+| Lowest per-mutation latency | 1n×1g or 1n×4g |
+| Highest mutations/min | 4n×4g (1.01 mut/min) |
+| Best GPU efficiency | 1n×4g (comparable throughput to 4n×1g at 1/4 the nodes) |
 
 **Practical guideline**
-For ≤ 4 mutations the per-mutation overhead of multi-node Dragon is negligible
-beyond R1 cold-start.  Scaling beyond 4 nodes (more mutations) is expected to
-remain near-linear for R2+ while R1 overhead grows proportionally with the
-number of remote nodes.
 
-### GPU utilization across all 4 nodes (4-node run)
+Use `--nodes=1 --gpus-per-node=4` for quick iteration on ≤4 mutations — it
+gives comparable throughput to 4 separate single-GPU nodes (within ~20% run-to-run
+variance) while consuming far fewer resources.  Use `--nodes=N --gpus-per-node=4` to scale to 4N mutations with
+~50% parallel efficiency; the wall time grows sub-linearly (~2× wall for 4×
+mutations).
+
+### 8e. GPU utilization across all 4 nodes (4-node, 1-GPU-per-node run)
 
 ![GPU utilization — all 4 nodes](gpu_util.png)
 
 Each subplot is one node (gpub004, gpub029, gpub051, gpub085).  The GPU
-utilization patterns (black) are nearly identical across all four nodes —
-each node carries exactly one mutation, performs the same embed → DES →
-foldseek sequence, and saturates the GPU at the same workflow stages.  The
-symmetric load distribution confirms that Dragon's `HOST_NAME` + `gpu_affinity`
-policy correctly pins one mutation per node with no skew.
+utilization patterns are nearly identical across all four nodes — each node
+carries exactly one mutation, performs the same embed → DES → foldseek
+sequence, and saturates the GPU at the same workflow stages.  The symmetric
+load distribution confirms that Dragon's `HOST_NAME` + `gpu_affinity` policy
+correctly pins one mutation per node with no skew.
+
+### 8f. GPU utilization — 4 nodes × 4 GPUs per node (4n×4g run)
+
+![GPU/CPU utilization — 4 nodes × 4 GPUs](dragon_multiGPUs.png)
+
+Each subplot is one node (gpub060, gpub061, gpub076, gpub094), showing all 4
+GPUs (solid colors) and CPU (red dashed) over ~950 s.  Key observations:
+
+- All 4 GPUs on each node fire in lock-step: the colored utilization spikes for
+  GPU 0–3 are nearly simultaneous within a node, confirming that Dragon's
+  `gpu_affinity=[0..3]` policies distribute the 4 mutations evenly across the 4
+  GPUs on each node.
+- CPU (red dashed) spikes between GPU bursts correspond to foldseek and ESM2
+  embedding steps — the 4-way concurrent foldseek processes drive CPU to 80–100%,
+  consistent with the slower R1/R2/R3 times vs. 1-GPU-per-node runs.
+- The pattern is consistent across all 4 nodes, showing symmetric load
+  distribution in the multi-node multi-GPU configuration.

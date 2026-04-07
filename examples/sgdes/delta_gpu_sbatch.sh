@@ -1,12 +1,12 @@
 #!/bin/sh -l
 
-#SBATCH -A bblj-delta-gpu 
+#SBATCH -A ***-delta-gpu 
 #xSBATCH -A bebo-delta-gpu 
 #SBATCH --partition=gpuA40x4
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=4
 #xSBATCH --exclusive
 #SBATCH --time=00:30:00
 #SBATCH --job-name=sgdes

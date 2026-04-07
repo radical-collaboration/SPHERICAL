@@ -6,7 +6,7 @@
 # to reproduce /u/mgoliyad1/ve/sgdes.
 #
 # Usage:
-#   bash install_env.sh [--env-dir DIR] [--sgdes-dir DIR] [--spherical-dir DIR]
+#   bash delta_env_setup.sh [--env-dir DIR] [--sgdes-dir DIR] [--spherical-dir DIR]
 #
 # Defaults:
 #   ENV_DIR       = /u/$USER/ve/sgdes
@@ -70,12 +70,17 @@ echo "── Step 1: Creating venv ──"
 # sys.version as '3.11.13 | packaged by conda-forge | ...', which its own
 # platform.py regex cannot parse — a Cray PE packaging bug that breaks
 # get-pip.py, cloudpickle, and other tools that call platform.python_version().
-# Use python3.11 from PATH (conda-forge Python with the patched platform.py)
-# to create the venv instead.
-BASE_PY=$(command -v python3.11)
+# Use python3.11 from the anaconda3 module (conda-forge Python with the patched
+# platform.py) to create the venv instead.
+BASE_PY=$(command -v python3.11 2>/dev/null || true)
 if [ -z "${BASE_PY}" ]; then
-    echo "ERROR: python3.11 not found in PATH."
-    echo "       Activate a conda env with Python 3.11 first."
+    echo "python3.11 not in PATH — loading anaconda3 module..."
+    module load cray-python/3.11.7 2>/dev/null || true
+    BASE_PY=$(command -v python3.11 2>/dev/null || true)
+fi
+if [ -z "${BASE_PY}" ]; then
+    echo "ERROR: python3.11 not found even after loading anaconda3."
+    echo "       Run: module load anaconda3"
     exit 1
 fi
 echo "Using Python: ${BASE_PY} ($(${BASE_PY} --version))"

@@ -69,14 +69,21 @@ def find_gpus():
     Uses Dragon's native machine API to enumerate all nodes and their GPUs.
     node.gpus may be None on CPU-only nodes (e.g. login nodes), so we guard
     with `or []` to skip them safely.
+
+    Under `dragon -s` (single-node mode) node.hostname returns 'localhost',
+    which resolves to host_id=-1 and causes a ~54 s scheduling timeout per
+    task.  We substitute the real hostname in that case.
     """
+    import socket
     from dragon.native.machine import Node, System
 
+    real_hostname = socket.gethostname()
     all_gpus = []
     for huid in System().nodes:
         node = Node(huid)
+        hostname = node.hostname if node.hostname != "localhost" else real_hostname
         for gpu_id in node.gpus or []:
-            all_gpus.append((node.hostname, gpu_id))
+            all_gpus.append((hostname, gpu_id))
     return all_gpus
 
 
