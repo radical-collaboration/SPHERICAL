@@ -146,7 +146,8 @@ async def generate_handler(request: web.Request) -> web.Response:
 
         if not batch_ids:
             return web.json_response(
-                {"status": "error", "message": "batch_ids or batch_id+batch is required"}, status=400
+                {"status": "error", "message": "batch_ids or batch_id+batch is required"},
+                status=400,
             )
 
         if DEBUG:

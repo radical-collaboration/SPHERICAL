@@ -3,12 +3,8 @@
 # =============================================================================
 
 # ── Telemetry ─────────────────────────────────────────────────────────────────
-collect_nvml_telemetry:    true          # per-node GPU util via NVML (all nodes)
 collect_dragon_telemetry:  true          # Dragon runtime metrics (dragon engine only)
-nvml_dir:                  "nvml-telemetry"
 dragon_telemetry_dir:      "dragon-telemetry"
-nvml_collection_rate:      1.0
-nvml_checkpoint_interval:  30.0
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # outdir: base directory; the workflow appends {mutation}_wd automatically.
@@ -37,18 +33,18 @@ mutations:
   - Y155T
   - Y198I
   - A272I
-  # - V266A
-  # - A226C
-  # - Y155H
-  # - A281V
-  # - A226V
-  # - A272V
-  # - Y155L
-  # - F257L
-  # - F49S
-  # - V84L
-  # - L283I
-  # - N186S
+  - V266A
+  - A226C
+  - Y155H
+  - A281V
+  - A226V
+  - A272V
+  - Y155L
+  - F257L
+  - F49S
+  - V84L
+  - L283I
+  - N186S
   # - Q182P
   # - T215V
   # - S230P

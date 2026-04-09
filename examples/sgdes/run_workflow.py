@@ -25,9 +25,6 @@ concurrent — LocalExecutionBackend backed by ProcessPoolExecutor; no GPU affin
 
 Telemetry (set via config.yaml)
 --------------------------------
-collect_nvml_telemetry   — GPU utilisation via NVML; a NvmlMonitor is started on
-                           each worker node via Dragon function tasks so all nodes
-                           are captured.  Output: nvml_dir/ (default nvml-telemetry/).
 collect_dragon_telemetry — Dragon runtime metrics via DragonTelemetryCollector;
                            only active when engine=dragon.  Output: dragon_telemetry_dir/
                            (default dragon-telemetry/).
@@ -166,10 +163,6 @@ async def main(config_file: str) -> None:
         policies = None
 
     wf = SGDESWorkflow(config, asyncflow=asyncflow, policies=policies)
-
-    # NvmlMonitor is started per-node inside SGDESWorkflow._sgdes_async via
-    # Dragon function tasks (start_node_telemetry / stop_node_telemetry), so
-    # all worker nodes are captured automatically.  No head-node monitor needed.
 
     print(
         f"Starting {len(wf.mutations)} mutations "

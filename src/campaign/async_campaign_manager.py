@@ -47,6 +47,7 @@ from ..utils.logger import Logger
 # GPU helpers
 # ---------------------------------------------------------------------------
 
+
 def _find_gpus() -> List[Tuple[str, int]]:
     """Return [(hostname, gpu_id), ...] for every GPU visible to Dragon.
 
@@ -55,6 +56,7 @@ def _find_gpus() -> List[Tuple[str, int]]:
     """
     try:
         from dragon.native.machine import System, Node
+
         gpus = []
         for huid in System().nodes:
             node = Node(huid)
@@ -80,6 +82,7 @@ def _make_policies(gpu_pool: List[Tuple[str, int]], gpu_ids: List[int]) -> List:
         return []
     try:
         from dragon.infrastructure.policy import Policy
+
         hostname = gpu_pool[0][0]  # single-node: all GPUs share the same host
         return [
             Policy(
@@ -96,33 +99,34 @@ def _make_policies(gpu_pool: List[Tuple[str, int]], gpu_ids: List[int]) -> List:
 # Internal group descriptor
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _GroupInfo:
-    name:                str
-    workflow_class:      Type[BaseWorkflow]
-    replicas:            int
-    dependencies:        List[str]
-    group_config:        Optional[dict]
-    configured_replicas: int  = 0
-    priority:            int  = 0
-    min_replicas:        int  = 0
-    max_replicas:        int  = 0
-    required_cpus:       int  = 0
-    required_gpus:       int  = 0
-    dep_threshold:       int  = 1
-    entry_point:         str  = "run"
-    status:              str  = "pending"
-    started_count:       int  = 0
-    running_count:       int  = 0
-    finished_replicas:   int  = 0
+    name: str
+    workflow_class: Type[BaseWorkflow]
+    replicas: int
+    dependencies: List[str]
+    group_config: Optional[dict]
+    configured_replicas: int = 0
+    priority: int = 0
+    min_replicas: int = 0
+    max_replicas: int = 0
+    required_cpus: int = 0
+    required_gpus: int = 0
+    dep_threshold: int = 1
+    entry_point: str = "run"
+    status: str = "pending"
+    started_count: int = 0
+    running_count: int = 0
+    finished_replicas: int = 0
     # Set to True when the workflow explicitly signals it has produced enough
     # data (via cm.signal_ready).  Takes precedence over dep_threshold check.
-    ready:               bool = False
+    ready: bool = False
     # GPU IDs currently held by all running replicas of this group.
     # Populated by _allocate_locked; cleared by _on_replica_finished.
     # Injected into each replica's config so shared services (e.g. inference)
     # can initialise on all group-level GPUs rather than just the first one.
-    running_gpu_ids:     List[int] = field(default_factory=list)
+    running_gpu_ids: List[int] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -152,26 +156,24 @@ class AsyncCampaignManager:
         num_workers: Optional[int] = None,
         debug: bool = False,
     ) -> None:
-        self._log         = Logger(name="AsyncCampaignManager", use_colors=True)
-        self._seq         = itertools.count()
-        self._lock        = asyncio.Lock()
+        self._log = Logger(name="AsyncCampaignManager", use_colors=True)
+        self._seq = itertools.count()
+        self._lock = asyncio.Lock()
         self._engine_type = engine
         self._num_workers = num_workers
-        self._debug       = debug
-        self._asyncflow    = None   # created in start()
+        self._debug = debug
+        self._asyncflow = None  # created in start()
         self._engine_dragon = None  # DragonExecutionBackendV3
-        self._gpu_pool:              List[Tuple[str, int]] = []  # populated after Dragon init
-        self._free_gpu_ids:          List[int]             = []  # available GPU IDs
+        self._gpu_pool: List[Tuple[str, int]] = []  # populated after Dragon init
+        self._free_gpu_ids: List[int] = []  # available GPU IDs
         self._replica_gpu_assignments: Dict[str, List[int]] = {}  # replica_id → [gpu_ids]
-        self._resources   = ResourcePool(total_cpus=total_cpus, total_gpus=total_gpus)
+        self._resources = ResourcePool(total_cpus=total_cpus, total_gpus=total_gpus)
 
-        self._groups: Dict[str, _GroupInfo]    = {}
-        self._stats:  Dict[str, WorkflowStats] = {}
+        self._groups: Dict[str, _GroupInfo] = {}
+        self._stats: Dict[str, WorkflowStats] = {}
         self._all_done = asyncio.Event()
 
-        self._log.info(
-            f"AsyncCampaignManager initialised (engine={engine})"
-        )
+        self._log.info(f"AsyncCampaignManager initialised (engine={engine})")
 
     # ------------------------------------------------------------------
     # Alternative constructor
@@ -198,17 +200,20 @@ class AsyncCampaignManager:
         )
 
         _cm_keys = {
-            "replicas", "dependencies", "dependency_threshold",
-            "priority", "min_replicas", "max_replicas",
-            "required_cpus", "required_gpus",
+            "replicas",
+            "dependencies",
+            "dependency_threshold",
+            "priority",
+            "min_replicas",
+            "max_replicas",
+            "required_cpus",
+            "required_gpus",
         }
 
         for name, wf_cfg in config.get("workflows", {}).items():
             wf_class = workflow_registry.get(name)
             if wf_class is None:
-                cm._log.warning(
-                    f"from_config: no class registered for {name!r} — skipping"
-                )
+                cm._log.warning(f"from_config: no class registered for {name!r} — skipping")
                 continue
 
             cm.register_group(
@@ -222,8 +227,7 @@ class AsyncCampaignManager:
                 max_replicas=int(wf_cfg.get("max_replicas", 0)),
                 required_cpus=int(wf_cfg.get("required_cpus", 0)),
                 required_gpus=int(wf_cfg.get("required_gpus", 0)),
-                config={k: v for k, v in wf_cfg.items()
-                        if k not in _cm_keys} or None,
+                config={k: v for k, v in wf_cfg.items() if k not in _cm_keys} or None,
             )
 
         return cm
@@ -234,11 +238,10 @@ class AsyncCampaignManager:
 
     @staticmethod
     def _resolve_entry_point(workflow_class: Type[BaseWorkflow]) -> str:
-        has_run   = workflow_class.run is not BaseWorkflow.run
-        has_start = (
-            "start" in workflow_class.__dict__ or
-            (hasattr(workflow_class, "start") and
-             workflow_class.start is not getattr(BaseWorkflow, "start", None))
+        has_run = workflow_class.run is not BaseWorkflow.run
+        has_start = "start" in workflow_class.__dict__ or (
+            hasattr(workflow_class, "start")
+            and workflow_class.start is not getattr(BaseWorkflow, "start", None)
         )
 
         if has_run and has_start:
@@ -247,9 +250,7 @@ class AsyncCampaignManager:
                 "choose exactly one as the workflow entry point"
             )
         if not has_run and not has_start:
-            raise ValueError(
-                f"{workflow_class.__name__} must define either 'run' or 'start'"
-            )
+            raise ValueError(f"{workflow_class.__name__} must define either 'run' or 'start'")
         return "run" if has_run else "start"
 
     def register_group(
@@ -267,7 +268,7 @@ class AsyncCampaignManager:
         config: Optional[dict] = None,
     ) -> None:
         """Register a workflow group."""
-        entry_point   = self._resolve_entry_point(workflow_class)
+        entry_point = self._resolve_entry_point(workflow_class)
         effective_max = max_replicas if max_replicas > 0 else replicas
 
         self._groups[name] = _GroupInfo(
@@ -305,6 +306,7 @@ class AsyncCampaignManager:
         if self._debug:
             try:
                 from rhapsody import enable_logging
+
                 enable_logging(level="DEBUG")
                 self._log.warning("rhapsody.enable_logging")
             except ImportError:
@@ -315,9 +317,10 @@ class AsyncCampaignManager:
         if self._engine_type == "dragon":
             try:
                 from rhapsody.backends import DragonExecutionBackendV3
+
                 self._engine_dragon = await DragonExecutionBackendV3(**kw)
-                self._gpu_pool      = _find_gpus()
-                self._free_gpu_ids  = [gid for _, gid in self._gpu_pool]
+                self._gpu_pool = _find_gpus()
+                self._free_gpu_ids = [gid for _, gid in self._gpu_pool]
                 # Sync ResourcePool to actual GPU count so can_fit() and
                 # _free_gpu_ids stay consistent.  config total_gpus acts as
                 # an upper bound; actual discovery takes precedence.
@@ -328,12 +331,15 @@ class AsyncCampaignManager:
                         f"!= discovered GPUs={actual_gpus} — "
                         f"capping ResourcePool to {actual_gpus}"
                     )
-                    self._resources.total_gpus     = actual_gpus
+                    self._resources.total_gpus = actual_gpus
                     self._resources.available_gpus = actual_gpus
                 self._log.info(
                     f"GPU pool: {len(self._gpu_pool)} GPU(s) — "
-                    + (", ".join(f"{h}:{g}" for h, g in self._gpu_pool)
-                       if self._gpu_pool else "none found")
+                    + (
+                        ", ".join(f"{h}:{g}" for h, g in self._gpu_pool)
+                        if self._gpu_pool
+                        else "none found"
+                    )
                 )
                 backend = self._engine_dragon
             except ImportError:
@@ -344,6 +350,7 @@ class AsyncCampaignManager:
 
         if self._engine_type == "concurrent":
             from rhapsody.backends import ConcurrentExecutionBackend
+
             backend = await ConcurrentExecutionBackend()
             # In concurrent mode Dragon is absent, so _free_gpu_ids is empty.
             # Auto-detect CUDA GPUs and populate it so assigned_gpu_ids is
@@ -351,13 +358,14 @@ class AsyncCampaignManager:
             if not self._free_gpu_ids:
                 try:
                     import torch
+
                     n = torch.cuda.device_count()
                 except Exception:
                     try:
                         import subprocess, re
+
                         out = subprocess.check_output(
-                            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                            text=True
+                            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], text=True
                         )
                         n = len(out.strip().splitlines())
                     except Exception:
@@ -387,9 +395,7 @@ class AsyncCampaignManager:
         """Block (async) until all workflow groups have finished."""
         if timeout is not None:
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._all_done.wait()), timeout=timeout
-                )
+                await asyncio.wait_for(asyncio.shield(self._all_done.wait()), timeout=timeout)
                 return True
             except asyncio.TimeoutError:
                 return False
@@ -425,10 +431,7 @@ class AsyncCampaignManager:
             if group is None or group.ready:
                 return
             group.ready = True
-            self._log.info(
-                f"Group {group_name!r} signaled ready — "
-                f"unblocking dependents"
-            )
+            self._log.info(f"Group {group_name!r} signaled ready — unblocking dependents")
         await self._schedule()
 
     async def add_replicas(self, group_name: str, n: int = 1) -> None:
@@ -441,9 +444,7 @@ class AsyncCampaignManager:
         async with self._lock:
             group = self._groups.get(group_name)
             if group is None:
-                self._log.warning(
-                    f"add_replicas: group {group_name!r} not found — ignoring"
-                )
+                self._log.warning(f"add_replicas: group {group_name!r} not found — ignoring")
                 return
             cap = group.configured_replicas
             if group.replicas >= cap:
@@ -468,20 +469,20 @@ class AsyncCampaignManager:
             "resources": self._resources.as_dict(),
             "groups": {
                 name: {
-                    "status":              g.status,
-                    "priority":            g.priority,
-                    "replicas_total":      g.replicas,
+                    "status": g.status,
+                    "priority": g.priority,
+                    "replicas_total": g.replicas,
                     "replicas_configured": g.configured_replicas,
-                    "replicas_started":    g.started_count,
-                    "replicas_running":    g.running_count,
-                    "replicas_finished":   g.finished_replicas,
-                    "min_replicas":        g.min_replicas,
-                    "max_replicas":        g.max_replicas,
-                    "required_cpus":       g.required_cpus,
-                    "required_gpus":       g.required_gpus,
-                    "dep_threshold":       g.dep_threshold,
-                    "ready":               g.ready,
-                    "dependencies":        g.dependencies,
+                    "replicas_started": g.started_count,
+                    "replicas_running": g.running_count,
+                    "replicas_finished": g.finished_replicas,
+                    "min_replicas": g.min_replicas,
+                    "max_replicas": g.max_replicas,
+                    "required_cpus": g.required_cpus,
+                    "required_gpus": g.required_gpus,
+                    "dep_threshold": g.dep_threshold,
+                    "ready": g.ready,
+                    "dependencies": g.dependencies,
                 }
                 for name, g in self._groups.items()
             },
@@ -489,10 +490,7 @@ class AsyncCampaignManager:
 
     def stats(self) -> Dict[str, WorkflowStats]:
         """Per-workflow-group statistics."""
-        return {
-            name: WorkflowStats(**vars(s))
-            for name, s in self._stats.items()
-        }
+        return {name: WorkflowStats(**vars(s)) for name, s in self._stats.items()}
 
     # ------------------------------------------------------------------
     # Internal — scheduler
@@ -537,9 +535,9 @@ class AsyncCampaignManager:
         self._stats[group.name].replicas_started = group.started_count
         # Pop specific GPU IDs from the global free pool (FIFO).
         replica_id = f"{group.name}_{idx}"
-        gpu_ids = [self._free_gpu_ids.pop(0)
-                   for _ in range(group.required_gpus)
-                   if self._free_gpu_ids]
+        gpu_ids = [
+            self._free_gpu_ids.pop(0) for _ in range(group.required_gpus) if self._free_gpu_ids
+        ]
         self._replica_gpu_assignments[replica_id] = gpu_ids
         group.running_gpu_ids.extend(gpu_ids)
         if gpu_ids:
@@ -563,7 +561,8 @@ class AsyncCampaignManager:
         to_start: List[Tuple[_GroupInfo, int]] = []
 
         eligible = [
-            g for g in self._groups.values()
+            g
+            for g in self._groups.values()
             if g.status != "done"
             and g.started_count < g.replicas
             and self._deps_satisfied_locked(g)
@@ -572,9 +571,7 @@ class AsyncCampaignManager:
         for g in eligible:
             if g.status == "pending":
                 g.status = "running"
-                self._log.info(
-                    f"Group {g.name!r} is now eligible — status → running"
-                )
+                self._log.info(f"Group {g.name!r} is now eligible — status → running")
 
         eligible.sort(key=lambda g: g.priority, reverse=True)
 
@@ -609,6 +606,7 @@ class AsyncCampaignManager:
                 )
 
         if to_start:
+
             def _gpu_tag(g, idx):
                 ids = self._replica_gpu_assignments.get(f"{g.name}_{idx}", [])
                 return f"gpu={ids}" if ids else ""
@@ -630,10 +628,7 @@ class AsyncCampaignManager:
                 )
                 _abbrevs[g.name] = ch
                 _used.add(ch)
-            viz = "".join(
-                _abbrevs[g.name] * g.running_count
-                for g in self._groups.values()
-            )
+            viz = "".join(_abbrevs[g.name] * g.running_count for g in self._groups.values())
             self._log.info(
                 f"Scheduling: [{summary}] | [{viz}] replicas: {replica_status}"
                 f" | resources: {self._resources.usage_str()}"
@@ -655,10 +650,10 @@ class AsyncCampaignManager:
 
     async def _run_replica(self, group: _GroupInfo, replica_idx: int) -> None:
         """Execute one replica of a workflow group."""
-        replica_id  = f"{group.name}_{replica_idx}"
+        replica_id = f"{group.name}_{replica_idx}"
         final_state = "done"
 
-        gpu_ids  = self._replica_gpu_assignments.get(replica_id, [])
+        gpu_ids = self._replica_gpu_assignments.get(replica_id, [])
         policies = _make_policies(self._gpu_pool, gpu_ids)
 
         res_tag = ""
@@ -667,10 +662,7 @@ class AsyncCampaignManager:
         if gpu_ids:
             host = self._gpu_pool[0][0] if self._gpu_pool else "?"
             res_tag += f" [gpu_affinity={gpu_ids} host={host}]"
-        self._log.info(
-            f"  starting replica {replica_id!r} "
-            f"(priority={group.priority}){res_tag}"
-        )
+        self._log.info(f"  starting replica {replica_id!r} (priority={group.priority}){res_tag}")
 
         # Inject GPU IDs into config so workflows that initialize services
         # in-process (e.g. inference) can select the correct CUDA devices
@@ -694,7 +686,6 @@ class AsyncCampaignManager:
             engine_dragon=self._engine_dragon,
         )
 
-
         entry = getattr(wf, group.entry_point)
         try:
             if asyncio.iscoroutinefunction(entry):
@@ -707,9 +698,7 @@ class AsyncCampaignManager:
             # Catch BaseException (not just Exception) so that unusual raises
             # like StopAsyncIteration or KeyboardInterrupt still reach
             # _handle_replica_done — otherwise the campaign hangs forever.
-            self._log.error(
-                f"Replica {replica_id!r} raised: {type(exc).__name__}: {exc}"
-            )
+            self._log.error(f"Replica {replica_id!r} raised: {type(exc).__name__}: {exc}")
             final_state = "failed"
 
         await self._handle_replica_done(wf, group, replica_id, replica_idx, final_state)
@@ -730,26 +719,22 @@ class AsyncCampaignManager:
             else:
                 hook(replica_id, self, final_state)
         except Exception as exc:
-            self._log.error(
-                f"Replica {replica_id!r} on_replica_done raised: {exc}"
-            )
+            self._log.error(f"Replica {replica_id!r} on_replica_done raised: {exc}")
 
         await self._on_replica_finished(group, replica_id)
 
-    async def _on_replica_finished(
-        self, group: _GroupInfo, replica_id: str
-    ) -> None:
+    async def _on_replica_finished(self, group: _GroupInfo, replica_id: str) -> None:
         """Update group counters and re-run scheduler."""
         group_done = False
         async with self._lock:
             group.finished_replicas += 1
-            group.running_count     -= 1
+            group.running_count -= 1
             self._resources.release(group.required_cpus, group.required_gpus)
             self._stats[group.name].replicas_finished = group.finished_replicas
 
             if group.finished_replicas >= group.replicas:
                 group.status = "done"
-                group_done   = True
+                group_done = True
 
         freed_gpu_ids = self._replica_gpu_assignments.pop(replica_id, [])
         self._free_gpu_ids.extend(freed_gpu_ids)
@@ -762,8 +747,7 @@ class AsyncCampaignManager:
         if freed_gpu_ids:
             if self._replica_gpu_assignments:
                 asgn_str = ", ".join(
-                    f"{rid}→{gids}"
-                    for rid, gids in sorted(self._replica_gpu_assignments.items())
+                    f"{rid}→{gids}" for rid, gids in sorted(self._replica_gpu_assignments.items())
                 )
                 self._log.info(
                     f"  GPU freed: {replica_id!r} released {freed_gpu_ids}"
@@ -785,8 +769,7 @@ class AsyncCampaignManager:
             )
         if freed_gpu_ids:
             release_tag += (
-                f" [freed gpu_affinity={freed_gpu_ids}"
-                f" | free_gpus={sorted(self._free_gpu_ids)}]"
+                f" [freed gpu_affinity={freed_gpu_ids} | free_gpus={sorted(self._free_gpu_ids)}]"
             )
         self._log.info(f"Replica {replica_id!r} finished{release_tag}")
 
@@ -801,9 +784,7 @@ class AsyncCampaignManager:
         await self._schedule()
 
         async with self._lock:
-            all_done = bool(self._groups) and all(
-                g.status == "done" for g in self._groups.values()
-            )
+            all_done = bool(self._groups) and all(g.status == "done" for g in self._groups.values())
 
         if all_done:
             self._all_done.set()

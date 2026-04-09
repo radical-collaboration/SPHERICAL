@@ -80,15 +80,15 @@ class InferenceService(ABC):
         self.max_batch_tokens = int(self.config.get("max_batch_tokens", 16000))
         self.num_workers_per_gpu = int(self.config.get("num_workers_per_gpu", 1))
         self.debug = self.config.get("debug", False)
-        self.cancel_io = self.config.get("cancel_io", True)  # Don't wait for all outputs to be saed to disk
+        self.cancel_io = self.config.get(
+            "cancel_io", True
+        )  # Don't wait for all outputs to be saed to disk
         self.use_streaming = self.config.get("use_streaming", False)
         self.output_dir = Path(self.config.get("output_dir", "./"))
         if client_mode:
             self.results_dir = Path(self.config.get("results_dir", "results"))
         else:
-            self.results_dir = ensure_dir(
-                Path(self.config.get("results_dir", "results"))
-            )
+            self.results_dir = ensure_dir(Path(self.config.get("results_dir", "results")))
 
         self.logger.info(
             f"[rank {self.rank}] Configuration: "
@@ -206,7 +206,6 @@ class InferenceService(ABC):
             self.logger.info(f"[rank {self.rank}] Waiting for disk I/O to complete...")
         await self.processed_queue.join()
         await self.processed_queue.put(None)
-
 
         await self.work_queue.join()
         for _ in self.workers:
@@ -355,7 +354,9 @@ class InferenceService(ABC):
                     self.logger.info(f"[rank {self.rank}] Received shutdown sentinel")
                     break
 
-                self.work_queue.put_nowait((batch_id, None, None))  # None request_id, None batch_data for local mode
+                self.work_queue.put_nowait(
+                    (batch_id, None, None)
+                )  # None request_id, None batch_data for local mode
                 batch_count += 1
 
                 if self.debug and batch_count % 100 == 0:

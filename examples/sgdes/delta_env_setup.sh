@@ -266,6 +266,10 @@ echo "── Step 8: Re-pinning critical versions ──"
     "fsspec[http]==2024.6.1" \
     "cloudpickle>=3.0"
 
+# pynvml is a deprecated wrapper around nvidia-ml-py that triggers a FutureWarning
+# from torch.cuda.  nvidia-ml-py (already a direct dep) provides the same API.
+"${PIP}" uninstall -q -y pynvml 2>/dev/null || true
+
 # ── 9. foldseek GPU binary ────────────────────────────────────────────────────
 echo ""
 echo "── Step 9: foldseek GPU binary ──"

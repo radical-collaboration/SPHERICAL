@@ -246,15 +246,15 @@ def init_collector(collector_dir: str) -> Optional[Any]:
         Path(collector_dir).mkdir(parents=True, exist_ok=True)
 
         collector = DragonTelemetryCollector(
-                    collection_rate=1.0,              # Collect every second
-                    checkpoint_interval=30.0,          # Checkpoint every 30 seconds
-                    checkpoint_dir=collector_dir,      # Save checkpoints here
-                    checkpoint_count=150,              # Keep last 10 checkpoints
-                    enable_cpu=True,
-                    enable_gpu=True,
-                    enable_memory=False,
-                    metric_prefix="SPHERICAL-inference"   # Prefix all metrics
-                )
+            collection_rate=1.0,  # Collect every second
+            checkpoint_interval=30.0,  # Checkpoint every 30 seconds
+            checkpoint_dir=collector_dir,  # Save checkpoints here
+            checkpoint_count=150,  # Keep last 10 checkpoints
+            enable_cpu=True,
+            enable_gpu=True,
+            enable_memory=False,
+            metric_prefix="SPHERICAL-inference",  # Prefix all metrics
+        )
         return collector
 
     except ImportError:

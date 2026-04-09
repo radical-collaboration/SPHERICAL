@@ -102,9 +102,9 @@ class ResourcePool:
 
     def as_dict(self) -> dict:
         return {
-            "total_cpus":     self.total_cpus,
+            "total_cpus": self.total_cpus,
             "available_cpus": self.available_cpus,
-            "total_gpus":     self.total_gpus,
+            "total_gpus": self.total_gpus,
             "available_gpus": self.available_gpus,
         }
 
@@ -162,6 +162,7 @@ class BaseWorkflow:
         No-op if no callback was provided.
         """
         import asyncio
+
         if self._on_ready is not None:
             result = self._on_ready()
             if asyncio.iscoroutine(result):
@@ -174,8 +175,7 @@ class BaseWorkflow:
         Override in subclasses (or define ``start`` instead).
         """
         raise NotImplementedError(
-            f"{type(self).__name__}.run() not implemented "
-            f"(replica_id={replica_id!r})"
+            f"{type(self).__name__}.run() not implemented (replica_id={replica_id!r})"
         )
 
     def on_replica_done(
@@ -201,7 +201,7 @@ class BaseWorkflow:
 class WorkflowStats:
     """Cumulative statistics for one workflow group."""
 
-    replicas_started:  int = 0
+    replicas_started: int = 0
     replicas_finished: int = 0
 
 
@@ -212,20 +212,20 @@ class WorkflowStats:
 
 @dataclass
 class _GroupInfo:
-    name:              str
-    workflow_class:    Type[BaseWorkflow]
-    replicas:          int
-    dependencies:      List[str]
-    group_config:      Optional[dict]
-    priority:          int = 0
-    min_replicas:      int = 0
-    max_replicas:      int = 0
-    required_cpus:     int = 0
-    required_gpus:     int = 0
-    entry_point:       str = "run"
-    status:            str = "pending"
-    started_count:     int = 0
-    running_count:     int = 0
+    name: str
+    workflow_class: Type[BaseWorkflow]
+    replicas: int
+    dependencies: List[str]
+    group_config: Optional[dict]
+    priority: int = 0
+    min_replicas: int = 0
+    max_replicas: int = 0
+    required_cpus: int = 0
+    required_gpus: int = 0
+    entry_point: str = "run"
+    status: str = "pending"
+    started_count: int = 0
+    running_count: int = 0
     finished_replicas: int = 0
 
 
@@ -251,8 +251,8 @@ class CampaignManager:
         total_cpus: int = 0,
         total_gpus: int = 0,
     ) -> None:
-        self._executor  = ThreadPoolExecutor(max_workers=max_workers or 8)
-        self._log       = Logger(name="CampaignManager", use_colors=True)
+        self._executor = ThreadPoolExecutor(max_workers=max_workers or 8)
+        self._log = Logger(name="CampaignManager", use_colors=True)
         self._resources = ResourcePool(total_cpus=total_cpus, total_gpus=total_gpus)
 
         self._lock = threading.Lock()
@@ -295,16 +295,19 @@ class CampaignManager:
         )
 
         _cm_keys = {
-            "replicas", "dependencies", "priority", "min_replicas", "max_replicas",
-            "required_cpus", "required_gpus",
+            "replicas",
+            "dependencies",
+            "priority",
+            "min_replicas",
+            "max_replicas",
+            "required_cpus",
+            "required_gpus",
         }
 
         for name, wf_cfg in config.get("workflows", {}).items():
             wf_class = workflow_registry.get(name)
             if wf_class is None:
-                cm._log.warning(
-                    f"from_config: no class registered for {name!r} — skipping"
-                )
+                cm._log.warning(f"from_config: no class registered for {name!r} — skipping")
                 continue
 
             cm.register_group(
@@ -317,8 +320,7 @@ class CampaignManager:
                 max_replicas=int(wf_cfg.get("max_replicas", 0)),
                 required_cpus=int(wf_cfg.get("required_cpus", 0)),
                 required_gpus=int(wf_cfg.get("required_gpus", 0)),
-                config={k: v for k, v in wf_cfg.items()
-                        if k not in _cm_keys} or None,
+                config={k: v for k, v in wf_cfg.items() if k not in _cm_keys} or None,
             )
 
         return cm
@@ -329,7 +331,7 @@ class CampaignManager:
 
     @staticmethod
     def _resolve_entry_point(workflow_class: Type[BaseWorkflow]) -> str:
-        has_run   = workflow_class.run is not BaseWorkflow.run
+        has_run = workflow_class.run is not BaseWorkflow.run
         has_start = hasattr(workflow_class, "start")
 
         if has_run and has_start:
@@ -338,9 +340,7 @@ class CampaignManager:
                 "choose exactly one as the workflow entry point"
             )
         if not has_run and not has_start:
-            raise ValueError(
-                f"{workflow_class.__name__} must define either 'run' or 'start'"
-            )
+            raise ValueError(f"{workflow_class.__name__} must define either 'run' or 'start'")
         return "run" if has_run else "start"
 
     def register_group(
@@ -378,7 +378,7 @@ class CampaignManager:
         config
             Optional dict forwarded to each workflow constructor.
         """
-        entry_point   = self._resolve_entry_point(workflow_class)
+        entry_point = self._resolve_entry_point(workflow_class)
         effective_max = max_replicas if max_replicas > 0 else replicas
 
         with self._lock:
@@ -418,7 +418,8 @@ class CampaignManager:
 
         with self._lock:
             ready = [
-                g for g in self._groups.values()
+                g
+                for g in self._groups.values()
                 if g.status == "pending" and self._deps_satisfied_locked(g)
             ]
             for g in ready:
@@ -442,17 +443,17 @@ class CampaignManager:
                 "resources": self._resources.as_dict(),
                 "groups": {
                     name: {
-                        "status":            g.status,
-                        "priority":          g.priority,
-                        "replicas_total":    g.replicas,
-                        "replicas_started":  g.started_count,
-                        "replicas_running":  g.running_count,
+                        "status": g.status,
+                        "priority": g.priority,
+                        "replicas_total": g.replicas,
+                        "replicas_started": g.started_count,
+                        "replicas_running": g.running_count,
                         "replicas_finished": g.finished_replicas,
-                        "min_replicas":      g.min_replicas,
-                        "max_replicas":      g.max_replicas,
-                        "required_cpus":     g.required_cpus,
-                        "required_gpus":     g.required_gpus,
-                        "dependencies":      g.dependencies,
+                        "min_replicas": g.min_replicas,
+                        "max_replicas": g.max_replicas,
+                        "required_cpus": g.required_cpus,
+                        "required_gpus": g.required_gpus,
+                        "dependencies": g.dependencies,
                     }
                     for name, g in self._groups.items()
                 },
@@ -461,10 +462,7 @@ class CampaignManager:
     def stats(self) -> Dict[str, WorkflowStats]:
         """Per-workflow-group statistics (snapshot)."""
         with self._lock:
-            return {
-                name: WorkflowStats(**vars(s))
-                for name, s in self._stats.items()
-            }
+            return {name: WorkflowStats(**vars(s)) for name, s in self._stats.items()}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -534,7 +532,10 @@ class CampaignManager:
         self._log.info(f"  submitting replica {replica_id!r}{res_tag}")
 
         fut = self._executor.submit(
-            self._run_replica, wf, replica_id, group.entry_point,
+            self._run_replica,
+            wf,
+            replica_id,
+            group.entry_point,
         )
         with self._lock:
             self._active_futures[replica_id] = fut
@@ -542,16 +543,15 @@ class CampaignManager:
     def _try_start_dependents(self, finished_group_name: str) -> None:
         with self._lock:
             to_start = [
-                g for g in self._groups.values()
+                g
+                for g in self._groups.values()
                 if g.status == "pending" and self._deps_satisfied_locked(g)
             ]
             for g in to_start:
                 g.status = "running"
 
         for g in to_start:
-            self._log.info(
-                f"Group {g.name!r} unblocked by {finished_group_name!r}"
-            )
+            self._log.info(f"Group {g.name!r} unblocked by {finished_group_name!r}")
             self._launch_group(g)
 
     # ------------------------------------------------------------------
@@ -577,20 +577,16 @@ class CampaignManager:
 
         self._handle_replica_done(wf, replica_id, final_state)
 
-    def _handle_replica_done(
-        self, wf: BaseWorkflow, replica_id: str, final_state: str
-    ) -> None:
+    def _handle_replica_done(self, wf: BaseWorkflow, replica_id: str, final_state: str) -> None:
         try:
             wf.on_replica_done(replica_id, self, final_state)
         except Exception as exc:
-            self._log.error(
-                f"Replica {replica_id!r} on_replica_done raised: {exc}"
-            )
+            self._log.error(f"Replica {replica_id!r} on_replica_done raised: {exc}")
 
         self._on_replica_finished(replica_id)
 
     def _on_replica_finished(self, replica_id: str) -> None:
-        group_done            = False
+        group_done = False
         next_replica_idx: Optional[int] = None
         group_name_local: Optional[str] = None
         release_tag = ""
@@ -607,7 +603,7 @@ class CampaignManager:
                 return
 
             g.finished_replicas += 1
-            g.running_count     -= 1
+            g.running_count -= 1
             self._resources.release(g.required_cpus, g.required_gpus)
 
             if g.required_cpus > 0 or g.required_gpus > 0:
@@ -658,9 +654,7 @@ class CampaignManager:
             self._try_start_dependents(group_name_local)
 
         with self._lock:
-            all_done = bool(self._groups) and all(
-                g.status == "done" for g in self._groups.values()
-            )
+            all_done = bool(self._groups) and all(g.status == "done" for g in self._groups.values())
 
         if all_done:
             self._all_done.set()

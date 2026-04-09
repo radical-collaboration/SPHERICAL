@@ -2,6 +2,7 @@
 # Limit OpenBLAS/OMP threads before any numpy import to avoid pthread_create
 # failures on login nodes where process counts are restricted.
 import os
+
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -68,6 +69,7 @@ def _expand_workflow_configs(config: dict, config_dir: Path) -> dict:
         wf_cfg.update(wf_specific)
     return config
 
+
 from ddsim_workflow import DDSimWorkflow
 from ddmd_workflow import DDMdWrapperWorkflow
 from inference_workflow import InferenceWorkflow
@@ -75,9 +77,9 @@ from miniapps_workflow import MiniAppsWrapperWorkflow
 
 # Maps config workflow names → workflow classes
 WORKFLOW_REGISTRY = {
-    "dummy":     DDSimWorkflow,
-    "md":        DDMdWrapperWorkflow,
-    "miniapps":  MiniAppsWrapperWorkflow,
+    "dummy": DDSimWorkflow,
+    "md": DDMdWrapperWorkflow,
+    "miniapps": MiniAppsWrapperWorkflow,
     "inference": InferenceWorkflow,
 }
 
@@ -86,19 +88,19 @@ _DEFAULT_CONFIG_FILE = Path(__file__).parent / "config.yaml"
 DEFAULT_CONFIG = {
     "workflows": {
         "ddsim": {
-            "replicas":               2,
-            "dependencies":           [],
-            "engine":                 "concurrent",
-            "home_dir":               str(Path.home() / "DDSim"),
-            "num_inputs":             5,
-            "max_sim_batch":          4,
-            "training_cores":         1,
-            "training_threshold":     0.5,
-            "prediction_threshold":   0.5,
+            "replicas": 2,
+            "dependencies": [],
+            "engine": "concurrent",
+            "home_dir": str(Path.home() / "DDSim"),
+            "num_inputs": 5,
+            "max_sim_batch": 4,
+            "training_cores": 1,
+            "training_threshold": 0.5,
+            "prediction_threshold": 0.5,
             "start_training_threshold": 1,
-            "training_epochs":        1,
+            "training_epochs": 1,
             "free_resources_for_train": True,
-            "sleep_time":             30,
+            "sleep_time": 30,
             "ddsim_config": str(
                 Path("/ocean/projects/dmr170002p/goliyad/DeepDriveSim")
                 / "workflows/ddmd_workflow/data/new_lassen-keras-dbscan.yaml"
@@ -143,15 +145,14 @@ async def main(config_file: Optional[str]) -> None:
     print(
         "Campaign: "
         + ", ".join(
-            f"{name}: {cfg.get('replicas', 1)} replica(s) "
-            f"deps={cfg.get('dependencies', [])}"
+            f"{name}: {cfg.get('replicas', 1)} replica(s) deps={cfg.get('dependencies', [])}"
             for name, cfg in groups.items()
         )
     )
 
     try:
-        await cm.start()   # launch groups with no unmet dependencies
-        await cm.wait()    # block until all groups (including dependents) finish
+        await cm.start()  # launch groups with no unmet dependencies
+        await cm.wait()  # block until all groups (including dependents) finish
     finally:
         if collector:
             collector.stop()

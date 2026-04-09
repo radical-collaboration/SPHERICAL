@@ -25,18 +25,17 @@ from src.utils.logger import Logger
 
 
 class InferenceWorkflow(BaseWorkflow):
-
     workflow_id = "inference"
 
     # ------------------------------------------------------------------ #
     # Shared state — lives across all replicas in the campaign            #
     # ------------------------------------------------------------------ #
 
-    _svc_handles:  ClassVar[Optional[List]]               = None  # one handle per service
-    _svc_locks:    ClassVar[Optional[List[asyncio.Lock]]] = None  # one lock per service
-    _asyncflow:    ClassVar                               = None  # shared WorkflowEngine
-    _init_lock:    ClassVar[Optional[asyncio.Lock]]       = None  # one-time init guard
-    _num_services: ClassVar[int]                          = 0
+    _svc_handles: ClassVar[Optional[List]] = None  # one handle per service
+    _svc_locks: ClassVar[Optional[List[asyncio.Lock]]] = None  # one lock per service
+    _asyncflow: ClassVar = None  # shared WorkflowEngine
+    _init_lock: ClassVar[Optional[asyncio.Lock]] = None  # one-time init guard
+    _num_services: ClassVar[int] = 0
     _log: ClassVar[Logger] = Logger(name="InferenceWorkflow", use_colors=True)
 
     # ------------------------------------------------------------------ #
@@ -62,7 +61,8 @@ class InferenceWorkflow(BaseWorkflow):
                 raise
             InferenceWorkflow._log.error(
                 f"inference failed ({type(exc).__name__}: {exc}); running stub",
-                component="workflow", task_name=replica_id,
+                component="workflow",
+                task_name=replica_id,
             )
             await self._run_stub(replica_id)
 
@@ -79,10 +79,10 @@ class InferenceWorkflow(BaseWorkflow):
 
         # Round-robin: replica index parsed from "group_N" replica_id.
         replica_idx = int(replica_id.split("_")[-1])
-        svc_idx     = replica_idx % InferenceWorkflow._num_services
-        lock        = InferenceWorkflow._svc_locks[svc_idx]
-        handle      = InferenceWorkflow._svc_handles[svc_idx]
-        svc         = handle.service
+        svc_idx = replica_idx % InferenceWorkflow._num_services
+        lock = InferenceWorkflow._svc_locks[svc_idx]
+        handle = InferenceWorkflow._svc_handles[svc_idx]
+        svc = handle.service
 
         async with lock:
             # Wait for previous replica's _result_writer on this service to finish.
@@ -91,18 +91,19 @@ class InferenceWorkflow(BaseWorkflow):
             self._reset_service_queues(svc)
 
             client = ESM2Client(
-                endpoints = [handle.endpoint] if handle.endpoint else [],
-                rank      = 0,
-                service   = svc,
-                config    = cfg,
-                asyncflow = InferenceWorkflow._asyncflow,
+                endpoints=[handle.endpoint] if handle.endpoint else [],
+                rank=0,
+                service=svc,
+                config=cfg,
+                asyncflow=InferenceWorkflow._asyncflow,
             )
 
             output_dir = cfg.get("output_dir", "data/outputs")
             await client.run()
             InferenceWorkflow._log.info(
                 f"inference complete → {output_dir}",
-                component="workflow", task_name=replica_id,
+                component="workflow",
+                task_name=replica_id,
             )
 
         metrics_dir = cfg.get("metrics_dir", "outputs")
@@ -136,9 +137,9 @@ class InferenceWorkflow(BaseWorkflow):
             if not handles:
                 raise RuntimeError("Failed to initialise ESM2 inference services")
 
-            cls._svc_handles  = handles
+            cls._svc_handles = handles
             cls._num_services = len(handles)
-            cls._svc_locks    = [asyncio.Lock() for _ in range(cls._num_services)]
+            cls._svc_locks = [asyncio.Lock() for _ in range(cls._num_services)]
 
             cls._asyncflow = asyncflow
 
@@ -174,36 +175,38 @@ class InferenceWorkflow(BaseWorkflow):
     # Replica-done hook                                                   #
     # ------------------------------------------------------------------ #
 
-    async def on_replica_done(
-        self, replica_id: str, cm, final_state: str
-    ) -> None:
+    async def on_replica_done(self, replica_id: str, cm, final_state: str) -> None:
         """Queue a DDSim replica per completed inference run; teardown on last."""
         status = cm.status()
         g = status["groups"].get("inference", {})
         finished = g.get("replicas_finished", 0) + 1
-        total    = g.get("replicas_total",    1)
+        total = g.get("replicas_total", 1)
 
         InferenceWorkflow._log.info(
             f"replica finished [{final_state}] ({finished}/{total})",
-            component="workflow", task_name=replica_id,
+            component="workflow",
+            task_name=replica_id,
         )
 
         if final_state == "done":
             InferenceWorkflow._log.info(
                 "queuing 1 ddsim replica",
-                component="workflow", task_name=replica_id,
+                component="workflow",
+                task_name=replica_id,
             )
             await cm.add_replicas("dummy", n=1)
         else:
             InferenceWorkflow._log.warning(
                 f"skipping ddsim replica (state={final_state})",
-                component="workflow", task_name=replica_id,
+                component="workflow",
+                task_name=replica_id,
             )
 
         if finished >= total:
             InferenceWorkflow._log.info(
                 "all inference replicas done — tearing down ESM2 services",
-                component="workflow", task_name=replica_id,
+                component="workflow",
+                task_name=replica_id,
             )
             await InferenceWorkflow._teardown()
 
@@ -227,8 +230,8 @@ class InferenceWorkflow(BaseWorkflow):
             svc = h.service
             await svc.processed_queue.join()
             await svc.shutdown()
-        cls._svc_handles  = None
-        cls._svc_locks    = None
+        cls._svc_handles = None
+        cls._svc_locks = None
         cls._num_services = 0
 
     @classmethod
@@ -243,10 +246,12 @@ class InferenceWorkflow(BaseWorkflow):
     async def _run_stub(self, replica_id: str) -> None:
         InferenceWorkflow._log.debug(
             "client_req starting (stub)",
-            component="workflow", task_name=replica_id,
+            component="workflow",
+            task_name=replica_id,
         )
         await asyncio.sleep(0.1)
         InferenceWorkflow._log.debug(
             "client_req done → requests_sent=500",
-            component="workflow", task_name=replica_id,
+            component="workflow",
+            task_name=replica_id,
         )

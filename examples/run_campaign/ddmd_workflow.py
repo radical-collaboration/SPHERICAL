@@ -64,8 +64,7 @@ class DDMdWrapperWorkflow(BaseWorkflow):
             )
         except Exception:
             print(
-                f"[{replica_id}] DDMdWorkflow.__init__ raised:\n"
-                + traceback.format_exc(),
+                f"[{replica_id}] DDMdWorkflow.__init__ raised:\n" + traceback.format_exc(),
                 flush=True,
             )
             raise
@@ -81,15 +80,15 @@ class DDMdWrapperWorkflow(BaseWorkflow):
             cfg = yaml.safe_load(f)
 
         base_exp_dir = Path(cfg["experiment_directory"])
-        cfg["experiment_directory"] = str(
-            base_exp_dir.parent / f"{base_exp_dir.name}_{replica_id}"
-        )
+        cfg["experiment_directory"] = str(base_exp_dir.parent / f"{base_exp_dir.name}_{replica_id}")
 
         if cfg.get("node_local_path"):
             cfg["node_local_path"] = str(Path(cfg["node_local_path"]) / replica_id)
 
         tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False,
+            mode="w",
+            suffix=".yaml",
+            delete=False,
             prefix=f"ddmd_{replica_id}_",
         )
         yaml.dump(cfg, tmp)

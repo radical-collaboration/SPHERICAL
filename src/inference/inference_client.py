@@ -154,7 +154,7 @@ class InferenceClient:
                                 last_error = error
                                 if attempt < retries - 1:
                                     retry_count += 1
-                                    await asyncio.sleep(0.5 * (2 ** attempt))
+                                    await asyncio.sleep(0.5 * (2**attempt))
                                     continue
                                 return {
                                     "status": "error",
@@ -168,7 +168,7 @@ class InferenceClient:
                     last_error = "Timeout"
                     if attempt < retries - 1:
                         retry_count += 1
-                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        await asyncio.sleep(0.5 * (2**attempt))
                         continue
                     return {
                         "status": "error",
@@ -182,7 +182,7 @@ class InferenceClient:
                     last_error = str(e)
                     if attempt < retries - 1:
                         retry_count += 1
-                        await asyncio.sleep(0.5 * (2 ** attempt))
+                        await asyncio.sleep(0.5 * (2**attempt))
                         continue
                     return {
                         "status": "error",
@@ -238,9 +238,7 @@ class InferenceClient:
     async def close(self):
         """Export metrics and shut down asyncflow."""
         self.logger.info(f"[Client {self.rank}] Closing")
-        await export_metrics(
-            Path(self.metrics_dir, f"client_{self.rank}.json"), self.metrics
-        )
+        await export_metrics(Path(self.metrics_dir, f"client_{self.rank}.json"), self.metrics)
         if self.flow:
             await self.flow.shutdown()
 
@@ -291,7 +289,7 @@ class InferenceClient:
     async def _process_queue(self):
         """Drain seq_queue and dispatch inference requests."""
         batch_count = 0
-        tasks:     list = []
+        tasks: list = []
         batch_ids: list = []
 
         while True:
@@ -321,13 +319,12 @@ class InferenceClient:
                     batch_ids.append(batch_id)
 
                     if self.debug and batch_count % 100 == 0:
-                        self.logger.debug(
-                            f"[Client {self.rank}] Dispatched {batch_count} batches"
-                        )
+                        self.logger.debug(f"[Client {self.rank}] Dispatched {batch_count} batches")
 
                     if len(tasks) >= self.max_concurrent:
                         await self._flush_tasks(tasks, batch_ids)
-                        tasks = []; batch_ids = []
+                        tasks = []
+                        batch_ids = []
                 else:
                     # Local mode — submit directly to the service work queue.
                     self.service.work_queue.put_nowait((batch_id, None, None))
@@ -336,9 +333,7 @@ class InferenceClient:
                 self.service.seq_queue.task_done()
 
         if self.debug:
-            self.logger.info(
-                f"[Client {self.rank}] Dispatched {batch_count} batches total"
-            )
+            self.logger.info(f"[Client {self.rank}] Dispatched {batch_count} batches total")
 
         # Local mode: wait for all workers to finish.
         if not self.endpoints and self.service is not None:
@@ -371,8 +366,10 @@ class InferenceClient:
                 if asyncio.isfuture(task) or asyncio.iscoroutine(task):
                     task_fut = asyncio.ensure_future(task)
                 elif hasattr(task, "__await__"):
+
                     async def _wrap():
                         return await task
+
                     task_fut = asyncio.ensure_future(_wrap())
                 elif hasattr(task, "result"):
                     task_fut = asyncio.ensure_future(
@@ -391,25 +388,22 @@ class InferenceClient:
 
                 if isinstance(result, dict):
                     self.metrics["successful"] += result.get("successful", 0)
-                    self.metrics["failed"]     += result.get("failed", 0)
-                    self.metrics["retries"]    += result.get("retries", 0)
+                    self.metrics["failed"] += result.get("failed", 0)
+                    self.metrics["retries"] += result.get("retries", 0)
                     if result.get("status") == "error":
                         batch_id = result.get("batch_id", "?")
-                        error    = result.get("error", "Unknown")
+                        error = result.get("error", "Unknown")
                         self.metrics["error_msgs"].append(f"batch {batch_id}: {error}")
                         self.logger.error(f"[Client {self.rank}] Batch {batch_id}: {error}")
 
             except asyncio.TimeoutError:
-                self.logger.error(
-                    f"[Client {self.rank}] Task {i} timed out after {self.timeout}s"
-                )
+                self.logger.error(f"[Client {self.rank}] Task {i} timed out after {self.timeout}s")
                 self.metrics["failed"] += 1
             except Exception as e:
                 self.logger.error(
                     f"[Client {self.rank}] Task {i} failed with {type(e).__name__}: {e}"
                 )
                 import traceback
-                self.logger.debug(
-                    f"[Client {self.rank}] Traceback: {traceback.format_exc()}"
-                )
+
+                self.logger.debug(f"[Client {self.rank}] Traceback: {traceback.format_exc()}")
                 self.metrics["failed"] += 1

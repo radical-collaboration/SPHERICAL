@@ -6,56 +6,33 @@ subprocess.run calls, enabling concurrent execution of multiple mutations.
 
 Task types
 ----------
-executable_task — returns a command string; Dragon/asyncflow launches it as a
-                  subprocess.  Used for trill (embed, fold) so Dragon can apply
-                  GPU affinity and HOST_NAME placement via task_description.
-function_task   — runs a Python async function directly in a Dragon worker
-                  thread.  Used for foldseek and DES (run_des) because those
-                  need subprocess.run with a custom environment, or call
-                  TensorFlow code that must not share a CUDA context with
-                  Dragon's gpu_affinity infrastructure.
+executable_task — trill embed/fold, foldseek createdb, seqkit grep/stats;
+                  Dragon launches each as a subprocess with GPU affinity and
+                  HOST_NAME placement via task_description.
+function_task   — foldseek_search only; runs via subprocess.run to avoid the
+                  ggml-CUDA context conflict that occurs when foldseek easy-search
+                  runs as a direct Dragon executable_task subprocess.
+_run_des        — plain async method on SGDESWorkflow; orchestrates the DES
+                  loop (solver.propose → foldseek scoring → population.add_samples)
+                  using the registered tasks.
 
-GPU / CUDA handling
--------------------
-- embed / fold (executable_task): receive task_description with a Policy
-  containing gpu_affinity + HOST_NAME; Dragon sets CUDA_VISIBLE_DEVICES for
-  those subprocesses automatically.
-- foldseek_createdb / foldseek_search (function_task): set LD_LIBRARY_PATH
-  (from $CUDA_HOME/lib64) in the subprocess env so foldseek's ggml-CUDA
-  backend can find libcudart on every node, including remote Dragon workers
-  that may not inherit the head-node environment.
-- foldseek_search (function_task, _TD_HOST): pinned to the correct node via a
-  Policy with HOST_NAME placement but NO gpu_affinity, so Dragon does not
-  pre-initialise a CUDA IPC context.
-- run_des (function_task, no task_description): intentionally unbound.  _TD_HOST
-  was tried but Dragon spawns a new managed process to satisfy the policy; that
-  process initialises JAX (multithreaded) and then _run_des calls os.fork() via
-  multiprocessing inside amortized_bo, which deadlocks after JAX init.  Running
-  unbound lets Dragon execute run_des as a thread in an existing worker — no new
-  process, no fork-after-JAX deadlock.  CUDA_VISIBLE_DEVICES is set manually.
-
-All CUDA-related paths are read from environment variables set in the sbatch
-script (CUDA_HOME, SGDES_DIR, SPHERICAL_DIR) — no hardcoded paths in this file.
+All environment variables (CUDA_HOME, SGDES_DIR, SPHERICAL_DIR, JAX_PLATFORMS,
+TF_FORCE_GPU_ALLOW_GROWTH) are set in the sbatch script.
 """
 
 import asyncio
+import io
 import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import types
+import uuid
 import warnings
 from datetime import datetime
 
-# Must be set before TensorFlow initialises its GPU context.
-# amortized_bo (DES) uses TF v1, which by default pre-allocates ~90 % of GPU
-# memory on first use and never releases it, starving subsequent trill embed
-# subprocess calls.  Memory-growth mode allocates only what is actually needed.
-os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
-# jaxlib on this system was compiled with cuDNN 8.9.6 but only 8.0.4 is installed;
-# force JAX to use the CPU backend to avoid a cuDNN version mismatch error.
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
 # amortized_bo imports JAX at module level, making this process multithreaded.
 # Dragon then uses os.fork() to spawn executable_task subprocesses (trill embed),
 # which triggers Python's fork-after-threads warning.  The warning is harmless —
@@ -82,9 +59,8 @@ _ABO_PARENT = os.path.join(_SGDES_DIR, "trill/utils/abo") if _SGDES_DIR else ""
 if _ABO_PARENT and _ABO_PARENT not in sys.path:
     sys.path.insert(0, _ABO_PARENT)
 
-from trill.utils.abo.amortized_bo import controller, data
+from trill.utils.abo.amortized_bo import data, domains
 from trill.utils.abo.amortized_bo.deep_evolution_solver import MutationPredictorSolver
-from trill.utils.abo.amortized_bo.foldseek_similarity_problem import FoldseekSimilarityProblem
 from trill.utils.fasta_files import remove_invalid_seqs_aa, truncate_seqs
 from trill.utils.foldseek_utils import run_foldseek_databases
 from trill.utils.sgdes import (
@@ -152,113 +128,30 @@ def _fasta_to_numeric(fasta_path, max_length=None, pad_char="A"):
     return np.array(arr, dtype=np.int32)
 
 
-def _run_des(
-    de_ref_fasta: str,
-    fixed_len: int,
-    des_fasta: str,
-    ori_ref: str,
-    ori_ref_structs: str,
-    round_i: int,
-    fast_folding: bool,
-    prostt5_weights_path,
-    fold_batch_size: int,
-    gpus: str,
-    rng_seed: int,
-    num_mutations: int,
-    des_rounds: int,
-    des_batch_size: int,
-    des_num_sequences: int,
-) -> None:
-
-    ref_path = ori_ref if fast_folding else ori_ref_structs
-
-    t0_total = time.time()
-
-    print(f"[DES ft_round={round_i}] Building input DB from {ref_path}")
-    t0 = time.time()
-    problem = FoldseekSimilarityProblem(
-        input_fasta=ref_path,
-        length=fixed_len,
-        fast_folding=fast_folding,
-        use_gpu=fast_folding,
-        # use_gpu=False,
-        prostt5_model_path=prostt5_weights_path if fast_folding else None,
-        fold_batch_size=fold_batch_size,
-        gpus=gpus,
-    )
-    print(f"[DES ft_round={round_i}] Input DB ready ({time.time() - t0:.1f}s)")
-
-    def my_initializer(domain, batch_size, random_state):
-        fasta_array = _fasta_to_numeric(ori_ref, fixed_len)
-        n = len(fasta_array)
-        assert fasta_array.shape[1] == fixed_len
-        if n < batch_size:
-            extra_idx = random_state.randint(0, n, size=batch_size - n)
-            fasta_array = np.concatenate([fasta_array, fasta_array[extra_idx]])
-        return fasta_array[:batch_size]
-
-    solver = MutationPredictorSolver(domain=problem.domain, random_state=int(rng_seed))
-    solver.cfg.initialize_dataset_fn = my_initializer
-    solver.cfg.num_mutations = num_mutations
-
-    cand_init = _fasta_to_int_array(de_ref_fasta, fixed_len)
-    print(f"[DES ft_round={round_i}] cand_init={len(cand_init)} seqs  fixed_len={fixed_len}")
-    init_population = data.Population.from_arrays(
-        structures=cand_init,
-        rewards=np.zeros(len(cand_init)),
-        batch_index=0,
-    )
-
-    def _init_with_ref(domain, batch_size, random_state):
-        if len(cand_init) >= batch_size:
-            return cand_init[:batch_size]
-        return cand_init[np.resize(np.arange(len(cand_init)), batch_size)]
-
-    solver._config().update(dict(initialize_dataset_fn=_init_with_ref))
-
-    _des_step_times = [time.time()]
-
-    def _des_step_callback(population, force_write=False):
-        now = time.time()
-        step = population.current_batch_index
-        step_elapsed = now - _des_step_times[-1]
-        total_elapsed = now - t0_total
-        rewards = [s.reward for s in population.get_last_batch()]
-        best_r = max(rewards) if rewards else float("nan")
-        mean_r = sum(rewards) / len(rewards) if rewards else float("nan")
-        print(
-            f"[DES ft_round={round_i} step={step}/{des_rounds}] "
-            f"step={step_elapsed:.1f}s  total={total_elapsed:.1f}s  "
-            f"best_reward={best_r:.4f}  mean_reward={mean_r:.4f}  "
-            f"pop={len(population)}"
-        )
-        _des_step_times.append(now)
-
-    print(f"[DES ft_round={round_i}] Starting {des_rounds} DES steps  batch_size={des_batch_size}")
-    population = controller.run(
-        problem,
-        solver,
-        num_rounds=int(des_rounds),
-        batch_size=int(des_batch_size),
-        initial_population=init_population,
-        callbacks=[_des_step_callback],
-    )
-
-    best = population.best_n(int(des_num_sequences), discard_duplicates=True)
-    print(
-        f"[DES ft_round={round_i}] Done — best_n={len(best)}  "
-        f"total={time.time() - t0_total:.1f}s  → {des_fasta}"
-    )
-    des_arr = (
-        np.array([s.structure for s in best])
-        if len(best) > 0
-        else cand_init[: min(int(des_num_sequences), len(cand_init))]
-    )
-    # Ensure the output directory exists.  run_des runs as an unbound Dragon
-    # worker thread and may execute before the head-node makedirs call is
-    # visible on Lustre, or on a node that hasn't yet seen the directory.
-    os.makedirs(os.path.dirname(des_fasta), exist_ok=True)
-    _int_array_to_fasta(des_arr, des_fasta, prefix=f"des_r{round_i}")
+def _parse_foldseek_avg(tsv_path, fast_mode=True):
+    if fast_mode:
+        cols = [
+            "query",
+            "target",
+            "fident",
+            "alnlen",
+            "mismatch",
+            "gapopen",
+            "qstart",
+            "qend",
+            "tstart",
+            "tend",
+            "evalue",
+            "bits",
+        ]
+        df = pd.read_csv(tsv_path, sep="\t", names=cols)
+        score_col = "bits"
+    else:
+        cols = ["query", "target", "fident", "bits", "alntmscore"]
+        df = pd.read_csv(tsv_path, sep="\t", names=cols)
+        score_col = "alntmscore"
+    avg = df.groupby("query")[score_col].mean().rename("avg_score").reset_index()
+    return avg
 
 
 class SGDESWorkflow:
@@ -273,7 +166,6 @@ class SGDESWorkflow:
 
         # ── Execution ─────────────────────────────────────────────────────────
         self.total_gpus = int(cfg.get("total_gpus", 1))
-        # self.total_cpus      = int(cfg.get("total_cpus", os.cpu_count()))
         self.rng_seed = int(cfg.get("RNG_seed", 42))
         self.foldtune_rounds = int(cfg.get("foldtune_rounds", 3))
         self.fast_folding = bool(cfg.get("fast_folding", True))
@@ -296,30 +188,16 @@ class SGDESWorkflow:
         os.makedirs(self.base_outdir, exist_ok=True)
 
         self.policies = policies
-        self.collect_nvml_telemetry = bool(cfg.get("collect_nvml_telemetry", True))
-        # Absolute path so Dragon workers on remote nodes resolve it correctly.
-        self.telemetry_dir = os.path.abspath(cfg.get("nvml_dir", "nvml-telemetry"))
-        self.nvml_rate = float(cfg.get("nvml_collection_rate", 1.0))
-        self.nvml_checkpoint = float(cfg.get("nvml_checkpoint_interval", 30.0))
 
     # ------------------------------------------------------------------
     # Task registration
     # ------------------------------------------------------------------
 
-    def _register_tasks(self, cuda_device: int, policy):
-        """
-        Register asyncflow executable tasks for one mutation slot.
+    def _register_tasks(self, policy):
+        """Register asyncflow tasks for one mutation slot.
 
-        Each task is a closure over `cuda_device` and `policy` so that all
-        commands dispatched for the same mutation target the same GPU.
-
-        Returns a SimpleNamespace with callable attributes:
-            .embed          — trill embed esm2_t33_650M
-            .fold           — trill fold ESMFold  (slow-folding path only)
-            .foldseek_createdb  — foldseek createdb
-            .foldseek_search    — foldseek easy-search
-            .seqkit_grep    — seqkit grep … > output  (shell redirect)
-            .seqkit_stats   — seqkit stats -a -T … > tsv  (shell redirect)
+        Each task closes over `policy` so all commands for the same mutation
+        target the same node/GPU.
         """
         flow = self.asyncflow
 
@@ -333,20 +211,7 @@ class SGDESWorkflow:
             else {}
         )
 
-        _TD_CPU = (
-            {
-                "process_template": {
-                    "policy": Policy() if Policy is not None else None,
-                },
-            }
-            if Policy is not None
-            else {}
-        )
-
-        # Host-only policy: pins task to the correct node without gpu_affinity so
-        # Dragon does not pre-initialise a CUDA IPC context in the worker.
-        # Used for run_des (TF deadlocks on Dragon's CUDA context) and
-        # foldseek_search (no GPU needed, but must run on the same node as its DBs).
+        # Host-only policy: pins tasks to the mutation's node without gpu_affinity
         if policy is not None and Policy is not None:
             _host_policy = Policy(
                 placement=Policy.Placement.HOST_NAME,
@@ -354,6 +219,7 @@ class SGDESWorkflow:
             )
             _TD_HOST = {"process_template": {"policy": _host_policy}}
         else:
+            _host_policy = None
             _TD_HOST = {}
 
         # ── trill embed ────────────────────────────────────────────────────────
@@ -394,20 +260,11 @@ class SGDESWorkflow:
             return cmd
 
         # ── foldseek createdb ─────────────────────────────────────────────────
-        # NOTE: implemented as function_task (not executable_task) so that foldseek
-        # runs as a grandchild subprocess of the Dragon worker process.  When foldseek
-        # is launched as a *direct* Dragon executable_task subprocess the ggml-CUDA
-        # backend initialises inside Dragon's CUDA IPC context, which causes a silent
-        # failure: the _ss (3Di secondary structure) file is written as empty even
-        # without --gpu 1.  Running via subprocess.run() avoids that context entirely.
-        @flow.function_task
+        @flow.executable_task
         async def foldseek_createdb(task_description=_TD_GPU, **kwargs):
-            """Run foldseek createdb via subprocess.
+            """Run foldseek createdb as an executable_task.
             kwargs: fasta, db_path, prostt5_model (optional)
-            Note: --gpu 1 omitted — foldseek ggml-CUDA crashes in Dragon subprocess context.
             """
-            import subprocess as _sp
-
             fasta = kwargs["fasta"]
             db_path = kwargs["db_path"]
             prostt5_model = kwargs.get("prostt5_model", "")
@@ -415,30 +272,15 @@ class SGDESWorkflow:
             gpu_flag = " --gpu 1" if prostt5_model else ""
             cmd = f"foldseek createdb {fasta} {db_path} {model_flag}{gpu_flag}".strip()
             print(f"[foldseek_createdb] cmd: {cmd}", flush=True)
-            import os as _os
-
-            env = _os.environ.copy()
-            # Ensure foldseek ggml-CUDA can find libcudart on Delta
-            cuda_lib = os.path.join(os.environ.get("CUDA_HOME", ""), "lib64")
-            if cuda_lib and cuda_lib != "/lib64":
-                env["LD_LIBRARY_PATH"] = cuda_lib + ":" + env.get("LD_LIBRARY_PATH", "")
-            # env["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
-            result = _sp.run(cmd, shell=True, capture_output=True, text=True, env=env)
-            if result.stdout:
-                print(result.stdout, flush=True)
-            if result.stderr:
-                print(result.stderr, flush=True)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"foldseek createdb failed (rc={result.returncode}): {result.stderr[-500:]}"
-                )
+            return cmd
 
         # ── foldseek easy-search ──────────────────────────────────────────────
-        # NOTE: function_task for the same reason as foldseek_createdb — direct
-        # Dragon executable_task subprocess hangs due to ggml-CUDA context conflict.
+        # NOTE: function_task (not executable_task) to avoid the ggml-CUDA context
+        # conflict that causes foldseek easy-search to hang when launched as a direct
+        # Dragon subprocess.  subprocess.run() sidesteps that context entirely.
         @flow.function_task
-        async def foldseek_search(task_description=_TD_HOST, **kwargs):
-            """Run foldseek easy-search via subprocess.
+        async def foldseek_search(task_description=_TD_GPU, **kwargs):
+            """Run foldseek easy-search via subprocess.run (function_task).
             kwargs: query_db, target_db, tsv_out, tmp_dir, extra_flags (optional)
             """
             import subprocess as _sp
@@ -447,7 +289,7 @@ class SGDESWorkflow:
             target_db = kwargs["target_db"]
             tsv_out = kwargs["tsv_out"]
             tmp_dir = kwargs["tmp_dir"]
-            extra_flags = kwargs.get("extra_flags", "")
+            extra_flags = kwargs.get("extra_flags1", "")
             cmd = f"foldseek easy-search {query_db} {target_db} {tsv_out} {tmp_dir} {extra_flags}".rstrip()
             print(f"[foldseek_search] cmd: {cmd}", flush=True)
             result = _sp.run(cmd, shell=True, capture_output=True, text=True)
@@ -460,155 +302,28 @@ class SGDESWorkflow:
                     f"foldseek easy-search failed (rc={result.returncode}): {result.stderr[-500:]}"
                 )
 
-        # ── seqkit grep → file ────────────────────────────────────────────────
-        @flow.function_task
-        async def seqkit_grep(task_description=_TD_CPU, **kwargs):
-            """Run seqkit grep via subprocess, redirecting stdout to output_fasta.
-            kwargs: pattern_file, input_fasta, output_fasta
+        # ── seqkit grep → file (stdout redirected via ProcessTemplate) ───────
+        @flow.executable_task
+        async def seqkit_grep(task_description=_TD_HOST, **kwargs):
+            """Run seqkit grep; Dragon writes stdout to output_fasta via task_description.
+            kwargs: pattern_file, input_fasta
             """
-            import subprocess as _sp
-
             pattern_file = kwargs["pattern_file"]
             input_fasta = kwargs["input_fasta"]
-            output_fasta = kwargs["output_fasta"]
-            cmd = f"seqkit grep --pattern-file {pattern_file} {input_fasta} > {output_fasta}"
+            cmd = f"seqkit grep --pattern-file {pattern_file} {input_fasta}"
             print(f"[seqkit_grep] cmd: {cmd}", flush=True)
-            result = _sp.run(cmd, shell=True, capture_output=True, text=True)
-            if result.stderr:
-                print(result.stderr, flush=True)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"seqkit grep failed (rc={result.returncode}): {result.stderr[-500:]}"
-                )
+            return cmd
 
-        # ── seqkit stats → TSV file ───────────────────────────────────────────
-        @flow.function_task
-        async def seqkit_stats(task_description=_TD_CPU, **kwargs):
-            """Run seqkit stats -a -T via subprocess, redirecting stdout to out_tsv.
-            kwargs: input_fasta, out_tsv
+        # ── seqkit stats → returns TSV via stdout ─────────────────────────────
+        @flow.executable_task
+        async def seqkit_stats(task_description=_TD_HOST, **kwargs):
+            """Run seqkit stats -a -T; stdout is returned by asyncflow as a string.
+            kwargs: input_fasta
             """
-            import subprocess as _sp
-
             input_fasta = kwargs["input_fasta"]
-            out_tsv = kwargs["out_tsv"]
-            cmd = f"seqkit stats -a -T {input_fasta} > {out_tsv}"
+            cmd = f"seqkit stats -a -T {input_fasta}"
             print(f"[seqkit_stats] cmd: {cmd}", flush=True)
-            result = _sp.run(cmd, shell=True, capture_output=True, text=True)
-            if result.stderr:
-                print(result.stderr, flush=True)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"seqkit stats failed (rc={result.returncode}): {result.stderr[-500:]}"
-                )
-
-        @flow.function_task
-        async def run_des(**kwargs):
-            # No task_description — intentionally unbound.
-            #
-            # _TD_HOST (HOST_NAME, no gpu_affinity) was tried to pin run_des to
-            # the correct node, but Dragon spawns a new managed process on the
-            # remote node to satisfy the policy.  That new process imports the
-            # module, initialising JAX (multithreaded), then _run_des calls
-            # os.fork() via multiprocessing inside amortized_bo / TF model
-            # evaluation.  fork() after a multithreaded JAX init deadlocks.
-            #
-            # Without a policy Dragon runs run_des as a thread inside an existing
-            # worker — no new process, no fork-after-JAX problem.
-            # CUDA_VISIBLE_DEVICES below points TF at the right GPU.
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(cuda_device)
-            # Dragon workers on remote nodes may not inherit LD_LIBRARY_PATH from
-            # the head node's sbatch environment.  foldseek's ggml-CUDA backend
-            # needs $CUDA_HOME/lib64 to dlopen libcudart at runtime.
-            _cuda_lib = os.path.join(os.environ.get("CUDA_HOME", ""), "lib64")
-            if _cuda_lib and _cuda_lib != "/lib64":
-                os.environ["LD_LIBRARY_PATH"] = (
-                    _cuda_lib + ":" + os.environ.get("LD_LIBRARY_PATH", "")
-                )
-            _run_des(
-                de_ref_fasta=kwargs["de_ref_fasta"],
-                fixed_len=kwargs["fixed_len"],
-                des_fasta=kwargs["des_fasta"],
-                ori_ref=kwargs["ori_ref"],
-                ori_ref_structs=kwargs["ori_ref_structs"],
-                round_i=kwargs["round_i"],
-                fast_folding=kwargs["fast_folding"],
-                prostt5_weights_path=kwargs["prostt5_weights_path"],
-                fold_batch_size=kwargs["fold_batch_size"],
-                gpus=kwargs["gpus"],
-                rng_seed=kwargs["rng_seed"],
-                num_mutations=kwargs["num_mutations"],
-                des_rounds=kwargs["des_rounds"],
-                des_batch_size=kwargs["des_batch_size"],
-                des_num_sequences=kwargs["des_num_sequences"],
-            )
-
-        # ── per-node NVML telemetry ───────────────────────────────────────────
-        # start_node_telemetry / stop_node_telemetry use _TD_HOST (HOST_NAME,
-        # no gpu_affinity) to run on the correct remote node.
-        #
-        # The monitor runs as an INDEPENDENT SUBPROCESS (nvml_monitor_worker.py),
-        # NOT as a daemon thread inside the Dragon worker.  Dragon kills its
-        # managed processes after each function_task returns; a daemon thread
-        # would die with the process before writing any data.  A subprocess with
-        # its own event loop survives Dragon's worker lifecycle.
-        #
-        # Communication: start writes a PID file to the shared Lustre outdir;
-        # stop reads that PID file and sends SIGTERM to the subprocess, which
-        # flushes remaining samples before exiting.  This works regardless of
-        # which Dragon worker process runs start vs. stop.
-        @flow.function_task
-        async def start_node_telemetry(task_description=_TD_HOST, **kwargs):
-            import os as _os
-            import socket as _socket
-            import subprocess as _sp
-            import sys as _sys
-
-            outdir = kwargs["outdir"]
-            rate = kwargs.get("rate", 1.0)
-            interval = kwargs.get("checkpoint_interval", 30.0)
-            spherical_dir = _os.environ.get("SPHERICAL_DIR", "")
-
-            _os.makedirs(outdir, exist_ok=True)
-
-            hostname = _socket.gethostname()
-            pid_file = _os.path.join(outdir, f"nvml_pid_{hostname}.txt")
-            if _os.path.exists(pid_file):
-                return  # already running on this node
-
-            worker = _os.path.join(spherical_dir, "src", "utils", "nvml_monitor_worker.py")
-            cmd = [
-                _sys.executable, worker,
-                "--outdir", outdir,
-                "--rate", str(rate),
-                "--checkpoint-interval", str(interval),
-                "--spherical-dir", spherical_dir,
-            ]
-            log_path = _os.path.join(outdir, f"nvml_worker_{hostname}.log")
-            log_fh = open(log_path, "w")
-            _sp.Popen(cmd, start_new_session=True, stdout=log_fh, stderr=log_fh)
-            print(f"[start_node_telemetry] launched nvml_monitor_worker on {hostname} → {log_path}")
-
-        @flow.function_task
-        async def stop_node_telemetry(task_description=_TD_HOST, **kwargs):
-            import os as _os
-            import signal as _signal
-            import socket as _socket
-            import time as _time
-
-            outdir = kwargs["outdir"]
-            hostname = _socket.gethostname()
-            pid_file = _os.path.join(outdir, f"nvml_pid_{hostname}.txt")
-
-            if not _os.path.exists(pid_file):
-                return
-
-            try:
-                with open(pid_file) as _f:
-                    pid = int(_f.read().strip())
-                _os.kill(pid, _signal.SIGTERM)
-                _time.sleep(3)  # allow final checkpoint flush
-            except (OSError, ValueError, ProcessLookupError):
-                pass
+            return cmd
 
         return types.SimpleNamespace(
             embed=embed,
@@ -617,28 +332,195 @@ class SGDESWorkflow:
             foldseek_search=foldseek_search,
             seqkit_grep=seqkit_grep,
             seqkit_stats=seqkit_stats,
-            run_des=run_des,
-            start_node_telemetry=start_node_telemetry,
-            stop_node_telemetry=stop_node_telemetry,
+            host_policy=_host_policy,
         )
+
+    # ------------------------------------------------------------------
+    # DES orchestration
+    # ------------------------------------------------------------------
+
+    async def _run_des(self, tasks, **kwargs) -> None:
+        """Orchestrate one DES round using asyncflow tasks for each subprocess call.
+
+        Manually steps through the DES loop (solver.propose → score via
+        tasks.foldseek_createdb/foldseek_search → population.add_samples) instead of delegating to
+        controller.run() + FoldseekSimilarityProblem.
+        """
+        de_ref_fasta = kwargs["de_ref_fasta"]
+        fixed_len = kwargs["fixed_len"]
+        des_fasta = kwargs["des_fasta"]
+        ori_ref = kwargs["ori_ref"]
+        ori_ref_structs = kwargs["ori_ref_structs"]
+        round_i = kwargs["round_i"]
+        fast_folding = kwargs["fast_folding"]
+        prostt5_weights_path = kwargs["prostt5_weights_path"]
+        fold_batch_size = kwargs["fold_batch_size"]
+        gpus = kwargs["gpus"]
+        rng_seed = kwargs["rng_seed"]
+        num_mutations = kwargs["num_mutations"]
+        des_rounds = kwargs["des_rounds"]
+        des_batch_size = kwargs["des_batch_size"]
+        des_num_sequences = kwargs["des_num_sequences"]
+
+        ref_path = ori_ref if fast_folding else ori_ref_structs
+        workdir = tempfile.mkdtemp(prefix="fsim_")
+        t0_total = time.time()
+
+        # ── Build input DB once ────────────────────────────────────────────────
+        input_db = os.path.join(workdir, "input_db")
+        print(f"[DES ft_round={round_i}] Building input DB from {ref_path}")
+        t0 = time.time()
+        await tasks.foldseek_createdb(
+            fasta=ref_path,
+            db_path=input_db,
+            prostt5_model=prostt5_weights_path if fast_folding else "",
+        )
+        print(f"[DES ft_round={round_i}] Input DB ready ({time.time() - t0:.1f}s)")
+
+        # ── Initialise solver ──────────────────────────────────────────────────
+        domain = domains.FixedLengthDiscreteDomain(vocab_size=len(AA), length=fixed_len)
+
+        def my_initializer(dom, batch_size, random_state):
+            fasta_array = _fasta_to_numeric(ori_ref, fixed_len)
+            n = len(fasta_array)
+            assert fasta_array.shape[1] == fixed_len
+            if n < batch_size:
+                extra_idx = random_state.randint(0, n, size=batch_size - n)
+                fasta_array = np.concatenate([fasta_array, fasta_array[extra_idx]])
+            return fasta_array[:batch_size]
+
+        solver = MutationPredictorSolver(domain=domain, random_state=int(rng_seed))
+        solver.cfg.initialize_dataset_fn = my_initializer
+        solver.cfg.num_mutations = num_mutations
+
+        cand_init = _fasta_to_int_array(de_ref_fasta, fixed_len)
+        print(f"[DES ft_round={round_i}] cand_init={len(cand_init)} seqs  fixed_len={fixed_len}")
+        population = data.Population.from_arrays(
+            structures=cand_init,
+            rewards=np.zeros(len(cand_init)),
+            batch_index=0,
+        )
+
+        _step_times = [time.time()]
+
+        # ── Manual DES loop ────────────────────────────────────────────────────
+        print(
+            f"[DES ft_round={round_i}] Starting {des_rounds} DES steps  batch_size={des_batch_size}"
+        )
+        for step in range(int(des_rounds)):
+            samples = solver.propose(int(des_batch_size), population.copy())
+            if not isinstance(samples[0], data.Sample):
+                samples = [data.Sample(structure=s) for s in samples]
+
+            structures = [s.structure for s in samples]
+            arr = np.array(structures, dtype=int)
+            tag = str(uuid.uuid4())[:8]
+            cand_fa = os.path.join(workdir, f"cands_{tag}.fa")
+            headers = [f"cand_{tag}_{i}" for i in range(len(structures))]
+            seqs = ["".join(_id2aa[int(x)] for x in row) for row in arr]
+            with open(cand_fa, "w") as _f:
+                for h, s in zip(headers, seqs):
+                    _f.write(f">{h}\n{s}\n")
+
+            out_tsv = os.path.join(workdir, f"res_{tag}.tsv")
+            tmp_dir = os.path.join(workdir, f"tmp_{tag}")
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            if fast_folding:
+                cand_db = os.path.join(workdir, f"cand_db_{tag}")
+                await tasks.foldseek_createdb(
+                    fasta=cand_fa,
+                    db_path=cand_db,
+                    prostt5_model=prostt5_weights_path or "",
+                )
+                await tasks.foldseek_search(
+                    query_db=cand_db,
+                    target_db=input_db,
+                    tsv_out=out_tsv,
+                    tmp_dir=tmp_dir,
+                    extra_flags="--gpu 1",
+                )
+                avg = _parse_foldseek_avg(out_tsv, fast_mode=True)
+            else:
+                cand_struct_dir = os.path.join(workdir, f"cand_structs_{tag}")
+                os.makedirs(cand_struct_dir, exist_ok=True)
+                await tasks.fold(
+                    name=tag,
+                    GPUs=gpus,
+                    seed=rng_seed,
+                    outdir=cand_struct_dir,
+                    query=cand_fa,
+                    batch_size=fold_batch_size,
+                )
+                cand_db = os.path.join(workdir, f"cand_db_{tag}")
+                await tasks.foldseek_createdb(fasta=cand_struct_dir, db_path=cand_db)
+                await tasks.foldseek_search(
+                    query_db=cand_db,
+                    target_db=input_db,
+                    tsv_out=out_tsv,
+                    tmp_dir=tmp_dir,
+                    extra_flags='--alignment-type 1 --format-output "query,target,alntmscore"',
+                )
+                avg = _parse_foldseek_avg(out_tsv, fast_mode=False)
+
+            score_map = dict(zip(avg["query"].values, avg["avg_score"].values))
+            rewards_np = np.array([score_map.get(h, 0.0) for h in headers], dtype=np.float32)
+
+            try:
+                os.remove(cand_fa)
+                os.remove(out_tsv)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                shutil.rmtree(cand_db, ignore_errors=True)
+                if not fast_folding:
+                    shutil.rmtree(cand_struct_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+            batch_index = population.current_batch_index + 1
+            scored = [
+                sample.copy(reward=float(r), batch_index=batch_index, new_key=False)
+                for sample, r in zip(samples, rewards_np)
+            ]
+            population.add_samples(scored)
+
+            now = time.time()
+            step_elapsed = now - _step_times[-1]
+            total_elapsed = now - t0_total
+            last_rewards = [s.reward for s in population.get_last_batch()]
+            best_r = max(last_rewards) if last_rewards else float("nan")
+            mean_r = sum(last_rewards) / len(last_rewards) if last_rewards else float("nan")
+            print(
+                f"[DES ft_round={round_i} step={step + 1}/{des_rounds}] "
+                f"step={step_elapsed:.1f}s  total={total_elapsed:.1f}s  "
+                f"best_reward={best_r:.4f}  mean_reward={mean_r:.4f}  "
+                f"pop={len(population)}"
+            )
+            _step_times.append(now)
+
+        best = population.best_n(int(des_num_sequences), discard_duplicates=True)
+        print(
+            f"[DES ft_round={round_i}] Done — best_n={len(best)}  "
+            f"total={time.time() - t0_total:.1f}s  → {des_fasta}"
+        )
+        des_arr = (
+            np.array([s.structure for s in best])
+            if len(best) > 0
+            else cand_init[: min(int(des_num_sequences), len(cand_init))]
+        )
+        os.makedirs(os.path.dirname(des_fasta), exist_ok=True)
+        _int_array_to_fasta(des_arr, des_fasta, prefix=f"des_r{round_i}")
+        shutil.rmtree(workdir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Per-mutation async implementation
     # ------------------------------------------------------------------
 
-    async def _sgdes_async(self, mutation: str, cuda_device: int, policy) -> None:
-        """Async port of _sgdes_blocking; all commands run via executable_task."""
-        tasks = self._register_tasks(cuda_device, policy)
+    async def _sgdes_async(self, mutation: str, policy) -> None:
+        """Run one full SGDES mutation: embed → DES → foldseek → rank → eval."""
+        tasks = self._register_tasks(policy)
 
         abspath = os.path.join(self.base_outdir, f"{mutation}_wd")
         os.makedirs(abspath, exist_ok=True)
-
-        if self.collect_nvml_telemetry:
-            await tasks.start_node_telemetry(
-                outdir=self.telemetry_dir,
-                rate=self.nvml_rate,
-                checkpoint_interval=self.nvml_checkpoint,
-            )
 
         name = f"{mutation}_run"
         query = os.path.join(self.query_dir, f"mayv_{mutation}.fasta")
@@ -733,9 +615,8 @@ class SGDESWorkflow:
                     )
                     logger.info(f"[{mutation}] Fold done ({time.time() - t0:.1f}s)")
 
-                stats_tsv = os.path.join(abspath, f"{name}_seqkit_stats.tsv")
-                await tasks.seqkit_stats(input_fasta=query, out_tsv=stats_tsv)
-                df_stats = pd.read_csv(stats_tsv, sep="\t")
+                stats_out = await tasks.seqkit_stats(input_fasta=query)
+                df_stats = pd.read_csv(io.StringIO(stats_out), sep="\t")
                 median = df_stats.Q2.values
                 logger.info(f"[{mutation}] Sequence length median={median[0]}  (from {query})")
 
@@ -752,7 +633,8 @@ class SGDESWorkflow:
                 f"  ref={de_ref_fasta})"
             )
             t0 = time.time()
-            await tasks.run_des(
+            await self._run_des(
+                tasks,
                 de_ref_fasta=de_ref_fasta,
                 fixed_len=fixed_len,
                 des_fasta=des_fasta,
@@ -903,11 +785,21 @@ class SGDESWorkflow:
 
             # ── seqkit grep → most-distant FASTA ──────────────────────────────
             output_fasta = os.path.join(abspath, f"{name}_foldtune_most-distant_round{i}.fasta")
-            await tasks.seqkit_grep(
+            # _grep_td pins stdout to output_fasta via Dragon's ProcessTemplate;
+            # re-enable if seqkit_grep is switched back to writing stdout directly
+            # rather than returning it as a string.
+            # _grep_td = (
+            #     {"process_template": {"policy": tasks.host_policy, "stdout": output_fasta}}
+            #     if tasks.host_policy is not None
+            #     else {"process_template": {"stdout": output_fasta}}
+            # )
+            res = await tasks.seqkit_grep(
+                # task_description=_grep_td,
                 pattern_file=labels_file,
                 input_fasta=cleaned,
-                output_fasta=output_fasta,
             )
+            with open(output_fasta, "w+") as output_file:
+                output_file.write(res)
 
             # ── Save per-sequence metrics ──────────────────────────────────────
             tmp_input_df = pd.read_csv(
@@ -1022,9 +914,6 @@ class SGDESWorkflow:
 
         logger.info(f"[{mutation}] SGDES complete → {abspath}")
 
-        if self.collect_nvml_telemetry:
-            await tasks.stop_node_telemetry(outdir=self.telemetry_dir)
-
     # ------------------------------------------------------------------
     # Async interface
     # ------------------------------------------------------------------
@@ -1032,19 +921,13 @@ class SGDESWorkflow:
     async def _run_one(self, mutation: str, idx: int) -> None:
         if self.policies is not None:
             policy = self.policies[idx % len(self.policies)]
-            # In multi-node Dragon, each worker is routed to a specific node+GPU via
-            # policy. The GPU index in CUDA_VISIBLE_DEVICES must match the per-node
-            # local GPU id (gpu_affinity), not the global idx % total_gpus calculation
-            # (which would exceed the number of GPUs on any single node).
-            cuda_device = policy.gpu_affinity[0] if policy.gpu_affinity else 0
             logger.info(f"[{mutation}] Starting (policy={policy})")
         else:
             policy = None
-            cuda_device = idx % self.total_gpus
             logger.info(f"[{mutation}] Starting")
 
         try:
-            await self._sgdes_async(mutation, cuda_device, policy)
+            await self._sgdes_async(mutation, policy)
         except Exception as e:
             import traceback
 

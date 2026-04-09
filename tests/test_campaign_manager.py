@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.campaign import AsyncCampaignManager, BaseWorkflow, CampaignManager, ResourcePool, WorkflowStats
+from src.campaign import (
+    AsyncCampaignManager,
+    BaseWorkflow,
+    CampaignManager,
+    ResourcePool,
+    WorkflowStats,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -222,7 +228,9 @@ class TestAsyncCampaignManager:
         """_signal_ready() unblocks B even before all of A's replicas finish."""
         acm.register_group("a", SignalWorkflow, replicas=1)
         acm.register_group(
-            "b", NullWorkflow, replicas=1,
+            "b",
+            NullWorkflow,
+            replicas=1,
             dependencies=["a"],
             dep_threshold=999,  # count-based fallback would never fire
         )
@@ -488,8 +496,8 @@ class TestAsyncCampaignManagerResources:
         await racm.start()
         assert await racm.wait(timeout=3.0)
         s = racm.status()["resources"]
-        assert s["available_cpus"] == 4   # total_cpus restored
-        assert s["available_gpus"] == 2   # total_gpus restored
+        assert s["available_cpus"] == 4  # total_cpus restored
+        assert s["available_gpus"] == 2  # total_gpus restored
 
     async def test_status_includes_resource_snapshot(self, racm):
         racm.register_group("g", NullWorkflow, replicas=1, required_cpus=2, required_gpus=1)
@@ -549,6 +557,7 @@ class TestCampaignManagerResources:
     def test_resource_limits_concurrency(self, rcm):
         """With 2 GPUs and 1 GPU/replica, at most 2 run concurrently."""
         import threading
+
         peak = []
         lock = threading.Lock()
 
@@ -560,7 +569,9 @@ class TestCampaignManagerResources:
                 with lock:
                     GpuWorkflow._active += 1
                     peak.append(GpuWorkflow._active)
-                import time; time.sleep(0.02)
+                import time
+
+                time.sleep(0.02)
                 with lock:
                     GpuWorkflow._active -= 1
 
@@ -570,8 +581,7 @@ class TestCampaignManagerResources:
         assert max(peak) <= 2
 
     def test_resources_released_after_replica(self, rcm):
-        rcm.register_group("g", SyncRecordingWorkflow, replicas=2,
-                            required_cpus=2, required_gpus=1)
+        rcm.register_group("g", SyncRecordingWorkflow, replicas=2, required_cpus=2, required_gpus=1)
         rcm.start()
         assert rcm.wait(timeout=3.0)
         s = rcm.status()["resources"]
@@ -579,8 +589,7 @@ class TestCampaignManagerResources:
         assert s["available_gpus"] == 2
 
     def test_status_includes_resource_snapshot(self, rcm):
-        rcm.register_group("g", SyncRecordingWorkflow, replicas=1,
-                            required_cpus=1, required_gpus=0)
+        rcm.register_group("g", SyncRecordingWorkflow, replicas=1, required_cpus=1, required_gpus=0)
         s = rcm.status()
         assert "resources" in s
         assert s["resources"]["total_cpus"] == 4

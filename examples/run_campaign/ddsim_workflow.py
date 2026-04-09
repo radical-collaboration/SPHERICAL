@@ -15,7 +15,7 @@ from pathlib import Path
 from src.campaign import BaseWorkflow
 
 _DDSIM_ROOT = Path("/ocean/projects/dmr170002p/goliyad/DeepDriveSim")
-_RUN_DUMMY  = _DDSIM_ROOT / "workflows/dummy_workflow/run_dummy.py"
+_RUN_DUMMY = _DDSIM_ROOT / "workflows/dummy_workflow/run_dummy.py"
 _DUMMY_PYTHON = Path("/ocean/projects/dmr170002p/goliyad/conda_env/dummy_workflow/bin/python")
 
 
@@ -31,8 +31,8 @@ class DDSimWorkflow(BaseWorkflow):
     workflow_id = "ddsim"
 
     async def run(self, replica_id: str) -> None:
-        cfg  = self.config or {}
-        base_home    = Path(cfg.get("home_dir", Path.home() / "DDSim")).expanduser()
+        cfg = self.config or {}
+        base_home = Path(cfg.get("home_dir", Path.home() / "DDSim")).expanduser()
         replica_home = base_home / replica_id
         replica_home.mkdir(parents=True, exist_ok=True)
 
@@ -46,11 +46,16 @@ class DDSimWorkflow(BaseWorkflow):
         ready_signal.unlink(missing_ok=True)
 
         cmd = [
-            str(_DUMMY_PYTHON), str(_RUN_DUMMY),
-            "--config-json",       config_json,
-            "--home-dir",          str(replica_home),
-            "--replica-id",        replica_id,
-            "--ready-signal-path", str(ready_signal),
+            str(_DUMMY_PYTHON),
+            str(_RUN_DUMMY),
+            "--config-json",
+            config_json,
+            "--home-dir",
+            str(replica_home),
+            "--replica-id",
+            replica_id,
+            "--ready-signal-path",
+            str(ready_signal),
         ]
 
         proc = await asyncio.create_subprocess_exec(*cmd)

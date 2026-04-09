@@ -16,13 +16,15 @@
 export CUDA_HOME=/opt/nvidia/hpc_sdk/Linux_x86_64/25.3/cuda/12.8
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
+export TF_FORCE_GPU_ALLOW_GROWTH=true
+export JAX_PLATFORMS=cpu
+
 export SGDES_DIR=/scratch/bblj/mgoliyad1/SGDES
 export SPHERICAL_DIR=/scratch/bblj/mgoliyad1/SPHERICAL
 
 cd $SPHERICAL_DIR/examples/sgdes
-rm -rf *telemetry
-rm -rf mayv_output
-rm -rf tmp*
+# ── Clean previous run artifacts ──────────────────────────────────────────────
+rm -rf *telemetry mayv_output tmp*
 
 source /u/mgoliyad1/ve/sgdes/bin/activate
 dragon-config add --ofi-runtime-lib=/opt/cray/libfabric/1.22.0/lib64

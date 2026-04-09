@@ -54,6 +54,7 @@ class ESM2InferenceService(InferenceService):
 
         # ESM2-specific imports
         from transformers.utils import logging as hf_logging
+
         hf_logging.disable_progress_bar()
         from transformers import EsmModel, EsmTokenizer
 
@@ -105,9 +106,7 @@ class ESM2InferenceService(InferenceService):
         model_id, tokenizer_kwargs, cache_dir, local = self._resolve_model_id()
 
         if local:
-            self.logger.info(
-                f"[Service {self.rank}] Loading models from local path: {model_id}"
-            )
+            self.logger.info(f"[Service {self.rank}] Loading models from local path: {model_id}")
             model_kwargs = {
                 "dtype": dtype,
                 "local_files_only": True,

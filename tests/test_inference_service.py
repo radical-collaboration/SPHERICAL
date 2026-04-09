@@ -273,7 +273,9 @@ class TestGPUWorker:
         worker = GPUWorker(device="cuda:0", worker_id=0, service=service)
 
         # Put a batch with None request_id (local mode)
-        await service.work_queue.put((1, None, None))  # batch_id=1, request_id=None, batch_data=None
+        await service.work_queue.put(
+            (1, None, None)
+        )  # batch_id=1, request_id=None, batch_data=None
         await service.work_queue.put(None)
 
         # Run worker

@@ -53,17 +53,27 @@ def main():
     _set_pdeathsig()
 
     parser = argparse.ArgumentParser(description="Dragon server node launcher")
-    parser.add_argument("--config-json", required=True,
-                        help="Path to JSON config file on shared filesystem")
+    parser.add_argument(
+        "--config-json", required=True, help="Path to JSON config file on shared filesystem"
+    )
     parser.add_argument("--node-rank", type=int, required=True)
     parser.add_argument("--hostname", required=True)
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--service-module", required=True,
-                        help="Python module containing the service class (e.g. esm2_service)")
-    parser.add_argument("--service-class", required=True,
-                        help="Name of the InferenceService subclass (e.g. ESM2InferenceService)")
-    parser.add_argument("--script-dir", default="",
-                        help="Directory to add to sys.path for finding the service module")
+    parser.add_argument(
+        "--service-module",
+        required=True,
+        help="Python module containing the service class (e.g. esm2_service)",
+    )
+    parser.add_argument(
+        "--service-class",
+        required=True,
+        help="Name of the InferenceService subclass (e.g. ESM2InferenceService)",
+    )
+    parser.add_argument(
+        "--script-dir",
+        default="",
+        help="Directory to add to sys.path for finding the service module",
+    )
     parser.add_argument("--use-https", action="store_true")
     args = parser.parse_args()
 
@@ -82,9 +92,14 @@ def main():
 
     # Now import and run the server
     from src.inference.orchestrator import _server_node_main
+
     _server_node_main(
-        config, args.node_rank, args.hostname, args.port,
-        service_class, args.use_https,
+        config,
+        args.node_rank,
+        args.hostname,
+        args.port,
+        service_class,
+        args.use_https,
     )
 
 

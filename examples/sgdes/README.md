@@ -292,16 +292,15 @@ documentation.
 
 ## 7. Design Notes
 
-**Three `task_description` policy tiers: `_TD_GPU`, `_TD_HOST`, `_TD_CPU`**
+**Two `task_description` policy tiers: `_TD_GPU`, `_TD_HOST`**
 
 Every task in `_register_tasks` is pinned to the correct node and/or GPU via
-one of three policy templates:
+one of two policy templates:
 
-| Template   | Placement   | `gpu_affinity` | Used by                              |
-|------------|-------------|----------------|--------------------------------------|
-| `_TD_GPU`  | `HOST_NAME` | `[gpu_id]`     | `embed`, `fold`, `foldseek_createdb` |
-| `_TD_HOST` | `HOST_NAME` | *(none)*       | `foldseek_search`                    |
-| `_TD_CPU`  | default     | *(none)*       | `seqkit_grep`, `seqkit_stats`        |
+| Template   | Placement   | `gpu_affinity` | Used by                                                      |
+|------------|-------------|----------------|--------------------------------------------------------------|
+| `_TD_GPU`  | `HOST_NAME` | `[gpu_id]`     | `embed`, `fold`, `foldseek_createdb`, `foldseek_search`      |
+| `_TD_HOST` | `HOST_NAME` | *(none)*       | `seqkit_grep`, `seqkit_stats`                                |
 
 **`JAX_PLATFORMS=cpu`**
 Forced at import time.  The system cuDNN may be older than what jaxlib was

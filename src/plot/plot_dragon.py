@@ -41,13 +41,21 @@ import numpy as np
 # Loaders
 # ---------------------------------------------------------------------------
 
+
 def load_telemetry_by_host(telemetry_dir: Path, tmin: float = None, tmax: float = None) -> dict:
     """Load Dragon telemetry files grouped by hostname.
 
     Returns:
         {hostname: {"timestamps": array, "gpu_utils": {col: array}, "cpu_util": array}}
     """
-    hosts = defaultdict(lambda: {"timestamps": [], "gpu_utils": defaultdict(list), "gpu_mems": defaultdict(list), "cpu_util": []})
+    hosts = defaultdict(
+        lambda: {
+            "timestamps": [],
+            "gpu_utils": defaultdict(list),
+            "gpu_mems": defaultdict(list),
+            "cpu_util": [],
+        }
+    )
 
     if not telemetry_dir.is_dir():
         return {}
@@ -84,7 +92,12 @@ def load_telemetry_by_host(telemetry_dir: Path, tmin: float = None, tmax: float 
             if np.any(arr > 0):
                 gpu_utils[key] = arr
         gpu_mems = {key: np.array(vals) for key, vals in hdata["gpu_mems"].items()}
-        result[hostname] = {"timestamps": timestamps, "cpu_util": cpu_util, "gpu_utils": gpu_utils, "gpu_mems": gpu_mems}
+        result[hostname] = {
+            "timestamps": timestamps,
+            "cpu_util": cpu_util,
+            "gpu_utils": gpu_utils,
+            "gpu_mems": gpu_mems,
+        }
 
     return result
 
@@ -107,7 +120,7 @@ def load_inference_metrics(output_dir: Path):
     for mf in metrics_files:
         with open(mf) as f:
             data = json.load(f)
-        ts  = np.array([e["timestamp"] for e in data["timeseries"]])
+        ts = np.array([e["timestamp"] for e in data["timeseries"]])
         tps = np.array([e["tok_per_sec"] for e in data["timeseries"]])
         tmin = min(tmin, ts.min())
         tmax = max(tmax, ts.max())
@@ -118,18 +131,27 @@ def load_inference_metrics(output_dir: Path):
     max_len = max(len(a) for a in all_tps)
     padded = np.full((len(all_tps), max_len), np.nan)
     for i, a in enumerate(all_tps):
-        padded[i, :len(a)] = a
+        padded[i, : len(a)] = a
     tok_sum = np.nansum(padded, axis=0)
 
     with open(metrics_files[0]) as f:
         ts_rel = np.array([e["timestamp"] for e in json.load(f)["timeseries"]]) - tmin
 
-    return ts_rel, tok_sum[:len(ts_rel)], np.nanmean(tok_sum), np.nanstd(tok_sum), num_gpus, tmin, tmax
+    return (
+        ts_rel,
+        tok_sum[: len(ts_rel)],
+        np.nanmean(tok_sum),
+        np.nanstd(tok_sum),
+        num_gpus,
+        tmin,
+        tmax,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Plotting helpers
 # ---------------------------------------------------------------------------
+
 
 def _plot_hosts(axes, ax_idx: int, hosts_data: dict, tmin: float) -> int:
     """Plot per-host GPU/CPU utilization subplots. Returns next ax_idx."""
@@ -143,18 +165,19 @@ def _plot_hosts(axes, ax_idx: int, hosts_data: dict, tmin: float) -> int:
         for gpu_key in sorted(hdata["gpu_utils"]):
             vals = hdata["gpu_utils"][gpu_key]
             gpu_idx = gpu_key.split("_")[1]
-            ax.plot(ts_h[:len(vals)], vals, alpha=0.4, label=f"GPU {gpu_idx}")
+            ax.plot(ts_h[: len(vals)], vals, alpha=0.4, label=f"GPU {gpu_idx}")
             all_gpu_vals.append(vals)
 
         if all_gpu_vals:
             min_len = min(len(v) for v in all_gpu_vals)
             stacked = np.array([v[:min_len] for v in all_gpu_vals])
             gpu_mean = np.mean(stacked, axis=0)
-            gpu_std  = np.std(stacked, axis=0)
-            t_short  = ts_h[:min_len]
+            gpu_std = np.std(stacked, axis=0)
+            t_short = ts_h[:min_len]
             ax.plot(t_short, gpu_mean, color="black", linewidth=2, label="GPU avg")
-            ax.fill_between(t_short, gpu_mean - gpu_std, gpu_mean + gpu_std,
-                            color="black", alpha=0.15)
+            ax.fill_between(
+                t_short, gpu_mean - gpu_std, gpu_mean + gpu_std, color="black", alpha=0.15
+            )
 
         ax.plot(ts_h, hdata["cpu_util"], color="tab:red", linestyle="--", label="CPU")
 
@@ -172,6 +195,7 @@ def _plot_hosts(axes, ax_idx: int, hosts_data: dict, tmin: float) -> int:
 # Summary printout
 # ---------------------------------------------------------------------------
 
+
 def print_summary(hosts_data: dict) -> None:
     all_ts = np.concatenate([h["timestamps"] for h in hosts_data.values()])
     duration = all_ts.max() - all_ts.min()
@@ -183,7 +207,7 @@ def print_summary(hosts_data: dict) -> None:
     for hostname in sorted(hosts_data):
         short = hostname.split(".")[0]
         gpu_utils = hosts_data[hostname]["gpu_utils"]
-        gpu_mems  = hosts_data[hostname]["gpu_mems"]
+        gpu_mems = hosts_data[hostname]["gpu_mems"]
         first = True
         for gpu_key in sorted(gpu_utils):
             gpu_id = gpu_key.split("_")[1]
@@ -191,7 +215,7 @@ def print_summary(hosts_data: dict) -> None:
             mem_vals = gpu_mems.get(mem_key, np.array([]))
             node_label = short if first else ""
             mem_mean = f"{np.mean(mem_vals):>14.2f}" if len(mem_vals) else f"{'—':>14}"
-            mem_max  = f"{np.max(mem_vals):>13.2f}"  if len(mem_vals) else f"{'—':>13}"
+            mem_max = f"{np.max(mem_vals):>13.2f}" if len(mem_vals) else f"{'—':>13}"
             print(
                 f"{node_label:<16} {'GPU ' + gpu_id:<6} "
                 f"{np.mean(gpu_utils[gpu_key]):>10.1f} "
@@ -206,6 +230,7 @@ def print_summary(hosts_data: dict) -> None:
 # ---------------------------------------------------------------------------
 # Standalone telemetry mode  (replaces plot_utilization.py)
 # ---------------------------------------------------------------------------
+
 
 def plot_telemetry_standalone(telemetry_dir: Path, output: Path) -> None:
     """Plot GPU/CPU utilization from a single telemetry directory."""
@@ -236,6 +261,7 @@ def plot_telemetry_standalone(telemetry_dir: Path, output: Path) -> None:
 # Multi-run inference mode  (replaces make_plots.py)
 # ---------------------------------------------------------------------------
 
+
 def plot_per_run(output_dir: Path, plots_dir: Path):
     """Generate per-run plot: GPU utilization by host + throughput timeseries."""
     print(f"\nReading data from {output_dir}")
@@ -247,7 +273,7 @@ def plot_per_run(output_dir: Path, plots_dir: Path):
     hosts_data = load_telemetry_by_host(telemetry_dir, tmin, tmax)
 
     has_telemetry = bool(hosts_data)
-    has_metrics   = result is not None and len(result[0]) > 0
+    has_metrics = result is not None and len(result[0]) > 0
 
     if not has_telemetry and not has_metrics:
         print("  No data to plot")
@@ -270,9 +296,8 @@ def plot_per_run(output_dir: Path, plots_dir: Path):
 
     if has_metrics:
         ax = axes[ax_idx]
-        ax.plot(ts_rel, tok_sum[:len(ts_rel)], label="Tokens/sec (all ranks)", color="green")
-        ax.axhline(mean_val, color="green", linestyle=":", alpha=0.5,
-                   label=f"mean={mean_val:.0f}")
+        ax.plot(ts_rel, tok_sum[: len(ts_rel)], label="Tokens/sec (all ranks)", color="green")
+        ax.axhline(mean_val, color="green", linestyle=":", alpha=0.5, label=f"mean={mean_val:.0f}")
         ax.set_ylabel("Throughput (tok/s)")
         ax.set_xlabel("Time (seconds)")
         ax.grid(True, alpha=0.3)
@@ -291,9 +316,9 @@ def plot_throughput_summary(tok_per_secs: dict, plots_dir: Path) -> None:
     """Bar chart: average throughput vs number of GPUs."""
     if not tok_per_secs:
         return
-    gpus  = sorted(tok_per_secs)
+    gpus = sorted(tok_per_secs)
     means = [tok_per_secs[n][0] for n in gpus]
-    stds  = [tok_per_secs[n][1] for n in gpus]
+    stds = [tok_per_secs[n][1] for n in gpus]
 
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(gpus, means, color=(0.25, 0.25, 0.25), marker="o", linestyle=":")
@@ -337,11 +362,13 @@ if __name__ == "__main__":
         help="Parent directory of per-run output subdirectories (multi-run mode)",
     )
     parser.add_argument(
-        "--output", default="utilization.png",
+        "--output",
+        default="utilization.png",
         help="Output file for standalone mode (default: utilization.png)",
     )
     parser.add_argument(
-        "--plots-dir", default="plots",
+        "--plots-dir",
+        default="plots",
         help="Directory to write plots into for multi-run mode (default: plots/)",
     )
     args = parser.parse_args()

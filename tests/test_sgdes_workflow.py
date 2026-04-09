@@ -30,6 +30,7 @@ if str(_SGDES_EXAMPLE) not in sys.path:
 # Stub out heavy / unavailable modules before importing the workflow
 # ---------------------------------------------------------------------------
 
+
 def _make_stub(name):
     mod = types.ModuleType(name)
     sys.modules[name] = mod
@@ -37,20 +38,32 @@ def _make_stub(name):
 
 
 for _mod in [
-    "trill", "trill.utils", "trill.utils.abo", "trill.utils.abo.amortized_bo",
+    "trill",
+    "trill.utils",
+    "trill.utils.abo",
+    "trill.utils.abo.amortized_bo",
     "trill.utils.abo.amortized_bo.controller",
     "trill.utils.abo.amortized_bo.data",
     "trill.utils.abo.amortized_bo.deep_evolution_solver",
     "trill.utils.abo.amortized_bo.foldseek_similarity_problem",
-    "trill.utils.fasta_files", "trill.utils.foldseek_utils", "trill.utils.sgdes",
+    "trill.utils.fasta_files",
+    "trill.utils.foldseek_utils",
+    "trill.utils.sgdes",
     "trill.utils.abo.amortized_bo.base_problem",
     "trill.utils.abo.amortized_bo.domains",
-    "dragon", "dragon.infrastructure", "dragon.infrastructure.policy",
-    "dragon.native", "dragon.native.machine",
-    "rhapsody", "rhapsody.backends",
-    "radical", "radical.asyncflow",
+    "dragon",
+    "dragon.infrastructure",
+    "dragon.infrastructure.policy",
+    "dragon.native",
+    "dragon.native.machine",
+    "rhapsody",
+    "rhapsody.backends",
+    "radical",
+    "radical.asyncflow",
     "gin",
-    "tensorflow", "tensorflow.compat", "tensorflow.compat.v1",
+    "tensorflow",
+    "tensorflow.compat",
+    "tensorflow.compat.v1",
     "jax",
 ]:
     if _mod not in sys.modules:
@@ -65,9 +78,13 @@ sys.modules["trill.utils.sgdes"].highest_avg_score_by_query = MagicMock()
 sys.modules["trill.utils.sgdes"].save_round_records = MagicMock()
 sys.modules["trill.utils.abo.amortized_bo.controller"].DeepEvolutionSolverController = MagicMock()
 sys.modules["trill.utils.abo.amortized_bo.data"].DiscreteSequenceData = MagicMock()
-sys.modules["trill.utils.abo.amortized_bo.deep_evolution_solver"].MutationPredictorSolver = MagicMock()
-sys.modules["trill.utils.abo.amortized_bo.foldseek_similarity_problem"].FoldseekSimilarityProblem = MagicMock()
-sys.modules["gin"].configurable = lambda *a, **kw: (lambda f: f)
+sys.modules[
+    "trill.utils.abo.amortized_bo.deep_evolution_solver"
+].MutationPredictorSolver = MagicMock()
+sys.modules[
+    "trill.utils.abo.amortized_bo.foldseek_similarity_problem"
+].FoldseekSimilarityProblem = MagicMock()
+sys.modules["gin"].configurable = lambda *a, **kw: lambda f: f
 sys.modules["dragon.infrastructure.policy"].Policy = None
 sys.modules["radical.asyncflow"].WorkflowEngine = MagicMock()
 sys.modules["radical.asyncflow"].LocalExecutionBackend = MagicMock()
@@ -92,6 +109,7 @@ from sgdes_workflow_asyncflow import (  # noqa: E402
 
 AA = "ACDEFGHIKLMNPQRSTVWY"
 
+
 @pytest.fixture
 def simple_fasta(tmp_path):
     fa = tmp_path / "seqs.fasta"
@@ -110,8 +128,8 @@ def single_fasta(tmp_path):
 # _fasta_to_int_array
 # ---------------------------------------------------------------------------
 
-class TestFastaToIntArray:
 
+class TestFastaToIntArray:
     def test_basic_encoding(self, simple_fasta):
         arr = _fasta_to_int_array(simple_fasta, length=5)
         assert arr.shape == (2, 5)
@@ -154,8 +172,8 @@ class TestFastaToIntArray:
 # _int_array_to_fasta
 # ---------------------------------------------------------------------------
 
-class TestIntArrayToFasta:
 
+class TestIntArrayToFasta:
     def test_roundtrip(self, tmp_path, simple_fasta):
         arr = _fasta_to_int_array(simple_fasta, length=5)
         out = str(tmp_path / "out.fasta")
@@ -185,8 +203,8 @@ class TestIntArrayToFasta:
 # _fasta_to_numeric
 # ---------------------------------------------------------------------------
 
-class TestFastaToNumeric:
 
+class TestFastaToNumeric:
     def test_basic_shape(self, simple_fasta):
         arr = _fasta_to_numeric(simple_fasta)
         assert arr.ndim == 2
@@ -202,8 +220,7 @@ class TestFastaToNumeric:
         arr = _fasta_to_numeric(str(fa))
         # longest is 4; shorter sequence padded to 4
         assert arr.shape == (2, 4)
-        assert list(arr[1]) == [AA.index("A"), AA.index("C"),
-                                 AA.index("A"), AA.index("A")]
+        assert list(arr[1]) == [AA.index("A"), AA.index("C"), AA.index("A"), AA.index("A")]
 
     def test_dtype(self, simple_fasta):
         arr = _fasta_to_numeric(simple_fasta)
@@ -222,10 +239,11 @@ class TestFastaToNumeric:
 # run_workflow helpers (load_config, make_policies)
 # ---------------------------------------------------------------------------
 
-class TestLoadConfig:
 
+class TestLoadConfig:
     def test_reads_yaml(self, tmp_path):
         from run_workflow import load_config
+
         cfg = tmp_path / "c.yaml"
         cfg.write_text("engine: dragon\ntotal_gpus: 4\n")
         result = load_config(str(cfg))
@@ -234,6 +252,7 @@ class TestLoadConfig:
 
     def test_empty_yaml_returns_empty_dict(self, tmp_path):
         from run_workflow import load_config
+
         cfg = tmp_path / "empty.yaml"
         cfg.write_text("")
         result = load_config(str(cfg))
@@ -241,6 +260,7 @@ class TestLoadConfig:
 
     def test_mutations_list(self, tmp_path):
         from run_workflow import load_config
+
         cfg = tmp_path / "c.yaml"
         cfg.write_text("mutations:\n  - T365F\n  - Y155T\n")
         result = load_config(str(cfg))
@@ -248,14 +268,15 @@ class TestLoadConfig:
 
 
 class TestMakePolicies:
-
     def _mock_policy_class(self):
         """Return a minimal Policy mock that tracks construction arguments."""
+
         class FakePlacement:
             HOST_NAME = "HOST_NAME"
 
         class FakePolicy:
             Placement = FakePlacement
+
             def __init__(self, placement=None, host_name=None, gpu_affinity=None):
                 self.placement = placement
                 self.host_name = host_name
@@ -272,11 +293,13 @@ class TestMakePolicies:
         i = 0
         for _ in range(4):
             hostname, gpu_id = gpus[i]
-            policies.append(FakePolicy(
-                placement=FakePolicy.Placement.HOST_NAME,
-                host_name=hostname,
-                gpu_affinity=[gpu_id],
-            ))
+            policies.append(
+                FakePolicy(
+                    placement=FakePolicy.Placement.HOST_NAME,
+                    host_name=hostname,
+                    gpu_affinity=[gpu_id],
+                )
+            )
             i = (i + 1) % len(gpus)
 
         assert len(policies) == 4
@@ -329,8 +352,8 @@ class TestMakePolicies:
 # SGDESWorkflow initialisation (no Dragon, no TRILL)
 # ---------------------------------------------------------------------------
 
-class TestSGDESWorkflowInit:
 
+class TestSGDESWorkflowInit:
     @pytest.fixture
     def base_config(self, tmp_path):
         outdir = str(tmp_path / "out")
@@ -354,29 +377,34 @@ class TestSGDESWorkflowInit:
 
     def test_init_sets_mutations(self, base_config):
         from sgdes_workflow_asyncflow import SGDESWorkflow
+
         mock_flow = MagicMock()
         wf = SGDESWorkflow(base_config, asyncflow=mock_flow)
         assert wf.mutations == ["T365F", "Y155T"]
 
     def test_init_sets_total_gpus(self, base_config):
         from sgdes_workflow_asyncflow import SGDESWorkflow
+
         mock_flow = MagicMock()
         wf = SGDESWorkflow(base_config, asyncflow=mock_flow)
         assert wf.total_gpus == 1
 
     def test_init_sets_foldtune_rounds(self, base_config):
         from sgdes_workflow_asyncflow import SGDESWorkflow
+
         mock_flow = MagicMock()
         wf = SGDESWorkflow(base_config, asyncflow=mock_flow)
         assert wf.foldtune_rounds == 2
 
     def test_init_requires_asyncflow(self, base_config):
         from sgdes_workflow_asyncflow import SGDESWorkflow
+
         with pytest.raises(ValueError, match="asyncflow"):
             SGDESWorkflow(base_config, asyncflow=None)
 
     def test_outdir_created(self, base_config):
         from sgdes_workflow_asyncflow import SGDESWorkflow
+
         mock_flow = MagicMock()
         SGDESWorkflow(base_config, asyncflow=mock_flow)
         assert Path(base_config["outdir"]).exists()

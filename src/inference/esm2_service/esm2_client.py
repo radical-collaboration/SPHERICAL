@@ -46,15 +46,11 @@ class ESM2Client(InferenceClient):
                 self._cached_batch_data = {
                     k: v.tolist() for k, v in self.service.single_batch.items()
                 }
-                self.logger.info(
-                    f"[Client {self.rank}] Prepared batch data for remote requests"
-                )
+                self.logger.info(f"[Client {self.rank}] Prepared batch data for remote requests")
             return self._cached_batch_data
 
         # Streaming: per-batch data
         if batch_id in self.service.batch_storage:
-            return {
-                k: v.tolist() for k, v in self.service.batch_storage[batch_id].items()
-            }
+            return {k: v.tolist() for k, v in self.service.batch_storage[batch_id].items()}
 
         return None

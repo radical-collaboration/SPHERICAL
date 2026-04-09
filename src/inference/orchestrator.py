@@ -88,9 +88,7 @@ def _server_node_main(config, node_rank, hostname, port, service_class, use_http
         )
 
         # 1. Initialize service (loads model onto devices -- slowest step)
-        svc = _init_server(
-            config, devices, node_rank, node_name, hostname, port, service_class
-        )
+        svc = _init_server(config, devices, node_rank, node_name, hostname, port, service_class)
 
         # 2. Create HTTP app and trigger startup (starts GPU workers)
         app = _get_app()
@@ -233,13 +231,9 @@ async def launch_servers(
     engine = config.get("engine", "").lower()
 
     if "dragon" in engine:
-        return await _launch_servers_dragon(
-            config, service_class, nodes, base_port, use_https
-        )
+        return await _launch_servers_dragon(config, service_class, nodes, base_port, use_https)
     else:
-        return await _launch_servers_async(
-            config, service_class, nodes, base_port, use_https
-        )
+        return await _launch_servers_async(config, service_class, nodes, base_port, use_https)
 
 
 async def _launch_servers_dragon(
@@ -275,9 +269,7 @@ async def _launch_servers_dragon(
         from dragon.native.process import Process
         from dragon.infrastructure.policy import Policy
     except ImportError:
-        logger.error(
-            "Dragon is not available. Install Dragon or set engine to 'concurrent'."
-        )
+        logger.error("Dragon is not available. Install Dragon or set engine to 'concurrent'.")
         return []
 
     logger.info(f"Using Dragon process placement for {len(nodes)} nodes")
@@ -318,13 +310,20 @@ async def _launch_servers_dragon(
         cmd = [
             service_python,
             launcher_script,
-            "--config-json", config_json_path,
-            "--node-rank", str(rank),
-            "--hostname", hostname,
-            "--port", str(port),
-            "--service-module", service_module_name,
-            "--service-class", service_class_name,
-            "--script-dir", script_dir,
+            "--config-json",
+            config_json_path,
+            "--node-rank",
+            str(rank),
+            "--hostname",
+            hostname,
+            "--port",
+            str(port),
+            "--service-module",
+            service_module_name,
+            "--service-class",
+            service_class_name,
+            "--script-dir",
+            script_dir,
         ]
         if use_https:
             cmd.append("--use-https")
@@ -367,6 +366,7 @@ async def _launch_servers_async(
         # Reuse the Dragon-path subprocess launch logic (no Dragon placement).
         import inspect, json, os
         from pathlib import Path
+
         launcher_script = str(Path(__file__).parent / "dragon_launcher.py")
         service_module_name = service_class.__module__
         service_class_name = service_class.__name__
@@ -390,13 +390,20 @@ async def _launch_servers_async(
             cmd = [
                 service_python,
                 launcher_script,
-                "--config-json", config_json_path,
-                "--node-rank", str(rank),
-                "--hostname", hostname,
-                "--port", str(port),
-                "--service-module", service_module_name,
-                "--service-class", service_class_name,
-                "--script-dir", script_dir,
+                "--config-json",
+                config_json_path,
+                "--node-rank",
+                str(rank),
+                "--hostname",
+                hostname,
+                "--port",
+                str(port),
+                "--service-module",
+                service_module_name,
+                "--service-class",
+                service_class_name,
+                "--script-dir",
+                script_dir,
             ]
             if use_https:
                 cmd.append("--use-https")
@@ -486,7 +493,9 @@ async def wait_for_healthy(
         now = time.time()
         # Log when status changes or every 30s to avoid flooding
         if len(healthy) != prev_healthy or (now - last_log_time) >= 30:
-            logger.info(f"{len(healthy)}/{len(endpoints)} servers ready, waiting... ({elapsed}s/{timeout}s)")
+            logger.info(
+                f"{len(healthy)}/{len(endpoints)} servers ready, waiting... ({elapsed}s/{timeout}s)"
+            )
             prev_healthy = len(healthy)
             last_log_time = now
 
@@ -577,12 +586,13 @@ async def start_services_local(
     # rather than defaulting to cuda:0.  Falls back to auto-detection when no
     # assignment is present (e.g. local testing without the CM).
     from .utils import get_available_device_count, detect_device_type
+
     device_type = detect_device_type()
     if device_type == "cuda":
         # Prefer group_gpu_ids (all GPUs held by the inference group) so that
         # each service is placed on a distinct CM-assigned GPU.  Fall back to
         # assigned_gpu_ids (single replica) or full auto-detection.
-        group_ids    = config.get("group_gpu_ids")
+        group_ids = config.get("group_gpu_ids")
         assigned_ids = config.get("assigned_gpu_ids")
         if group_ids:
             all_devices = [f"cuda:{i}" for i in group_ids]
@@ -670,9 +680,7 @@ async def start_services(
                 client_svc = service_class(
                     config=config, devices=["cpu"], rank=rank, client_mode=True
                 )
-                handles.append(
-                    ServiceHandle(ep, client_svc, None, dragon_process=proc_or_runner)
-                )
+                handles.append(ServiceHandle(ep, client_svc, None, dragon_process=proc_or_runner))
             else:
                 handles.append(ServiceHandle(ep, svc, proc_or_runner))
 
