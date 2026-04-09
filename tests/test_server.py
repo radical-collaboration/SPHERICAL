@@ -6,8 +6,8 @@ import pytest
 from aiohttp import web
 
 # Import server module functions (mocking dependencies)
-with patch.dict("sys.modules", {"inference_service": MagicMock()}):
-    from server import create_app, health_handler, info_handler, root_handler
+with patch.dict("sys.modules", {"src.inference.inference_service": MagicMock()}):
+    from src.inference.server import create_app, health_handler, info_handler, root_handler
 
 
 class TestServerHandlers:
@@ -31,7 +31,7 @@ class TestServerHandlers:
         """Test health endpoint when service not initialized."""
         request = MagicMock()
 
-        with patch("server.inference_service", None):
+        with patch("src.inference.server.inference_service", None):
             response = await health_handler(request)
 
         assert response.status == 503
@@ -41,7 +41,7 @@ class TestServerHandlers:
         """Test info endpoint when service not initialized."""
         request = MagicMock()
 
-        with patch("server.inference_service", None):
+        with patch("src.inference.server.inference_service", None):
             response = await info_handler(request)
 
         assert response.status == 503

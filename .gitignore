@@ -29,6 +29,7 @@ pip-log.txt
 nosetests.xml
 *.log
 *.prof
+examples/*/slurm*
 
 # Translations
 *.mo
@@ -47,5 +48,6 @@ __pycache__/
 _dragon_config_*.json
 
 # Outputs
-plots/
+#plots/
 outputs/
+*out

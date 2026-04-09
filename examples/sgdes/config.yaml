@@ -1,0 +1,81 @@
+# =============================================================================
+# SGDES Workflow Configuration — MAYV mutations
+# =============================================================================
+
+# ── Telemetry ─────────────────────────────────────────────────────────────────
+collect_dragon_telemetry:  true          # Dragon runtime metrics (dragon engine only)
+dragon_telemetry_dir:      "dragon-telemetry"
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+# outdir: base directory; the workflow appends {mutation}_wd automatically.
+outdir:    "/scratch/bblj/mgoliyad1/SPHERICAL/examples/sgdes/mayv_output"
+query_dir: "/scratch/bblj/mgoliyad1/SGDES/results/mayv/splited_mayv"
+wt_query:  "/scratch/bblj/mgoliyad1/SGDES/data/mayv_ori.fasta"
+
+# ── Execution ─────────────────────────────────────────────────────────────────
+engine:          dragon # concurrent (asyncio) or dragon
+# total_gpus is set automatically by delta_gpu_sbatch.sh via TOTAL_GPUS env var (nodes × gpus-per-node)
+foldtune_rounds: 3
+fast_folding:    true
+fold_batch_size: 1
+RNG_seed:        42
+
+# ── DES hyperparameters ───────────────────────────────────────────────────────
+des_rounds:        3
+des_batch_size:    100
+des_num_sequences: 50
+num_mutations:     1
+topk:              10
+
+# ── All 50 MAYV mutations (from run_sgdes_for_mayv.sh) ───────────────────────
+mutations:
+  - T365F
+  - Y155T
+  - Y198I
+  - A272I
+  - V266A
+  - A226C
+  - Y155H
+  - A281V
+  - A226V
+  - A272V
+  - Y155L
+  - F257L
+  - F49S
+  - V84L
+  - L283I
+  - N186S
+  # - Q182P
+  # - T215V
+  # - S230P
+  # - D213A
+  # - D213G
+  # - M23T
+  # - H63T
+  # - H146G
+  # - Q182D
+  # - H351A
+  # - W234I
+  # - N237T
+  # - Q235T
+  # - T215L
+  # - T215I
+  # - H145L
+  # - N186D
+  # - H254T
+  # - H254S
+  # - H286T
+  # - N217F
+  # - N217M
+  # - H63G
+  # - W234T
+  # - H169T
+  # - T232G
+  # - K233G
+  # - M23D
+  # - H169S
+  # - H286R
+  # - M23R
+  # - N217D
+  # - I216T
+  # - Q183T

@@ -135,11 +135,42 @@ dragon -w ssh --network-config slurm.yaml run_esm2_infern.py
 
 ## Metrics & Visualization
 
-Plot inference metrics:
+Two plotting scripts live in `src/plot/`:
+
+| Script | Input | Use case |
+|--------|-------|----------|
+| `src/plot/plot_dragon.py` | Dragon telemetry JSON (`checkpoint_metadata` + `metrics[]`) and/or inference `metrics_*.json` | ESM2 inference runs, Dragon campaign runs |
+| `src/plot/plot_nvml.py` | NVML telemetry JSON (`nvml_checkpoint_*.json`) | SGDES and any workflow using `NvmlMonitor` |
+
+### Dragon telemetry — standalone mode
+
+Plot GPU/CPU utilization from a single telemetry directory:
 
 ```bash
-python doc/plot_metrics.py --output_dir outputs
+python src/plot/plot_dragon.py --telemetry-dir outputs/telemetry-results
 ```
+
+### Dragon telemetry — multi-run mode
+
+Scan a parent directory for per-run output subdirectories, generate one plot
+per run and a throughput-vs-GPUs summary chart:
+
+```bash
+python src/plot/plot_dragon.py --output-dirs outputs --plots-dir plots
+```
+
+Each subdirectory may contain `metrics_*.json` (throughput timeseries) and/or
+a `telemetry-results/` subdirectory (GPU/CPU utilization).
+
+### NVML telemetry
+
+Plot GPU utilization and memory from NVML checkpoint files:
+
+```bash
+python src/plot/plot_nvml.py --telemetry-dir nvml-telemetry --output gpu_util.png
+```
+
+Prints a per-GPU summary table (mean/max utilization and memory) to stdout.
 
 ## Development
 
