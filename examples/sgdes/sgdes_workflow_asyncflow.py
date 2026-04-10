@@ -363,7 +363,9 @@ class SGDESWorkflow:
         des_num_sequences = kwargs["des_num_sequences"]
 
         ref_path = ori_ref if fast_folding else ori_ref_structs
-        workdir = tempfile.mkdtemp(prefix="fsim_")
+        #_des_tmp = os.environ.get("TMPDIR") or os.path.dirname(des_fasta)
+        workdir = tempfile.mkdtemp(prefix="fsim_", dir=os.path.dirname(des_fasta))
+        print(f"[DES ft_round={round_i}] workdir={workdir}", flush=True)
         t0_total = time.time()
 
         # ── Build input DB once ────────────────────────────────────────────────
