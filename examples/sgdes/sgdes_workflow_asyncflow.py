@@ -177,6 +177,9 @@ class SGDESWorkflow:
         self.des_num_sequences = int(cfg.get("des_num_sequences", 200))
         self.num_mutations_des = int(cfg.get("num_mutations", 1))
         self.topk = int(cfg.get("topk", 20))
+        # None → _run_des falls back to Lustre (os.path.dirname(des_fasta)).
+        # Set to a /tmp path by run_workflow.py on single-node runs.
+        self.des_workdir_base = cfg.get("des_workdir_base", None)
 
         if asyncflow is None:
             raise ValueError(
@@ -211,10 +214,10 @@ class SGDESWorkflow:
             else {}
         )
 
-        # Host-only policy: pins tasks to the mutation's node without gpu_affinity
+        # Host-only policy: same placement + host_name as _TD_GPU, no gpu_affinity
         if policy is not None and Policy is not None:
             _host_policy = Policy(
-                placement=Policy.Placement.HOST_NAME,
+                placement=policy.placement,
                 host_name=policy.host_name,
             )
             _TD_HOST = {"process_template": {"policy": _host_policy}}
@@ -282,14 +285,23 @@ class SGDESWorkflow:
         async def foldseek_search(task_description=_TD_GPU, **kwargs):
             """Run foldseek easy-search via subprocess.run (function_task).
             kwargs: query_db, target_db, tsv_out, tmp_dir, extra_flags (optional)
+
+            tmp_dir may be on node-local /tmp (when DES_TMPDIR is set); this task
+            creates it on the worker so the head process doesn't need to.
             """
+            import os as _os
             import subprocess as _sp
 
             query_db = kwargs["query_db"]
             target_db = kwargs["target_db"]
             tsv_out = kwargs["tsv_out"]
             tmp_dir = kwargs["tmp_dir"]
-            extra_flags = kwargs.get("extra_flags1", "")
+            extra_flags = kwargs.get("extra_flags", "")
+
+            # Create tmp_dir here on the worker — it may be on node-local /tmp
+            # which the head process cannot reach.
+            _os.makedirs(tmp_dir, exist_ok=True)
+
             cmd = f"foldseek easy-search {query_db} {target_db} {tsv_out} {tmp_dir} {extra_flags}".rstrip()
             print(f"[foldseek_search] cmd: {cmd}", flush=True)
             result = _sp.run(cmd, shell=True, capture_output=True, text=True)
@@ -363,9 +375,22 @@ class SGDESWorkflow:
         des_num_sequences = kwargs["des_num_sequences"]
 
         ref_path = ori_ref if fast_folding else ori_ref_structs
-        #_des_tmp = os.environ.get("TMPDIR") or os.path.dirname(des_fasta)
-        workdir = tempfile.mkdtemp(prefix="fsim_", dir=os.path.dirname(des_fasta))
-        print(f"[DES ft_round={round_i}] workdir={workdir}", flush=True)
+
+        # des_workdir_base is set by run_workflow.py:
+        #   single-node → DES_TMPDIR (/tmp): fast local I/O, ~10 s/createdb step
+        #   multi-node  → None (Lustre):      shared across nodes, ~27-130 s/step
+        # See run_workflow.py for the full rationale.
+        _workdir_base = self.des_workdir_base if self.des_workdir_base is not None \
+            else os.path.dirname(des_fasta)
+        workdir = tempfile.mkdtemp(prefix="fsim_", dir=_workdir_base)
+
+        # foldseek_search's internal scratch stays on node-local /tmp regardless.
+        _des_tmp = os.environ.get("DES_TMPDIR", "/tmp")
+
+        print(
+            f"[DES ft_round={round_i}] workdir={workdir}  foldseek_tmp={_des_tmp}",
+            flush=True,
+        )
         t0_total = time.time()
 
         # ── Build input DB once ────────────────────────────────────────────────
@@ -424,12 +449,14 @@ class SGDESWorkflow:
                 for h, s in zip(headers, seqs):
                     _f.write(f">{h}\n{s}\n")
 
+            # Multi-node: workdir is on Lustre → cand_fa, out_tsv, cand_db all
+            # visible to any node.  Single-node: workdir is on /tmp (fast I/O).
             out_tsv = os.path.join(workdir, f"res_{tag}.tsv")
-            tmp_dir = os.path.join(workdir, f"tmp_{tag}")
-            os.makedirs(tmp_dir, exist_ok=True)
+            cand_db = os.path.join(workdir, f"cand_db_{tag}")
+            # tmp_dir: foldseek_search creates it on the worker's local /tmp
+            tmp_dir = os.path.join(_des_tmp, f"fsim_{tag}")
 
             if fast_folding:
-                cand_db = os.path.join(workdir, f"cand_db_{tag}")
                 await tasks.foldseek_createdb(
                     fasta=cand_fa,
                     db_path=cand_db,
@@ -444,6 +471,8 @@ class SGDESWorkflow:
                 )
                 avg = _parse_foldseek_avg(out_tsv, fast_mode=True)
             else:
+                # fold writes PDB files; head creates dir on Lustre so fold task
+                # (executable_task on worker) can write and head can clean up later
                 cand_struct_dir = os.path.join(workdir, f"cand_structs_{tag}")
                 os.makedirs(cand_struct_dir, exist_ok=True)
                 await tasks.fold(
@@ -454,7 +483,6 @@ class SGDESWorkflow:
                     query=cand_fa,
                     batch_size=fold_batch_size,
                 )
-                cand_db = os.path.join(workdir, f"cand_db_{tag}")
                 await tasks.foldseek_createdb(fasta=cand_struct_dir, db_path=cand_db)
                 await tasks.foldseek_search(
                     query_db=cand_db,
@@ -469,10 +497,15 @@ class SGDESWorkflow:
             rewards_np = np.array([score_map.get(h, 0.0) for h in headers], dtype=np.float32)
 
             try:
+                # Clean up per-step files to avoid accumulating them.
                 os.remove(cand_fa)
                 os.remove(out_tsv)
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                shutil.rmtree(cand_db, ignore_errors=True)
+                import glob as _glob
+                for _f in _glob.glob(f"{cand_db}*"):
+                    try:
+                        os.remove(_f)
+                    except Exception:
+                        pass
                 if not fast_folding:
                     shutil.rmtree(cand_struct_dir, ignore_errors=True)
             except Exception:
@@ -937,8 +970,21 @@ class SGDESWorkflow:
             raise
 
     async def run(self) -> None:
-        """Run all mutations in parallel; asyncflow schedules task concurrency."""
-        tasks = [self._run_one(mutation, idx) for idx, mutation in enumerate(self.mutations)]
+        """Run mutations with concurrency capped at the number of GPU slots.
+
+        A semaphore limits active mutations to len(self.policies) so that
+        each running mutation maps to a unique policy slot (node + GPU).
+        When a mutation finishes it releases the semaphore, and the next
+        queued mutation picks up that slot via idx % len(policies).
+        """
+        num_slots = len(self.policies) if self.policies else len(self.mutations)
+        sem = asyncio.Semaphore(num_slots)
+
+        async def _bounded(mutation, idx):
+            async with sem:
+                await self._run_one(mutation, idx)
+
+        tasks = [_bounded(m, i) for i, m in enumerate(self.mutations)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         failed = [self.mutations[i] for i, r in enumerate(results) if isinstance(r, Exception)]
         if failed:

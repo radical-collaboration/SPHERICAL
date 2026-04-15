@@ -1,7 +1,6 @@
 #!/bin/sh -l
 
 #SBATCH -A ***-delta-gpu 
-#xSBATCH -A bebo-delta-gpu 
 #SBATCH --partition=gpuA40x4
 #SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
@@ -25,6 +24,13 @@ export SPHERICAL_DIR=/scratch/bblj/mgoliyad1/SPHERICAL
 cd $SPHERICAL_DIR/examples/sgdes
 # ── Clean previous run artifacts ──────────────────────────────────────────────
 rm -rf *telemetry mayv_output tmp*
+
+# ── Node-local /tmp for foldseek DB files ─────────────────────────────────────
+# Pre-create the per-job base dir on every compute node's local /tmp.
+# foldseek_createdb (executable_task) and foldseek_search (function_task) are
+# pinned to the same node via policy, so both see the same /tmp.
+export DES_TMPDIR=/tmp/sgdes_${SLURM_JOBID}
+srun --ntasks=${SLURM_NNODES} --ntasks-per-node=1 mkdir -p $DES_TMPDIR
 
 source /u/mgoliyad1/ve/sgdes/bin/activate
 dragon-config add --ofi-runtime-lib=/opt/cray/libfabric/1.22.0/lib64
