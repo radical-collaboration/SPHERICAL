@@ -103,23 +103,8 @@ correctly in a SLURM multi-node allocation.
 
 ## 3. Running
 
-### 3a. Single node — interactive node
+### 3a. Single node — sbatch
 
-On an already-allocated interactive GPU node run:
-
-```bash
-bash run_interactive.sh --gpus 4
-# or with a custom config:
-bash run_interactive.sh --gpus 1 --config config_test.yaml
-```
-
-`run_interactive.sh` activates the venv, sets `TOTAL_GPUS`, and launches
-`dragon -s` automatically.  Pass `--gpus N` to match the number of GPUs
-allocated to the node.
-
-### 3b. Single node — sbatch
-
-Submit via SLURM:
 ```bash
 sbatch delta_gpu_sbatch.sh      # Delta
 # sbatch bridges2_gpu_sbatch.sh  # Bridges-2
@@ -131,7 +116,7 @@ sbatch delta_gpu_sbatch.sh      # Delta
 #SBATCH --gpus-per-node=4
 ```
 
-### 3c. Multi-node — sbatch only
+### 3b. Multi-node — sbatch only
 
 Dragon distributes one mutation worker per GPU; each mutation runs on its
 own dedicated GPU.
@@ -151,7 +136,7 @@ The sbatch script automatically sets `TOTAL_GPUS = nodes × gpus-per-node`
 and selects `dragon -s` (single node) or `dragon -m` (multi-node) based on
 `SLURM_NNODES`.  No manual edits needed when switching between node counts.
 
-### 3d. Environment variables in the sbatch script
+### 3c. Environment variables in the sbatch script
 
 No paths are hardcoded in the Python files.  Set these exports in your sbatch
 script before the `dragon` launch line:
@@ -160,8 +145,9 @@ script before the `dragon` launch line:
 |-----------------|----------------------------------------------------------------|
 | `CUDA_HOME`     | CUDA toolkit root; `$CUDA_HOME/lib64` is prepended to `LD_LIBRARY_PATH` on every node, including remote Dragon workers |
 | `SGDES_DIR`     | Root of the SGDES/TRILL fork; used to add `amortized_bo` to `sys.path` |
-| `SPHERICAL_DIR` | Root of the SPHERICAL repo; added to `sys.path`                |
+| `SPHERICAL_DIR` | Root of the SPHERICAL repo; added to `sys.path`; also expands `${SPHERICAL_DIR}` in `config.yaml` |
 | `TOTAL_GPUS`    | Total GPUs across all nodes (`nodes × gpus-per-node`); set automatically by the sbatch script from SLURM variables; controls mutation concurrency |
+| `DES_TMPDIR`    | Node-local scratch for DES working directories (default `/tmp`); set to a Lustre path for multi-node runs so all nodes share intermediate files |
 
 **Delta example (`delta_gpu_sbatch.sh`):**
 ```sh
@@ -184,10 +170,10 @@ export SPHERICAL_DIR=$PROJECT/htp/SPHERICAL
 ## 4. Configuration Reference (`config.yaml`)
 
 ```yaml
-# Paths
-outdir:    "mayv_output"           # output root; {mutation}_wd/ appended per target
-query_dir: ".../splited_mayv"      # directory with one FASTA per mutation target
-wt_query:  ".../mayv_ori.fasta"    # wild-type reference sequence
+# Paths — ${VAR} references are expanded at load time
+outdir:    "${SPHERICAL_DIR}/workflows/sgdes/mayv_output"  # {mutation}_wd/ appended per target
+query_dir: "${SGDES_DIR}/results/mayv/splited_mayv"        # one FASTA per mutation target
+wt_query:  "${SGDES_DIR}/data/mayv_ori.fasta"              # wild-type reference sequence
 
 # Execution
 engine:          dragon   # "dragon" (HPC) or "concurrent" (local asyncio, no GPU affinity)
@@ -195,6 +181,7 @@ engine:          dragon   # "dragon" (HPC) or "concurrent" (local asyncio, no GP
 foldtune_rounds: 3        # outer optimisation rounds
 fast_folding:    true     # true = ProstT5 3Di (fast); false = ESMFold (slow)
 fold_batch_size: 1
+RNG_seed:        42
 
 # DES hyperparameters
 des_rounds:        3      # DES steps per foldtune round
@@ -203,13 +190,9 @@ des_num_sequences: 50     # top sequences kept after DES
 num_mutations:     1      # point mutations per candidate
 topk:              10     # sequences forwarded to next round
 
-# Telemetry (independent flags)
-collect_nvml_telemetry:   true          # per-node GPU util via NVML; all worker nodes captured
-collect_dragon_telemetry: true          # Dragon runtime metrics; dragon engine only
-nvml_dir:                 "nvml-telemetry"
-dragon_telemetry_dir:     "dragon-telemetry"
-nvml_collection_rate:     1.0           # seconds between NVML samples
-nvml_checkpoint_interval: 30.0          # seconds between checkpoint flushes
+# Telemetry
+collect_telemetry: true            # asyncflow runtime metrics (dragon engine only)
+telemetry_dir:     "telemetry_output"
 
 # Mutation targets — uncomment to enable
 mutations:
@@ -234,8 +217,7 @@ mutations:
     ├── T365F_run_round1_seq_records.csv                   # per-sequence metrics
     ├── T365F_run_round1_eval_*.json                       # round evaluation stats
     └── ...  (rounds 2, 3, …)
-nvml-telemetry/                                            # per-node GPU util logs (one file per node)
-dragon-telemetry/                                          # Dragon runtime metrics (dragon engine only)
+telemetry_output/                                          # asyncflow runtime metrics (dragon engine only)
 ```
 
 ---
@@ -254,39 +236,9 @@ SLURM output goes to `slurm-<jobid>.out`.  Key log lines to watch:
 Done.
 ```
 
-Two independent telemetry streams are collected when enabled in `config.yaml`:
-
-**NVML telemetry** (`collect_nvml_telemetry: true`) — GPU utilisation and memory
-sampled every 1 s, checkpointed every 30 s.  A `NvmlMonitor` is started on each
-worker node via Dragon function tasks, so all nodes write to `nvml-telemetry/`
-(filenames are hostname-namespaced; no collisions on shared Lustre storage).
-
-**Dragon telemetry** (`collect_dragon_telemetry: true`, dragon engine only) —
-Dragon runtime metrics collected via `DragonTelemetryCollector` and written to
-`dragon-telemetry/`.
-
-To plot GPU utilization and memory after a run:
-
-```bash
-# from the SPHERICAL root
-python src/plot/plot_nvml.py \
-    --telemetry-dir examples/sgdes/nvml-telemetry \
-    --output gpu_util.png
-```
-
-This reads `nvml_checkpoint_*.json` files and produces two subplots (compute
-utilization and memory usage per GPU) plus a per-GPU summary table.
-
-To plot Dragon runtime metrics:
-
-```bash
-python src/plot/plot_dragon.py \
-    --telemetry-dir examples/sgdes/dragon-telemetry \
-    --output dragon_util.png
-```
-
-See the [root README](../../README.md#metrics--visualization) for full plotting
-documentation.
+When `collect_telemetry: true` (dragon engine only), asyncflow runtime metrics are
+collected via `asyncflow.start_telemetry()` and written to `telemetry_dir/`
+(default `telemetry_output/`).
 
 ---
 
@@ -310,6 +262,11 @@ compiled against; forcing CPU avoids a version-mismatch error on import.
 Prevents TensorFlow (used by DES) from pre-allocating ~90% of GPU memory on
 first use, which would starve subsequent trill embed calls on the same GPU.
 
+**DES working directory**
+Single-node runs use `DES_TMPDIR` (default `/tmp`) for fast node-local I/O
+(~10 s `createdb` vs ~60 s on Lustre).  Multi-node runs fall back to a shared
+Lustre path so all Dragon workers can read intermediate files.
+
 ---
 
 ## 8. Dragon Scaling
@@ -323,21 +280,21 @@ All runs on Delta (NCSA) with identical config (`des_rounds=3`,
 
 ### 8a. 1 GPU per node (2026-04-05)
 
-| Nodes | GPUs/node | Mutations | Workflow | Wall   | Throughput (mut/min) |
-|------:|----------:|----------:|---------:|-------:|--------:|
-|     1 |         1 |         1 |    443 s |  ~8 m  |    0.14 |
-|     2 |         1 |         2 |    484 s |  ~9 m  |    0.25 |
-|     4 |         1 |         4 |    517 s |  ~9 m  |    0.46 |
+| Nodes | GPUs/node | Mutations | Wall   | Throughput (mut/min) |
+|------:|----------:|----------:|-------:|---------------------:|
+|     1 |         1 |         1 |  443 s |                 0.14 |
+|     2 |         1 |         2 |  484 s |                 0.25 |
+|     4 |         1 |         4 |  517 s |                 0.46 |
 
 Per-mutation speedup: 2 nodes → 1.8×; 4 nodes → 3.4× (91% / 85% efficiency).
 
 ### 8b. 4 GPUs per node (2026-04-07)
 
-| Nodes | GPUs/node | Mutations | Workflow       | Wall    | Throughput (mut/min) |
-|------:|----------:|----------:|---------------:|--------:|--------:|
-|     1 |         4 |         4 | 545 s (avg×2)  |   9:05  |    0.44 |
-|     2 |         4 |         8 |         710 s  |  12:47  |    0.68 |
-|     4 |         4 |        16 |         952 s  |  16:54  |    1.01 |
+| Nodes | GPUs/node | Mutations | Wall          | Throughput (mut/min) |
+|------:|----------:|----------:|--------------:|---------------------:|
+|     1 |         4 |         4 | 545 s (avg×2) |                 0.44 |
+|     2 |         4 |         8 |         710 s |                 0.68 |
+|     4 |         4 |        16 |         952 s |                 1.01 |
 
 Two 1n×4g runs on the same node (gpub053): 492 s and 597 s — ~20% run-to-run variance
 from shared-node load.  All other configs are single runs.
@@ -395,10 +352,10 @@ concurrent foldseek processes per node compete for CPUs even in warm rounds.
 **Practical guideline**
 
 Use `--nodes=1 --gpus-per-node=4` for quick iteration on ≤4 mutations — it
-gives comparable throughput to 4 separate single-GPU nodes (within ~20% run-to-run
-variance) while consuming far fewer resources.  Use `--nodes=N --gpus-per-node=4` to scale to 4N mutations with
-~50% parallel efficiency; the wall time grows sub-linearly (~2× wall for 4×
-mutations).
+gives comparable throughput to 4 separate single-GPU nodes (within ~20%
+run-to-run variance) while consuming far fewer node hours.  Use
+`--nodes=N --gpus-per-node=4` to scale to 4N mutations with ~50% parallel
+efficiency; wall time grows sub-linearly (~2× wall for 4× mutations).
 
 ### 8e. GPU utilization across all 4 nodes (4-node, 1-GPU-per-node run)
 

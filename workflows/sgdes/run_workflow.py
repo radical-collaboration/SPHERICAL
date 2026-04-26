@@ -46,78 +46,15 @@ import os
 import sys
 from pathlib import Path
 
-import yaml
 from radical.asyncflow import WorkflowEngine
 
 _SPHERICAL_ROOT = Path(os.environ.get("SPHERICAL_DIR", Path(__file__).resolve().parents[2]))
 if str(_SPHERICAL_ROOT) not in sys.path:
     sys.path.insert(0, str(_SPHERICAL_ROOT))
 
-# JAX_PLATFORMS=cpu is set in the sbatch to keep pre-Dragon setup CPU-only.
-# Clear it here before SGDESWorkflow is imported so that JAX initialises on GPU.
-# The DES solver (MutationPredictorSolver.propose / _update_params) runs in the
-# head process and is bottlenecked by JAX on CPU (~108 s/step) vs GPU (~5 s/step).
-# Dragon's function_task forks the head, but foldseek_search immediately calls
-# subprocess.run() so the exec() follows the fork instantly — safe in practice.
-os.environ.pop("JAX_PLATFORMS", None)
+from sgdes_workflow import SGDESWorkflow  # noqa: E402
 
-from sgdes_workflow_asyncflow import SGDESWorkflow
-
-_DEFAULT_CONFIG = Path(__file__).parent / "config.yaml"
-
-
-def load_config(path: str) -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
-
-
-def find_gpus():
-    """Return [(hostname, gpu_id), ...] for every GPU visible to Dragon.
-
-    Uses Dragon's native machine API to enumerate all nodes and their GPUs.
-    node.gpus may be None on CPU-only nodes (e.g. login nodes), so we guard
-    with `or []` to skip them safely.
-
-    Under `dragon -s` (single-node mode) node.hostname returns 'localhost',
-    which resolves to host_id=-1 and causes a ~54 s scheduling timeout per
-    task.  We substitute the real hostname in that case.
-    """
-    import socket
-    from dragon.native.machine import Node, System
-
-    real_hostname = socket.gethostname()
-    all_gpus = []
-    for huid in System().nodes:
-        node = Node(huid)
-        hostname = node.hostname if node.hostname != "localhost" else real_hostname
-        for gpu_id in node.gpus or []:
-            all_gpus.append((hostname, gpu_id))
-    return all_gpus
-
-
-def make_policies(all_gpus):
-    """Create one Policy per available GPU slot.
-
-    Each policy pins a worker to a specific node (HOST_NAME) and GPU
-    (gpu_affinity).  The list length equals len(all_gpus); run() enforces
-    a semaphore so at most len(policies) mutations run concurrently and no
-    two active mutations share the same node/GPU.
-
-    HOST_NAME must be the actual compute node hostname (e.g. 'gpub001').
-    Using 'localhost' resolves to host_id=-1 on single-node Dragon (-s)
-    and causes a ~54 s scheduling timeout — always pass the real hostname
-    returned by find_gpus().
-    """
-    from dragon.infrastructure.policy import Policy
-
-    return [
-        Policy(
-            placement=Policy.Placement.HOST_NAME,
-            host_name=hostname,
-            gpu_affinity=[gpu_id],
-        )
-        for hostname, gpu_id in all_gpus
-    ]
+from src.utils.workflow import find_gpus, load_config, make_policies  # noqa: E402
 
 
 async def main(config_file: str) -> None:
@@ -152,18 +89,9 @@ async def main(config_file: str) -> None:
         config["des_workdir_base"] = os.environ.get("DES_TMPDIR", "/tmp")
     else:
         config["des_workdir_base"] = None  # Lustre fallback in _run_des
-    print(f"Nodes: {nnodes}  DES workdir base: {config['des_workdir_base'] or 'Lustre (multi-node)'}")
-
-    # ── Dragon telemetry (dragon engine only) ─────────────────────────────────
-    dragon_collector = None
-    if backend == "dragon" and config.get("collect_dragon_telemetry", False):
-        from src.inference.utils import init_collector
-
-        dragon_telemetry_dir = config.get("dragon_telemetry_dir", "dragon-telemetry")
-        dragon_collector = init_collector(dragon_telemetry_dir)
-        if dragon_collector:
-            dragon_collector.start()
-            print(f"DragonTelemetryCollector started → {dragon_telemetry_dir}")
+    print(
+        f"Nodes: {nnodes}  DES workdir base: {config['des_workdir_base'] or 'Lustre (multi-node)'}"
+    )
 
     if backend == "dragon":
         import multiprocessing as mp
@@ -172,8 +100,7 @@ async def main(config_file: str) -> None:
         from rhapsody.backends import DragonExecutionBackendV3
 
         num_mutations = len(list(config["mutations"]))
-        total_gpus = int(config.get("total_gpus", 1))
-        policies = make_policies(find_gpus())
+        policies = make_policies(find_gpus(), nprocs=num_mutations)
 
         engine_dragon = await DragonExecutionBackendV3()
         asyncflow = await WorkflowEngine.create(engine_dragon)
@@ -181,11 +108,21 @@ async def main(config_file: str) -> None:
     else:  # concurrent
         from concurrent.futures import ProcessPoolExecutor
 
-        from radical.asyncflow import LocalExecutionBackend
+        from rhapsody.backends import ConcurrentExecutionBackend
 
-        engine_concurrent = LocalExecutionBackend(executor=ProcessPoolExecutor())
+        engine_concurrent = ConcurrentExecutionBackend(executor=ProcessPoolExecutor())
         asyncflow = await WorkflowEngine.create(engine_concurrent)
         policies = None
+
+    telemetry = None
+    if config.get("collect_telemetry", False):
+        telemetry_dir = config.get("telemetry_dir", "telemetry_output")
+        if hasattr(asyncflow, "start_telemetry"):
+            telemetry = await asyncflow.start_telemetry(
+                resource_poll_interval=0.5,
+                checkpoint_path=telemetry_dir,
+            )
+            print(f"Started Asyncflow telemetry → {telemetry_dir}")
 
     wf = SGDESWorkflow(config, asyncflow=asyncflow, policies=policies)
 
@@ -200,19 +137,20 @@ async def main(config_file: str) -> None:
     )
     try:
         await wf.run()
+        await wf.run()
         print("Done.")
     finally:
         await asyncflow.shutdown()
-        if dragon_collector:
-            dragon_collector.stop()
-            print("DragonTelemetryCollector stopped")
+        if telemetry:
+            await telemetry.stop()
+            print("Asyncflow telemetry stopped")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SGDES MAYV runner")
     parser.add_argument(
         "--config",
-        default=str(_DEFAULT_CONFIG),
+        default="config.yaml",
         help="Path to YAML config file (default: config.yaml next to this script)",
     )
     args = parser.parse_args()

@@ -1,116 +1,204 @@
-# Spherical
+# SPHERICAL
 
-Multi-GPU Inference Service Framework with Worker Pool Management.
+HPC workflow orchestration framework for multi-GPU protein inference and engineering campaigns.
 
 ## Features
 
-- **Multi-GPU Support**: Automatic load balancing across multiple GPUs
-- **Automatic Device Detection**: Detects CUDA GPUs if available, falls back to CPU
-- **Worker Pool Management**: Configurable workers per device
-- **Async Architecture**: Built on asyncio for high throughput
-- **HTTP Server/Client**: aiohttp-based server with health checks
-- **Dragon/Asyncflow Integration**: Optional HPC runtime support for distributed execution
-- **Metrics Collection**: Real-time throughput and device utilization tracking
-- **Extensible**: Base classes for adding new model types
+- **AsyncCampaignManager** — async-native orchestrator for concurrent multi-workflow campaigns with priority scheduling, resource pools, and dependency signalling
+- **Multi-GPU Inference** — worker pool per GPU with automatic load balancing; aiohttp HTTP server/client
+- **ESM2 Inference Workflow** — standalone or campaign-embedded ESM2-650M embedding service
+- **SGDES Workflow** — Structure-Guided Deep Evolution Solver for iterative protein sequence optimisation
+- **Dragon/Asyncflow Integration** — HPC runtime for distributed multi-node execution via DragonHPC
+- **Automatic Device Detection** — CUDA GPUs if available, CPU fallback
+- **YAML Config with Env-Var Expansion** — `${VAR}` references in config files are resolved at load time
+- **Telemetry & Visualization** — asyncflow native JSONL telemetry with workflow dashboard plots; campaign replica timeline and resource utilization charts from SLURM logs
+
+---
+
+## Repository Layout
+
+```
+spherical/
+├── src/
+│   ├── campaign/                    # AsyncCampaignManager + BaseWorkflow + ResourcePool
+│   │   └── campaign_manager.py
+│   ├── inference/                   # InferenceService base, orchestrator, server
+│   │   ├── esm2_service/            # ESM2InferenceService + ESM2Client
+│   │   ├── inference_client.py
+│   │   ├── orchestrator.py
+│   │   ├── server.py
+│   │   └── utils.py                 # load_config, ensure_dir, export_metrics
+│   └── utils/
+│       ├── logger.py                # structured Logger with colours
+│       └── workflow.py              # _expand_env, load_config, find_gpus, make_policies
+├── workflows/
+│   ├── plot_telemetry.sh            # Plot asyncflow JSONL telemetry → workflow dashboard PNG
+│   ├── esm2_inference/              # Standalone ESM2 inference runner
+│   │   ├── run_esm2_infern.py
+│   │   └── config.yaml
+│   ├── run_campaign/                # Multi-workflow campaign (DDSim + Inference)
+│   │   ├── run_campaing.py
+│   │   ├── inference_workflow.py
+│   │   ├── ddmd_workflow.py
+│   │   ├── plot_cm_timeline.py.py         # Gantt timeline + resource chart from SLURM log
+│   │   └── config.yaml
+│   └── sgdes/                       # SGDES protein engineering
+│       ├── run_workflow.py
+│       ├── sgdes_workflow.py
+│       └── config.yaml
+└── tests/
+    ├── test_campaign_manager.py
+    ├── test_inference_service.py
+    ├── test_client.py
+    ├── test_server.py
+    ├── test_sgdes_workflow.py
+    ├── test_logger.py
+    └── test_utils.py
+```
+
+---
 
 ## Installation
 
 ```bash
-# Basic installation
+# Core
 pip install -e .
 
-# With ESM2 model support
+# With ESM2 model support (torch + transformers)
 pip install -e ".[esm2]"
 
-# With Dragon/RADICAL support
+# With Dragon/RADICAL HPC support
 pip install -e ".[dragon]"
 
-# With development dependencies
-pip install -e ".[dev]"
-
-# Full installation
-pip install -e ".[esm2,dragon,dev,plotting]"
+# Full (includes dev and plotting extras)
+pip install -e ".[esm2,dragon,dev]"
 ```
+
+---
 
 ## Quick Start
 
-### Running the ESM2 Example
+### ESM2 Inference (standalone)
 
 ```bash
-# Start server mode (with HTTP endpoints)
-python example/esm2/run_esm2_inference.py --mode server --config_file example/esm2/config.yaml
+# Local mode — model runs in-process, no HTTP server
+python workflows/esm2_inference/run_esm2_infern.py \
+    --config_file workflows/esm2_inference/config.yaml \
+    --mode local
 
-# Run local inference (no server)
-python example/esm2/run_esm2_inference.py --mode local --config_file example/esm2/config.yaml
+# Server mode (default) — model hosted via HTTP; use dragon for multi-node
+dragon -m workflows/esm2_inference/run_esm2_infern.py \
+    --config_file workflows/esm2_inference/config.yaml
 ```
 
-### Configuration
-
-Edit `example/esm2/config.yaml` to configure:
+Key config options (`workflows/esm2_inference/config.yaml`):
 
 ```yaml
-# Model Settings
 model_path: "facebook/esm2_t33_650M_UR50D"
-
-# GPU Configuration
 num_services: 1
-num_gpus_per_service: 4
-num_workers_per_gpu: 2
-
-# Server Settings
+num_workers_per_gpu: 4
 server_port: 8000
-
-# Batch Settings
-num_batches: 200
-max_batch_tokens: 16000
-
-# Execution Settings
-debug: true
-engine: dragon      # Enable Dragon HPC runtime
+num_batches: 32
+max_batch_tokens: 20000
+mode: local           # "local" or "server"
+engine: concurrent    # "concurrent" or "dragon"
+service_python: "${VE_HOME}/esm2/bin/python"   # resolved at load time
 ```
 
-## Architecture
+### Multi-workflow Campaign
 
-```
-spherical/
-├── src/                       # Core library
-│   ├── inference_service.py   # Base inference service + GPU workers
-│   ├── server.py              # HTTP server endpoints
-│   ├── orchestrator.py        # Multi-node coordination
-│   ├── logger.py              # Logging utilities
-│   └── utils.py               # Helper functions
-├── example/
-│   └── esm2/                  # ESM2 example
-│       ├── client.py          # HTTP client with load balancing
-│       ├── esm2_service.py    # ESM2 service (re-export)
-│       ├── run_esm2_inference.py  # Entry point
-│       └── config.yaml        # Configuration
-├── tests/                     # Unit tests
-└── doc/                       # Documentation
+```bash
+python workflows/run_campaign/run_campaing.py --config workflows/run_campaign/config.yaml
 ```
 
-## Extending for New Models
+Config structure:
 
-Create a new service by extending `InferenceService`:
+```yaml
+resources:
+  total_cpus: 128
+  total_gpus: 4
+
+workflows:
+  ddsim:
+    replicas:      8
+    min_replicas:  2
+    max_replicas:  4
+    priority:      5
+    required_cpus: 20
+    dependencies:  []
+
+  inference:
+    replicas:      16
+    min_replicas:  1
+    max_replicas:  4
+    priority:      10
+    required_cpus: 32
+    required_gpus: 1
+    dependencies:  [ddsim]
+```
+
+### SGDES Protein Engineering
+
+```bash
+sbatch workflows/sgdes/delta_gpu_sbatch.sh
+```
+
+See [workflows/sgdes/README.md](workflows/sgdes/README.md) for full setup, configuration, and scaling results.
+
+---
+
+## Campaign Manager
+
+`AsyncCampaignManager` orchestrates heterogeneous workflow groups inside a single `asyncio` event loop.
+
+### Authoring a workflow
 
 ```python
-from src.inference_service import InferenceService
+from src.campaign import BaseWorkflow
+
+class MyWorkflow(BaseWorkflow):
+    workflow_id = "my_wf"
+
+    async def run(self, replica_id: str) -> None:
+        await do_work(self.asyncflow, self.config)
+        await self._signal_ready()          # unblock dependent groups immediately
+
+    async def on_replica_done(self, replica_id, cm, final_state):
+        if final_state == "done":
+            await cm.add_replicas("downstream", n=1)
+```
+
+### Runner pattern
+
+```python
+cm = AsyncCampaignManager.from_config(config, WORKFLOW_REGISTRY)
+await cm.start()
+await cm.wait()
+await cm.close()
+```
+
+See [src/campaign/README.md](src/campaign/README.md) for full API reference, scheduler details, and a live run trace.
+
+---
+
+## Extending for New Model Types
+
+Subclass `InferenceService` from `src.inference.inference_service`:
+
+```python
+from src.inference.inference_service import InferenceService
 
 class MyModelService(InferenceService):
     def _load_models(self):
-        """Load your model onto GPUs."""
         for device in self.devices:
             self.models[device] = load_model().to(device)
 
     def process_batch_sync(self, batch_id: int, device: str):
-        """Run inference on a batch."""
-        model = self.models[device]
-        # Process batch...
+        results = self.models[device](self.reply_store[batch_id])
         self.reply_store[batch_id] = results
         self.processed_queue.put_nowait(batch_id)
 
     async def generate_batch(self) -> tuple:
-        """Generate batches from input queue."""
         seq = await self.input_queue.get()
         if seq is None:
             raise StopAsyncIteration
@@ -118,59 +206,78 @@ class MyModelService(InferenceService):
         return len(batch), batch
 ```
 
-## Dragon/Asyncflow Support
+---
 
-For HPC environments, Spherical supports Dragon runtime with asyncflow:
+## Environment Variables in YAML Configs
+
+All config files support `${VAR}` and `$VAR` shell-style references.
+They are expanded by `_expand_env` (in `src/utils/workflow.py`) at load time,
+so paths like the following work without any Python-side substitution:
 
 ```yaml
-# Enable in config.yaml
-engine: dragon
-dragon_workers: 100
+outdir:         "${SPHERICAL_DIR}/workflows/sgdes/mayv_output"
+service_python: "${VE_HOME}/esm2/bin/python"
 ```
 
-Run with Dragon:
-```bash
-dragon -w ssh --network-config slurm.yaml run_esm2_infern.py
-```
+If a variable is not set at runtime the literal string is preserved, producing a clear `FileNotFoundError` rather than an obscure downstream crash.
 
-## Metrics & Visualization
+---
 
-Two plotting scripts live in `src/plot/`:
+## Visualization
 
-| Script | Input | Use case |
-|--------|-------|----------|
-| `src/plot/plot_dragon.py` | Dragon telemetry JSON (`checkpoint_metadata` + `metrics[]`) and/or inference `metrics_*.json` | ESM2 inference runs, Dragon campaign runs |
-| `src/plot/plot_nvml.py` | NVML telemetry JSON (`nvml_checkpoint_*.json`) | SGDES and any workflow using `NvmlMonitor` |
+### Asyncflow workflow telemetry dashboard
 
-### Dragon telemetry — standalone mode
-
-Plot GPU/CPU utilization from a single telemetry directory:
+`workflows/plot_telemetry.sh` plots the native JSONL telemetry produced by
+`asyncflow.start_telemetry()` (enabled via `collect_telemetry: true` in the
+workflow config).  It calls
+`radical.asyncflow/workflows/telemetry/plot_workflow_dashboard.py` and saves a
+PNG to `workflows/plots/<wf_name>/`.
 
 ```bash
-python src/plot/plot_dragon.py --telemetry-dir outputs/telemetry-results
+bash workflows/plot_telemetry.sh <telemetry.jsonl> [--out-dir DIR]
 ```
 
-### Dragon telemetry — multi-run mode
+The workflow name is inferred from the directory layout
+(`<wf_name>/telemetry-output/<file>.jsonl`); pass `--out-dir` to override.
+Output file: `workflow_dashboard_<YYYYMMDD_HHMMSS>.png`.
 
-Scan a parent directory for per-run output subdirectories, generate one plot
-per run and a throughput-vs-GPUs summary chart:
+**Example** (SGDES run):
+```bash
+bash workflows/plot_telemetry.sh \
+    workflows/sgdes/telemetry_output/out.jsonl \
+    --out-dir plots/sgdes
+```
+
+### Campaign Manager replica timeline
+
+`workflows/run_campaign/plot_cm_timeline.py.py` parses a SLURM output log and
+produces a Gantt chart of replica execution spans with a resource utilization
+panel (GPU/CPU in use over time) and a campaign config summary table.
 
 ```bash
-python src/plot/plot_dragon.py --output-dirs outputs --plots-dir plots
+python workflows/run_campaign/plot_cm_timeline.py.py slurm-<jobid>.out \
+    [--config workflows/run_campaign/config.yaml] \
+    [--out timeline.png]
 ```
 
-Each subdirectory may contain `metrics_*.json` (throughput timeseries) and/or
-a `telemetry-results/` subdirectory (GPU/CPU utilization).
+| Output element | Description |
+|----------------|-------------|
+| Gantt chart | One bar per replica, coloured by workflow group; red border = error; dependency arrows show signal-ready flow |
+| Resource panel | Step plot of GPU and CPU slots in use over elapsed time (from scheduler log lines) |
+| Config table | Replicas, priority, CPU/GPU requirements, min/max, and dependency graph per group |
 
-### NVML telemetry
+`config.yaml` is auto-detected when it sits next to the log file.  If found,
+group metadata is taken from the config (authoritative); otherwise it is parsed
+from the log lines.
 
-Plot GPU utilization and memory from NVML checkpoint files:
-
+**Example**:
 ```bash
-python src/plot/plot_nvml.py --telemetry-dir nvml-telemetry --output gpu_util.png
+python workflows/run_campaign/plot_cm_timeline.py.py \
+    workflows/run_campaign/slurm-17715157.out \
+    --out replica_timeline.png
 ```
 
-Prints a per-GPU summary table (mean/max utilization and memory) to stdout.
+---
 
 ## Development
 
@@ -184,10 +291,12 @@ pytest
 # Run tests with coverage
 pytest --cov=src --cov-report=html
 
-# Lint and format code
+# Lint and format
 ruff check .
 ruff format .
 ```
+
+---
 
 ## License
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 export BASE_DIR="${PROJECT}"
 export SPHERICAL_DIR="${BASE_DIR}/htp/SPHERICAL"
-export WORK_DIR="${SPHERICAL_DIR}/examples/run_campaign"
+export WORK_DIR="${SPHERICAL_DIR}/workflows/run_campaign"
 export CONDA_ENV="${BASE_DIR}/conda_env"
 
 #mkdir $CONDA_ENV

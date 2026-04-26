@@ -42,6 +42,6 @@ source activate base
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 conda activate $PROJECT/conda_env/test_inf
-cd $PROJECT/htp/SPHERICAL/examples/run_campaign
+cd $PROJECT/htp/SPHERICAL/workflows/run_campaign
 
 python run_esm2_infern.py

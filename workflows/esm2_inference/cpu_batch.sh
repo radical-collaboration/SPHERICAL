@@ -15,7 +15,7 @@ module load gcc
 module load anaconda3
 conda activate $PROJECT/conda_env/test_inf
 
-cd $PROJECT/htp/SPHERICAL/examples/esm2_inference
+cd $PROJECT/htp/SPHERICAL/workflows/esm2_inference
 
 #dragon-network-config --output-to-yaml 
 

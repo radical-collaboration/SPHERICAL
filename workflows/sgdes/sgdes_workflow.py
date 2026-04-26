@@ -26,7 +26,6 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import time
 import types
 import uuid
@@ -43,14 +42,14 @@ warnings.filterwarnings(
     category=RuntimeWarning,
 )
 
-import numpy as np
-import pandas as pd
-from Bio import SeqIO
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from Bio import SeqIO  # noqa: E402
 
-from src.utils.logger import Logger
+from src.utils.logger import Logger  # noqa: E402
 
 logger = Logger(name="sgdes", use_colors=True)
-from sklearn.metrics.pairwise import cosine_distances, euclidean_distances
+from sklearn.metrics.pairwise import cosine_distances, euclidean_distances  # noqa: E402
 
 # amortized_bo uses absolute imports (e.g. `from amortized_bo import data`),
 # so its parent directory must be on sys.path.
@@ -59,11 +58,11 @@ _ABO_PARENT = os.path.join(_SGDES_DIR, "trill/utils/abo") if _SGDES_DIR else ""
 if _ABO_PARENT and _ABO_PARENT not in sys.path:
     sys.path.insert(0, _ABO_PARENT)
 
-from trill.utils.abo.amortized_bo import data, domains
-from trill.utils.abo.amortized_bo.deep_evolution_solver import MutationPredictorSolver
-from trill.utils.fasta_files import remove_invalid_seqs_aa, truncate_seqs
-from trill.utils.foldseek_utils import run_foldseek_databases
-from trill.utils.sgdes import (
+from trill.utils.abo.amortized_bo import data, domains  # noqa: E402
+from trill.utils.abo.amortized_bo.deep_evolution_solver import MutationPredictorSolver  # noqa: E402
+from trill.utils.fasta_files import remove_invalid_seqs_aa, truncate_seqs  # noqa: E402
+from trill.utils.foldseek_utils import run_foldseek_databases  # noqa: E402
+from trill.utils.sgdes import (  # noqa: E402
     compute_average_rank_without_df,
     highest_avg_score_by_query,
     save_round_records,
@@ -204,7 +203,7 @@ class SGDESWorkflow:
         """
         flow = self.asyncflow
 
-        _TD_GPU = (
+        _TD_GPU = (  # noqa: N806
             {
                 "process_template": {
                     "policy": policy,
@@ -220,10 +219,10 @@ class SGDESWorkflow:
                 placement=policy.placement,
                 host_name=policy.host_name,
             )
-            _TD_HOST = {"process_template": {"policy": _host_policy}}
+            _TD_HOST = {"process_template": {"policy": _host_policy}}  # noqa: N806
         else:
             _host_policy = None
-            _TD_HOST = {}
+            _TD_HOST = {}  # noqa: N806
 
         # ── trill embed ────────────────────────────────────────────────────────
         @flow.executable_task
@@ -232,12 +231,12 @@ class SGDESWorkflow:
             kwargs: name, GPUs, seed, outdir, query
             """
             name = kwargs["name"]
-            GPUs = kwargs["GPUs"]
+            gpus = kwargs["GPUs"]
             seed = kwargs["seed"]
             outdir = kwargs["outdir"]
             query = kwargs["query"]
             cmd = (
-                f"trill {name} {GPUs} --RNG_seed {seed} --outdir {outdir} "
+                f"trill {name} {gpus} --RNG_seed {seed} --outdir {outdir} "
                 f"embed esm2_t33_650M {query} --avg"
             )
             print(f"[embed] cmd: {cmd}", flush=True)
@@ -250,13 +249,13 @@ class SGDESWorkflow:
             kwargs: name, GPUs, seed, outdir, query, batch_size
             """
             name = kwargs["name"]
-            GPUs = kwargs["GPUs"]
+            gpus = kwargs["GPUs"]
             seed = kwargs["seed"]
             outdir = kwargs["outdir"]
             query = kwargs["query"]
             batch_size = kwargs["batch_size"]
             cmd = (
-                f"trill {name} {GPUs} --RNG_seed {seed} --outdir {outdir} "
+                f"trill {name} {gpus} --RNG_seed {seed} --outdir {outdir} "
                 f"fold ESMFold {query} --batch_size {batch_size}"
             )
             print(f"[fold] cmd: {cmd}", flush=True)
@@ -446,7 +445,7 @@ class SGDESWorkflow:
             headers = [f"cand_{tag}_{i}" for i in range(len(structures))]
             seqs = ["".join(_id2aa[int(x)] for x in row) for row in arr]
             with open(cand_fa, "w") as _f:
-                for h, s in zip(headers, seqs):
+                for h, s in zip(headers, seqs, strict=False):
                     _f.write(f">{h}\n{s}\n")
 
             # Multi-node: workdir is on Lustre → cand_fa, out_tsv, cand_db all
@@ -493,7 +492,7 @@ class SGDESWorkflow:
                 )
                 avg = _parse_foldseek_avg(out_tsv, fast_mode=False)
 
-            score_map = dict(zip(avg["query"].values, avg["avg_score"].values))
+            score_map = dict(zip(avg["query"].values, avg["avg_score"].values, strict=False))
             rewards_np = np.array([score_map.get(h, 0.0) for h in headers], dtype=np.float32)
 
             try:
@@ -514,7 +513,7 @@ class SGDESWorkflow:
             batch_index = population.current_batch_index + 1
             scored = [
                 sample.copy(reward=float(r), batch_index=batch_index, new_key=False)
-                for sample, r in zip(samples, rewards_np)
+                for sample, r in zip(samples, rewards_np, strict=False)
             ]
             population.add_samples(scored)
 
@@ -559,14 +558,14 @@ class SGDESWorkflow:
 
         name = f"{mutation}_run"
         query = os.path.join(self.query_dir, f"mayv_{mutation}.fasta")
-        GPUs = "1"
+        gpus_count = "1"
 
         args = types.SimpleNamespace(
             name=name,
             outdir=abspath,
             query=query,
             wt_query=self.wt_query,
-            GPUs=GPUs,
+            GPUs=gpus_count,
             RNG_seed=self.rng_seed,
             fast_folding=self.fast_folding,
             fold_batch_size=self.fold_batch_size,
@@ -630,7 +629,7 @@ class SGDESWorkflow:
                 t0 = time.time()
                 await tasks.embed(
                     name=f"{name}_foldtune_input",
-                    GPUs=GPUs,
+                    GPUs=gpus_count,
                     seed=args.RNG_seed,
                     outdir=abspath,
                     query=query,
@@ -642,7 +641,7 @@ class SGDESWorkflow:
                     t0 = time.time()
                     await tasks.fold(
                         name=f"{name}_foldtune_input",
-                        GPUs=GPUs,
+                        GPUs=gpus_count,
                         seed=args.RNG_seed,
                         outdir=f"{abspath}/{name}_foldtune_input_structs",
                         query=query,
@@ -679,12 +678,13 @@ class SGDESWorkflow:
                 fast_folding=args.fast_folding,
                 prostt5_weights_path=prostt5_weights_path if args.fast_folding else None,
                 fold_batch_size=args.fold_batch_size,
-                gpus=GPUs,
+                gpus=gpus_count,
                 rng_seed=args.RNG_seed,
                 num_mutations=args.num_mutations,
                 des_rounds=args.des_rounds,
                 des_batch_size=args.des_batch_size,
                 des_num_sequences=args.des_num_sequences,
+                workdir_base=abspath,
             )
 
             logger.info(f"[{mutation}] DES done ({time.time() - t0:.1f}s) → {des_fasta}")
@@ -713,7 +713,7 @@ class SGDESWorkflow:
             cleaned = os.path.join(
                 abspath, f"cleaned_truncated_{name}_foldtune_generated_sequences_round{i}.fasta"
             )
-            n_cleaned = sum(1 for l in open(cleaned) if l.startswith(">"))
+            n_cleaned = sum(1 for line in open(cleaned) if line.startswith(">"))
             logger.info(f"[{mutation}] Merged/cleaned → {n_cleaned} seqs  ({cleaned})")
 
             # ── Embed generated sequences ──────────────────────────────────────
@@ -721,7 +721,7 @@ class SGDESWorkflow:
             t0 = time.time()
             await tasks.embed(
                 name=f"{name}_round{i}",
-                GPUs=GPUs,
+                GPUs=gpus_count,
                 seed=args.RNG_seed,
                 outdir=abspath,
                 query=cleaned,
@@ -745,7 +745,7 @@ class SGDESWorkflow:
                 t0 = time.time()
                 await tasks.fold(
                     name=f"{name}_round{i}",
-                    GPUs=GPUs,
+                    GPUs=gpus_count,
                     seed=args.RNG_seed,
                     outdir=f"{abspath}/{name}_foldtune_generated_structs_round{i}",
                     query=cleaned,
@@ -824,10 +824,17 @@ class SGDESWorkflow:
             # re-enable if seqkit_grep is switched back to writing stdout directly
             # rather than returning it as a string.
             # _grep_td = (
-            #     {"process_template": {"policy": tasks.host_policy, "stdout": output_fasta}}
+            #     {
+            #         "capture_stdio": True,
+            #         "process_template": {"policy": tasks.host_policy, "stdout": output_fasta},
+            #     }
             #     if tasks.host_policy is not None
-            #     else {"process_template": {"stdout": output_fasta}}
+            #     else {
+            #         "capture_stdio": True,
+            #         "process_template": {"stdout": output_fasta},
+            #     }
             # )
+
             res = await tasks.seqkit_grep(
                 # task_description=_grep_td,
                 pattern_file=labels_file,
@@ -863,7 +870,7 @@ class SGDESWorkflow:
                 logger.info(f"[{mutation}] Folding selected sequences for eval (ESMFold)")
                 await tasks.fold(
                     name=f"{name}_round{i}",
-                    GPUs=GPUs,
+                    GPUs=gpus_count,
                     seed=args.RNG_seed,
                     outdir=os.path.join(abspath, f"{eval_prefix}_structs"),
                     query=output_fasta,
@@ -968,6 +975,14 @@ class SGDESWorkflow:
 
             logger.error(f"[{mutation}] FAILED: {e}\n{traceback.format_exc()}")
             raise
+
+    # async def run(self) -> None:
+    #     """Run all mutations in parallel; asyncflow schedules task concurrency."""
+    #     tasks = [self._run_one(mutation, idx) for idx, mutation in enumerate(self.mutations)]
+    #     results = await asyncio.gather(*tasks, return_exceptions=True)
+    #     failed = [self.mutations[i] for i, r in enumerate(results) if isinstance(r, Exception)]
+    #     if failed:
+    #         logger.error(f"Failed mutations: {failed}")
 
     async def run(self) -> None:
         """Run mutations with concurrency capped at the number of GPU slots.

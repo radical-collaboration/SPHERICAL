@@ -12,25 +12,57 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from radical.asyncflow import WorkflowEngine
+
 from src.inference.esm2_service import ESM2Client, ESM2InferenceService
-from src.utils.logger import Logger
 from src.inference.orchestrator import init_clients, start_services, start_services_local
 from src.inference.utils import load_config
+from src.utils.logger import Logger
 
 logger = Logger(use_colors=True)
 
 
+async def init_asyncflow(config: dict):
+    engine_name = config.get("engine", "concurrent").lower()
+    if "dragon" in engine_name:
+        from rhapsody.backends import DragonExecutionBackendV3
+
+        engine = await DragonExecutionBackendV3()
+        logger.info("Asyncflow enabled with DragonExecutionBackendV3")
+    elif "dask" in engine_name:
+        from rhapsody.backends import DaskExecutionBackend
+
+        engine = await DaskExecutionBackend
+        logger.info("Asyncflow enabled with DaskExecutionBackend")
+    else:
+        from rhapsody.backends import ConcurrentExecutionBackend
+
+        engine = await ConcurrentExecutionBackend()
+        logger.info("Asyncflow enabled with ConcurrentExecutionBackend")
+    return await WorkflowEngine.create(engine)
+
+
 async def main(config_file: str, mode: str):
     config = load_config(config_file)
+
+    asyncflow = await init_asyncflow(config)
+
+    telemetry = None
+    if config.get("collect_telemetry", False):
+        telemetry_dir = config.get("telemetry_dir", "telemetry_output")
+        if hasattr(asyncflow, "start_telemetry"):
+            telemetry = await asyncflow.start_telemetry(
+                resource_poll_interval=0.5,
+                checkpoint_path=telemetry_dir,
+            )
+            print(f"Started Asyncflow telemetry → {telemetry_dir}")
 
     if mode == "server":
         services = await start_services(config, ESM2InferenceService)
     else:
         services = await start_services_local(config, ESM2InferenceService)
 
-    clients, collector = await init_clients(config, services, ESM2Client)
-    if collector:
-        collector.start()
+    clients = await init_clients(config, services, ESM2Client, asyncflow)
 
     try:
         if clients is None:
@@ -43,7 +75,7 @@ async def main(config_file: str, mode: str):
     except Exception as e:
         logger.error(f"An error occurred while running inference: {e}")
     finally:
-        # Close clients first (shuts down asyncflow)
+        # Close clients first
         for client in clients:
             if hasattr(client, "close"):
                 await client.close()
@@ -53,8 +85,11 @@ async def main(config_file: str, mode: str):
             if hasattr(service, "close"):
                 await service.close()
 
-        if collector:
-            collector.stop()
+        await asyncflow.shutdown()
+
+        if telemetry:
+            await telemetry.stop()
+            print("Asyncflow telemetry stopped")
 
     print("All work has been completed...")
 

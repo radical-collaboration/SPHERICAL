@@ -11,18 +11,20 @@ from src.inference.inference_service import GPUWorker, InferenceService
 class ConcreteInferenceService(InferenceService):
     """Concrete implementation for testing abstract base class."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.process_calls: list = []
+
     def _load_models(self):
-        """Mock model loading."""
         self.models = {device: MagicMock() for device in self.devices}
 
     def process_batch_sync(self, batch_id: int, device: str, batch_data=None):
-        """Mock batch processing."""
+        self.process_calls.append((batch_id, device))
         self.logger.metrics["total_tokens"] += 100
         self.reply_store[batch_id] = [f"result_{batch_id}"]
         self.processed_queue.put_nowait(batch_id)
 
     async def generate_batch(self) -> tuple:
-        """Mock batch generation."""
         seq = await self.input_queue.get()
         if seq is None:
             await self.input_queue.put(None)
@@ -30,16 +32,31 @@ class ConcreteInferenceService(InferenceService):
         return 100, {"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1]}
 
 
+class ErrorInferenceService(InferenceService):
+    """Concrete service whose process_batch_sync always raises."""
+
+    def _load_models(self):
+        self.models = {}
+
+    def process_batch_sync(self, batch_id: int, device: str, batch_data=None):
+        raise ValueError("simulated processing error")
+
+    async def generate_batch(self) -> tuple:
+        seq = await self.input_queue.get()
+        if seq is None:
+            await self.input_queue.put(None)
+            raise StopAsyncIteration
+        return 10, {}
+
+
 class TestInferenceService:
     """Tests for InferenceService base class."""
 
     def test_init_requires_devices(self, sample_config):
-        """Test that service requires devices."""
         with pytest.raises(ValueError, match="No devices provided"):
             ConcreteInferenceService(config=sample_config, devices=[])
 
     def test_init_with_devices(self, sample_config, temp_dir):
-        """Test service initialization with devices."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
@@ -53,7 +70,6 @@ class TestInferenceService:
         assert service.max_batch_tokens == sample_config["max_batch_tokens"]
 
     def test_init_metrics(self, sample_config, temp_dir):
-        """Test metrics initialization."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
@@ -65,7 +81,6 @@ class TestInferenceService:
         assert "cuda:0" in service.logger.metrics["gpu_stats"]
 
     def test_init_queues(self, sample_config, temp_dir):
-        """Test queue initialization."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
@@ -77,7 +92,6 @@ class TestInferenceService:
         assert service.processed_queue is not None
 
     def test_init_pending_requests(self, sample_config, temp_dir):
-        """Test pending requests initialization."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
@@ -87,7 +101,6 @@ class TestInferenceService:
         assert service._request_counter == 0
 
     def test_configuration_from_config(self, sample_config, temp_dir):
-        """Test that configuration is read from config dict."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
         sample_config["num_workers_per_gpu"] = 4
@@ -104,7 +117,6 @@ class TestInferenceServiceAsync:
 
     @pytest.mark.asyncio
     async def test_start_workers(self, sample_config, temp_dir):
-        """Test starting workers."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
         sample_config["num_workers_per_gpu"] = 1
@@ -114,7 +126,7 @@ class TestInferenceServiceAsync:
         await service.start_workers()
 
         assert len(service.workers) == 1
-        assert len(service.worker_tasks) >= 1  # Workers + metrics task
+        assert len(service.worker_tasks) >= 1
 
         # Cleanup
         service.shutting_down.set()
@@ -123,7 +135,6 @@ class TestInferenceServiceAsync:
 
     @pytest.mark.asyncio
     async def test_submit_batch_returns_future(self, sample_config, temp_dir):
-        """Test submitting a batch returns a Future."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
@@ -131,22 +142,16 @@ class TestInferenceServiceAsync:
 
         future = service.submit_batch(batch_id=1)
 
-        # Check it returns a Future
         assert isinstance(future, asyncio.Future)
 
-        # Check batch was added to work queue
         item = await service.work_queue.get()
         batch_id, request_id, batch_data = item
         assert batch_id == 1
-        assert request_id == 1  # First request
-
-        # Check pending request was stored
-        # Note: we already popped from work queue, but counter was incremented
+        assert request_id == 1
         assert service._request_counter == 1
 
     @pytest.mark.asyncio
     async def test_submit_batch_increments_counter(self, sample_config, temp_dir):
-        """Test that submit_batch increments request counter."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
@@ -160,54 +165,57 @@ class TestInferenceServiceAsync:
 
     @pytest.mark.asyncio
     async def test_resolve_request(self, sample_config, temp_dir):
-        """Test resolving a pending request."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
         service = ConcreteInferenceService(config=sample_config, devices=["cuda:0"], rank=0)
 
         future = service.submit_batch(batch_id=1)
-
-        # Resolve the request
         service._resolve_request(1, {"status": "success"})
 
-        # Future should now be done
         assert future.done()
-        result = future.result()
-        assert result == {"status": "success"}
+        assert future.result() == {"status": "success"}
 
     @pytest.mark.asyncio
-    async def test_sequence_source(self, sample_config, temp_dir):
-        """Test sequence source generator."""
+    async def test_sequence_source_yields_from_config(self, sample_config, temp_dir):
+        """sequence_source yields sequences from config['SEQUENCES'] in order."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
-
         service = ConcreteInferenceService(config=sample_config, devices=["cuda:0"], rank=0)
 
-        sequences = []
-        count = 0
+        collected = []
+        n = len(sample_config["SEQUENCES"])
         async for seq in service.sequence_source():
-            sequences.append(seq)
-            count += 1
-            if count >= 3:
+            collected.append(seq)
+            if len(collected) >= n:
                 service.shutdown_init.set()
                 break
 
-        assert len(sequences) == 3
+        assert collected[:n] == sample_config["SEQUENCES"]
+
+    @pytest.mark.asyncio
+    async def test_sequence_source_empty_yields_nothing(self, sample_config, temp_dir):
+        """sequence_source produces nothing when SEQUENCES is empty."""
+        sample_config["output_dir"] = str(temp_dir / "outputs")
+        sample_config["metrics_dir"] = str(temp_dir / "metrics")
+        sample_config["SEQUENCES"] = []
+        service = ConcreteInferenceService(config=sample_config, devices=["cuda:0"], rank=0)
+
+        collected = []
+        async for seq in service.sequence_source():
+            collected.append(seq)
+
+        assert collected == []
 
     @pytest.mark.asyncio
     async def test_close_alias(self, sample_config, temp_dir):
-        """Test that close is an alias for shutdown."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
         service = ConcreteInferenceService(config=sample_config, devices=["cuda:0"], rank=0)
 
-        # Mock shutdown to verify close calls it
         service.shutdown = AsyncMock()
-
         await service.close()
-
         service.shutdown.assert_called_once()
 
 
@@ -215,7 +223,6 @@ class TestGPUWorker:
     """Tests for GPUWorker class."""
 
     def test_init(self, sample_config, temp_dir):
-        """Test GPUWorker initialization."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
 
@@ -231,75 +238,85 @@ class TestGPUWorker:
 
     @pytest.mark.asyncio
     async def test_worker_processes_batch(self, sample_config, temp_dir):
-        """Test worker processes batches from queue."""
+        """Worker calls process_batch_sync, increments counters, resolves future."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
         sample_config["debug"] = False
 
         service = ConcreteInferenceService(config=sample_config, devices=["cuda:0"], rank=0)
-
         worker = GPUWorker(device="cuda:0", worker_id=0, service=service)
 
-        # Put a batch with request_id and shutdown signal
-        await service.work_queue.put((1, 42, None))  # batch_id=1, request_id=42, batch_data=None
+        await service.work_queue.put((1, 42, None))
         await service.work_queue.put(None)
 
-        # Create a future for the request
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         service.pending_requests[42] = future
 
-        # Run worker
         await worker.run()
 
-        # Check processing occurred
         assert worker.processed_count == 1
         assert service.logger.metrics["requests"] == 1
         assert service.logger.metrics["gpu_stats"]["cuda:0"]["processed"] == 1
-
-        # Check future was resolved
         assert future.done()
         assert future.result() == {"status": "success"}
+        # Verify process_batch_sync was actually called with correct args
+        assert (1, "cuda:0") in service.process_calls
+
+    @pytest.mark.asyncio
+    async def test_worker_exception_resolves_future_with_error(self, sample_config, temp_dir):
+        """process_batch_sync exception resolves future with error status."""
+        sample_config["output_dir"] = str(temp_dir / "outputs")
+        sample_config["metrics_dir"] = str(temp_dir / "metrics")
+        sample_config["debug"] = False
+
+        service = ErrorInferenceService(config=sample_config, devices=["cuda:0"], rank=0)
+        worker = GPUWorker(device="cuda:0", worker_id=0, service=service)
+
+        await service.work_queue.put((1, 99, None))
+        await service.work_queue.put(None)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        service.pending_requests[99] = future
+
+        await worker.run()
+
+        assert future.done()
+        result = future.result()
+        assert result["status"] == "error"
+        assert "simulated processing error" in result["error"]
+        assert service.logger.metrics["errors"] == 1
 
     @pytest.mark.asyncio
     async def test_worker_handles_local_mode(self, sample_config, temp_dir):
-        """Test worker handles None request_id (local mode)."""
+        """Worker handles None request_id (local mode) without resolving a future."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
         sample_config["debug"] = False
 
         service = ConcreteInferenceService(config=sample_config, devices=["cuda:0"], rank=0)
-
         worker = GPUWorker(device="cuda:0", worker_id=0, service=service)
 
-        # Put a batch with None request_id (local mode)
-        await service.work_queue.put(
-            (1, None, None)
-        )  # batch_id=1, request_id=None, batch_data=None
+        await service.work_queue.put((1, None, None))
         await service.work_queue.put(None)
 
-        # Run worker
         await worker.run()
 
-        # Check processing occurred
         assert worker.processed_count == 1
         assert service.logger.metrics["requests"] == 1
 
     @pytest.mark.asyncio
     async def test_worker_handles_shutdown(self, sample_config, temp_dir):
-        """Test worker handles shutdown signal."""
         sample_config["output_dir"] = str(temp_dir / "outputs")
         sample_config["metrics_dir"] = str(temp_dir / "metrics")
         sample_config["debug"] = True
 
         service = ConcreteInferenceService(config=sample_config, devices=["cuda:0"], rank=0)
-
         worker = GPUWorker(device="cuda:0", worker_id=0, service=service)
 
-        # Put only shutdown signal
         await service.work_queue.put(None)
 
-        # Run worker - should exit cleanly
         await worker.run()
 
         assert worker.processed_count == 0

@@ -22,16 +22,16 @@ import sys
 from pathlib import Path
 
 # Add project root to sys.path BEFORE any src imports.
-# This file lives in SPHERICAL/src/, so project root is one level up.
-_project_root = str(Path(__file__).resolve().parent.parent)
+# This file lives in SPHERICAL/src/inference/, so project root is three levels up.
+_project_root = str(Path(__file__).resolve().parent.parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-import argparse
-import ctypes
-import importlib
-import json
-import signal
+import argparse  # noqa: E402
+import ctypes  # noqa: E402
+import importlib  # noqa: E402
+import json  # noqa: E402
+import signal  # noqa: E402
 
 
 def _set_pdeathsig():
@@ -42,9 +42,9 @@ def _set_pdeathsig():
     SIGTERM so we can shut down gracefully instead of becoming an orphan.
     """
     try:
-        PR_SET_PDEATHSIG = 1
+        pr_set_pdeathsig = 1
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        libc.prctl(pr_set_pdeathsig, signal.SIGTERM)
     except OSError:
         pass  # Not on Linux or libc unavailable; skip
 

@@ -4,22 +4,29 @@
 
 # ── Cluster Resources ─────────────────────────────────────────────────────────
 resources:
-  total_cpus: 40   # CPU cores on the allocated node(s)
-  total_gpus: 8     # GPUs on the allocated node(s)
+  total_cpus: 64   # CPU cores on the allocated node(s)
+  total_gpus: 4     # GPUs on the allocated node(s)
 
 # ── Engine ────────────────────────────────────────────────────────────────────
-engine:      concurrent       # concurrent | dragon 
-num_workers: 64   # Dragon backend worker pool size (DragonExecutionBackendV3)
-debug:       false  # set true to enable rhapsody DEBUG logging
+engine:      dragon       # concurrent | dragon 
+debug:       false         # set true to enable rhapsody DEBUG logging
 
 # ── Telemetry ─────────────────────────────────────────────────────────────────
 telemetry:
-  collect_telemetry: false
-  telemetry_dir: "data/telemetry-results"
+  collect_telemetry: true
+  telemetry_dir: "telemetry-results"
+
+# ── Workflow Registry ────────────────────────────────────────────────────────
+# Maps config workflow names to "module.ClassName" strings.
+# Modules are resolved relative to the run_campaign directory.
+workflow_registry:
+  dummy:     dummy_workflow.DDSimWorkflow
+  md:        ddmd_workflow.DDMdWrapperWorkflow
+  miniapps:  miniapps_workflow.MiniAppsWrapperWorkflow
+  inference: inference_workflow.InferenceWorkflow
 
 # ── Workflow Groups ───────────────────────────────────────────────────────────
-# Each key must match a name in the workflow registry passed to
-# CampaignManager.from_config().
+# Each key must match a name in the workflow_registry above.
 #
 #   replicas          : total replicas to run
 #   min_replicas      : guaranteed concurrent slots
@@ -37,17 +44,17 @@ workflows:
   # ── DDSim (simulation + training loop) ─────────────────────────────────────
   dummy:
     priority:             5
-    replicas:             32
+    replicas:             8
     min_replicas:         2
     max_replicas:         4
     required_cpus:        4
     required_gpus:        0
-    dependencies:         [miniapps]
-    config_file:          ${DUMMY_DIR}/config.yaml
+    dependencies:         [inference]
+    config_file:          "${DUMMY_DIR}/config.yaml"
 
   # ── ESM2 Inference ──────────────────────────────────────────────────────────
   inference:
-    priority:             10
+    priority:             6
     replicas:             8
     min_replicas:         1
     max_replicas:         4
@@ -55,26 +62,26 @@ workflows:
     required_gpus:        1
     dependencies:         []
     dependency_threshold: 1
-    config_file:          ${INF_DIR}/config.yaml
+    config_file:          "${INF_DIR}/config.yaml"
 
   # ── MiniApps Workflow ────────────────────────────────────────────────────────
   miniapps:
-    priority:      5
+    priority:      8
     replicas:      4
     min_replicas:  1
     max_replicas:  2
     required_cpus: 4
     required_gpus: 1
     dependencies:  [md]
-    config_file:   ${MINAPPS_DIR}/config.yaml
+    config_file:   "${MINAPPS_DIR}/config.yaml"
 
   # ── DDMd Workflow (real MD simulations) ──────────────────────────────────────
   md:
-    priority:      5
+    priority:      10
     replicas:      4
-    min_replicas:  1
-    max_replicas:  2
+    min_replicas:  2
+    max_replicas:  4
     required_cpus: 4
     required_gpus: 1
     dependencies:  []
-    config_file:   ${MD_DIR}/config.yaml
+    config_file:   "${MD_HOME}/config.yaml"

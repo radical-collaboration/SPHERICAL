@@ -5,26 +5,30 @@ MiniAppsWorkflow — wraps MiniAppsWorkflow from DeepDriveSim.
 import importlib.util
 import os
 import sys
+import traceback
 from functools import lru_cache
 from pathlib import Path
 
-# Make DeepDriveSim importable
-_DDSIM_ROOT = Path("/ocean/projects/dmr170002p/goliyad/DeepDriveSim")
+# Make DeepDriveSim importable — honour $DDSIM_DIR set by the sbatch script.
+_ddsim_dir = os.environ.get("DDSIM_DIR")
+if not _ddsim_dir:
+    raise OSError("DDSIM_DIR is not set. Export it before launching the campaign.")
+_DDSIM_ROOT = Path(_ddsim_dir)
 if str(_DDSIM_ROOT) not in sys.path:
     sys.path.insert(0, str(_DDSIM_ROOT))
 
-from src.campaign import BaseWorkflow
+from src.campaign import BaseWorkflow  # noqa: E402
 
 
 @lru_cache(maxsize=1)
 def _get_workflow_class():
     spec = importlib.util.spec_from_file_location(
-        "miniapps_workflow_asyncflow",
-        _DDSIM_ROOT / "workflows/miniapps_workflow/miniapps_workflow_asyncflow.py",
+        "miniapps_workflow",
+        _DDSIM_ROOT / "workflows/miniapps_workflow/miniapps_workflow.py",
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.MiniAppsWorkflowAsyncflow
+    return mod.MiniAppsWorkflow
 
 
 # Pre-load at module import time to warm the cache before Dragon workers start.
@@ -47,22 +51,30 @@ class MiniAppsWrapperWorkflow(BaseWorkflow):
             gpu_id = str(self.config["assigned_gpu_ids"][0])
             os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
-        WorkflowClass = _get_workflow_class()
+        workflow_class = _get_workflow_class()
         asyncflow = self.asyncflow
         cfg = self.config or {}
-        base_home = Path(cfg.get("home_dir", Path.home() / "MiniApps")).expanduser()
-        replica_home = base_home / replica_id
 
         if not cfg.get("src_dir"):
             cfg = {**cfg, "src_dir": str(_DDSIM_ROOT / "workflows/miniapps_workflow")}
 
-        workflow = WorkflowClass(
-            config=cfg,
-            asyncflow=asyncflow,
-            home_dir=replica_home,
-            name=replica_id,
-            on_ready=self._on_ready,
-            policies=self.policies,
-        )
+        name = replica_id.replace("_", "")
+        home_base = Path(cfg.get("home_dir", Path.home() / "MiniApps")).expanduser()
+
+        try:
+            workflow = workflow_class(
+                config=cfg,
+                asyncflow=asyncflow,
+                home_dir=str(home_base),
+                name=name,
+                on_ready=self._on_ready,
+                policies=self.policies,
+            )
+        except Exception:
+            print(
+                f"[{replica_id}] MiniAppsWorkflow.__init__ raised:\n" + traceback.format_exc(),
+                flush=True,
+            )
+            raise
 
         await workflow.start()

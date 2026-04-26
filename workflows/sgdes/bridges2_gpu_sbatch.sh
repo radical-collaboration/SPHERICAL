@@ -28,7 +28,7 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export SGDES_DIR=$PROJECT/sgdes/SGDES
 export SPHERICAL_DIR=$PROJECT/htp/SPHERICAL
 
-cd $SPHERICAL_DIR/examples/sgdes
+cd $SPHERICAL_DIR/workflows/sgdes
 rm -rf nvml-telemetry
 rm -rf mayv_output
 rm -rf tmp*

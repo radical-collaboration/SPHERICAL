@@ -2,7 +2,7 @@
 Tests for the SGDES workflow — examples/sgdes.
 
 All tests run without Dragon, GPU, or the TRILL/amortized_bo packages.
-Heavy imports in sgdes_workflow_asyncflow are guarded by mocking; the pure
+Heavy imports in sgdes_workflow are guarded by mocking; the pure
 utility functions (_fasta_to_int_array, _fasta_to_numeric, etc.) and the
 run_workflow helpers (load_config, make_policies) are tested directly.
 """
@@ -10,7 +10,7 @@ run_workflow helpers (load_config, make_policies) are tested directly.
 import sys
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -19,7 +19,7 @@ import pytest
 # Path setup — make examples/sgdes importable without Dragon or TRILL
 # ---------------------------------------------------------------------------
 _ROOT = Path(__file__).resolve().parents[1]
-_SGDES_EXAMPLE = _ROOT / "examples" / "sgdes"
+_SGDES_EXAMPLE = _ROOT / "workflows" / "sgdes"
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 if str(_SGDES_EXAMPLE) not in sys.path:
@@ -65,11 +65,69 @@ for _mod in [
     "tensorflow.compat",
     "tensorflow.compat.v1",
     "jax",
+    "pandas",
+    "sklearn",
+    "sklearn.metrics",
+    "sklearn.metrics.pairwise",
 ]:
     if _mod not in sys.modules:
         _make_stub(_mod)
 
-# Give trill stubs just enough for imports in sgdes_workflow_asyncflow
+# pandas stub — minimal DataFrame surface used by _parse_foldseek_avg
+_pd = sys.modules["pandas"]
+_pd.DataFrame = MagicMock
+_pd.read_csv = MagicMock(return_value=MagicMock())
+
+# sklearn stub — cosine_distances / euclidean_distances imported at module level
+_sk_pairwise = sys.modules["sklearn.metrics.pairwise"]
+_sk_pairwise.cosine_distances = MagicMock()
+_sk_pairwise.euclidean_distances = MagicMock()
+
+# Bio / Bio.SeqIO stub — SeqIO.parse is called by _fasta_to_numeric, so provide
+# a real FASTA parser rather than a MagicMock that silently returns nothing.
+if "Bio" not in sys.modules:
+    _make_stub("Bio")
+if "Bio.SeqIO" not in sys.modules:
+    _make_stub("Bio.SeqIO")
+
+
+class _FastaRecord:
+    """Minimal SeqRecord stand-in."""
+
+    def __init__(self, seq: str) -> None:
+        self.seq = seq  # _fasta_to_numeric does str(rec.seq)
+
+
+def _seqio_parse(path: str, fmt: str):
+    """Read a FASTA file and yield _FastaRecord objects."""
+    records = []
+    with open(path) as _fh:
+        cur: list = []
+        for _line in _fh:
+            _line = _line.strip()
+            if not _line:
+                continue
+            if _line.startswith(">"):
+                if cur:
+                    records.append(_FastaRecord("".join(cur)))
+                cur = []
+            else:
+                cur.append(_line)
+        if cur:
+            records.append(_FastaRecord("".join(cur)))
+    return records
+
+
+sys.modules["Bio.SeqIO"].parse = _seqio_parse
+sys.modules["Bio"].SeqIO = sys.modules["Bio.SeqIO"]
+
+# Wire submodule attributes so "from parent import child" works on stubs.
+sys.modules["trill.utils.abo.amortized_bo"].data = sys.modules["trill.utils.abo.amortized_bo.data"]
+sys.modules["trill.utils.abo.amortized_bo"].domains = sys.modules[
+    "trill.utils.abo.amortized_bo.domains"
+]
+
+# Give trill stubs just enough for imports in sgdes_workflow
 sys.modules["trill.utils.fasta_files"].remove_invalid_seqs_aa = MagicMock()
 sys.modules["trill.utils.fasta_files"].truncate_seqs = MagicMock()
 sys.modules["trill.utils.foldseek_utils"].run_foldseek_databases = MagicMock()
@@ -96,12 +154,11 @@ for _mod in ["src.utils.nvml_monitor"]:
 sys.modules["src.utils.nvml_monitor"].NvmlMonitor = MagicMock()
 
 # Now safe to import
-from sgdes_workflow_asyncflow import (  # noqa: E402
+from sgdes_workflow import (  # noqa: E402
     _fasta_to_int_array,
     _fasta_to_numeric,
     _int_array_to_fasta,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -167,6 +224,18 @@ class TestFastaToIntArray:
         expected = [AA.index(c) for c in "ACDEF"]
         assert list(arr[0]) == expected
 
+    def test_nonexistent_file_raises(self, tmp_path):
+        """Missing file raises an OS-level error."""
+        with pytest.raises((FileNotFoundError, OSError)):
+            _fasta_to_int_array(str(tmp_path / "missing.fasta"), length=5)
+
+    def test_empty_fasta_returns_empty(self, tmp_path):
+        """File with no sequences returns zero-length array."""
+        fa = tmp_path / "empty.fasta"
+        fa.write_text("")
+        arr = _fasta_to_int_array(str(fa), length=5)
+        assert len(arr) == 0
+
 
 # ---------------------------------------------------------------------------
 # _int_array_to_fasta
@@ -181,6 +250,19 @@ class TestIntArrayToFasta:
         arr2 = _fasta_to_int_array(out, length=5)
         np.testing.assert_array_equal(arr, arr2)
 
+    def test_roundtrip_file_contents(self, tmp_path):
+        """Written FASTA contains correct headers and amino-acid sequences."""
+        arr = np.array([[0, 1, 2], [3, 4, 5]])  # ACD / EFG
+        out = str(tmp_path / "verify.fasta")
+        _int_array_to_fasta(arr, out, prefix="seq")
+        content = Path(out).read_text()
+        assert ">seq_0\n" in content
+        assert ">seq_1\n" in content
+        expected_seq0 = "".join(AA[i] for i in [0, 1, 2])
+        expected_seq1 = "".join(AA[i] for i in [3, 4, 5])
+        assert expected_seq0 in content
+        assert expected_seq1 in content
+
     def test_header_format(self, tmp_path):
         arr = np.array([[0, 1, 2]])  # A, C, D
         out = str(tmp_path / "out.fasta")
@@ -193,7 +275,7 @@ class TestIntArrayToFasta:
         arr = np.array([[0, 1, 2], [3, 4, 5]])
         out = str(tmp_path / "out.fasta")
         _int_array_to_fasta(arr, out, prefix="p")
-        lines = [l for l in Path(out).read_text().splitlines() if l.startswith(">")]
+        lines = [ln for ln in Path(out).read_text().splitlines() if ln.startswith(">")]
         assert len(lines) == 2
         assert lines[0] == ">p_0"
         assert lines[1] == ">p_1"
@@ -233,6 +315,13 @@ class TestFastaToNumeric:
         arr = _fasta_to_numeric(str(fa), max_length=4)
         assert arr.shape == (1, 4)
         assert list(arr[0]) == [AA.index(c) for c in "ACDE"]
+
+    def test_empty_fasta_raises(self, tmp_path):
+        """_fasta_to_numeric with no sequences raises because max() over empty is undefined."""
+        fa = tmp_path / "empty.fasta"
+        fa.write_text("")
+        with pytest.raises((ValueError, Exception)):
+            _fasta_to_numeric(str(fa))
 
 
 # ---------------------------------------------------------------------------
@@ -287,15 +376,15 @@ class TestMakePolicies:
     def test_round_robin_assignment(self):
         # make_policies uses a local `from dragon.infrastructure.policy import Policy`
         # which is unavailable in CI; test the round-robin logic directly.
-        FakePolicy = self._mock_policy_class()
+        policy_cls = self._mock_policy_class()  # noqa: N806
         gpus = [("node1", 0), ("node2", 0)]
         policies = []
         i = 0
         for _ in range(4):
             hostname, gpu_id = gpus[i]
             policies.append(
-                FakePolicy(
-                    placement=FakePolicy.Placement.HOST_NAME,
+                policy_cls(
+                    placement=policy_cls.Placement.HOST_NAME,
                     host_name=hostname,
                     gpu_affinity=[gpu_id],
                 )
@@ -309,24 +398,24 @@ class TestMakePolicies:
         assert policies[3].host_name == "node2"
 
     def test_nprocs_determines_length(self):
-        FakePolicy = self._mock_policy_class()
+        policy_cls = self._mock_policy_class()  # noqa: N806
         gpus = [("node1", 0), ("node1", 1)]
         policies = []
         i = 0
         for _ in range(7):
             hostname, gpu_id = gpus[i]
-            policies.append(FakePolicy(host_name=hostname, gpu_affinity=[gpu_id]))
+            policies.append(policy_cls(host_name=hostname, gpu_affinity=[gpu_id]))
             i = (i + 1) % len(gpus)
         assert len(policies) == 7
 
     def test_gpu_affinity_preserved(self):
-        FakePolicy = self._mock_policy_class()
+        policy_cls = self._mock_policy_class()  # noqa: N806
         gpus = [("node1", 2), ("node2", 3)]
         policies = []
         i = 0
         for _ in range(2):
             hostname, gpu_id = gpus[i]
-            policies.append(FakePolicy(host_name=hostname, gpu_affinity=[gpu_id]))
+            policies.append(policy_cls(host_name=hostname, gpu_affinity=[gpu_id]))
             i = (i + 1) % len(gpus)
         assert policies[0].gpu_affinity == [2]
         assert policies[1].gpu_affinity == [3]
@@ -334,14 +423,14 @@ class TestMakePolicies:
     def test_host_only_policy_has_no_gpu_affinity(self):
         # _register_tasks builds a host-only policy for run_des / foldseek_search.
         # Verify that stripping gpu_affinity from a full GPU policy works correctly.
-        FakePolicy = self._mock_policy_class()
-        full_policy = FakePolicy(
-            placement=FakePolicy.Placement.HOST_NAME,
+        policy_cls = self._mock_policy_class()  # noqa: N806
+        full_policy = policy_cls(
+            placement=policy_cls.Placement.HOST_NAME,
             host_name="gpub023",
             gpu_affinity=[1],
         )
-        host_policy = FakePolicy(
-            placement=FakePolicy.Placement.HOST_NAME,
+        host_policy = policy_cls(
+            placement=policy_cls.Placement.HOST_NAME,
             host_name=full_policy.host_name,
         )
         assert host_policy.host_name == "gpub023"
@@ -376,34 +465,34 @@ class TestSGDESWorkflowInit:
         }
 
     def test_init_sets_mutations(self, base_config):
-        from sgdes_workflow_asyncflow import SGDESWorkflow
+        from sgdes_workflow import SGDESWorkflow
 
         mock_flow = MagicMock()
         wf = SGDESWorkflow(base_config, asyncflow=mock_flow)
         assert wf.mutations == ["T365F", "Y155T"]
 
     def test_init_sets_total_gpus(self, base_config):
-        from sgdes_workflow_asyncflow import SGDESWorkflow
+        from sgdes_workflow import SGDESWorkflow
 
         mock_flow = MagicMock()
         wf = SGDESWorkflow(base_config, asyncflow=mock_flow)
         assert wf.total_gpus == 1
 
     def test_init_sets_foldtune_rounds(self, base_config):
-        from sgdes_workflow_asyncflow import SGDESWorkflow
+        from sgdes_workflow import SGDESWorkflow
 
         mock_flow = MagicMock()
         wf = SGDESWorkflow(base_config, asyncflow=mock_flow)
         assert wf.foldtune_rounds == 2
 
     def test_init_requires_asyncflow(self, base_config):
-        from sgdes_workflow_asyncflow import SGDESWorkflow
+        from sgdes_workflow import SGDESWorkflow
 
         with pytest.raises(ValueError, match="asyncflow"):
             SGDESWorkflow(base_config, asyncflow=None)
 
     def test_outdir_created(self, base_config):
-        from sgdes_workflow_asyncflow import SGDESWorkflow
+        from sgdes_workflow import SGDESWorkflow
 
         mock_flow = MagicMock()
         SGDESWorkflow(base_config, asyncflow=mock_flow)

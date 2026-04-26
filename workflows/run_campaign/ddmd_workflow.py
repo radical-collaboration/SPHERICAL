@@ -3,6 +3,9 @@ DDMdWrapperWorkflow — wraps the real DDMdWorkflow from DeepDriveSim.
 """
 
 import importlib.util
+
+# Make DeepDriveSim importable — honour $DDSIM_DIR set by the sbatch script.
+import os
 import sys
 import tempfile
 import traceback
@@ -11,13 +14,14 @@ from pathlib import Path
 
 import yaml
 
-
-# Make DeepDriveSim importable
-_DDSIM_ROOT = Path("/ocean/projects/dmr170002p/goliyad/DeepDriveSim")
+_ddsim_dir = os.environ.get("DDSIM_DIR")
+if not _ddsim_dir:
+    raise OSError("DDSIM_DIR is not set. Export it before launching the campaign.")
+_DDSIM_ROOT = Path(_ddsim_dir)
 if str(_DDSIM_ROOT) not in sys.path:
     sys.path.insert(0, str(_DDSIM_ROOT))
 
-from src.campaign import BaseWorkflow
+from src.campaign import BaseWorkflow  # noqa: E402
 
 
 @lru_cache(maxsize=1)
@@ -44,7 +48,7 @@ class DDMdWrapperWorkflow(BaseWorkflow):
     workflow_id = "ddmd"
 
     async def run(self, replica_id: str) -> None:
-        WorkflowClass = _get_workflow_class()  # returns instantly from lru_cache
+        workflow_class = _get_workflow_class()  # returns instantly from lru_cache
 
         asyncflow = self.asyncflow
         cfg = self.config or {}
@@ -52,12 +56,14 @@ class DDMdWrapperWorkflow(BaseWorkflow):
         if not ddsim_config:
             raise ValueError(f"[{replica_id}] 'ddsim_config' missing from workflow config.")
 
-        replica_config_path = self._make_replica_config(ddsim_config, replica_id)
+        experiment_dir = cfg.get("experiment_dir", "")
+        replica_config_path = self._make_replica_config(ddsim_config, replica_id, experiment_dir)
+        name = replica_id.replace("_", "")
         try:
-            workflow = WorkflowClass(
+            workflow = workflow_class(
                 asyncflow=asyncflow,
                 config=replica_config_path,
-                name=replica_id,
+                name=name,
                 on_ready=self._on_ready,
                 policies=self.policies,
                 engine_dragon=self.engine_dragon,
@@ -75,15 +81,17 @@ class DDMdWrapperWorkflow(BaseWorkflow):
             Path(replica_config_path).unlink(missing_ok=True)
 
     @staticmethod
-    def _make_replica_config(base_config_path: str, replica_id: str) -> str:
+    def _make_replica_config(
+        base_config_path: str, replica_id: str, experiment_dir: str = ""
+    ) -> str:
         with open(base_config_path) as f:
             cfg = yaml.safe_load(f)
 
-        base_exp_dir = Path(cfg["experiment_directory"])
-        cfg["experiment_directory"] = str(base_exp_dir.parent / f"{base_exp_dir.name}_{replica_id}")
-
         if cfg.get("node_local_path"):
             cfg["node_local_path"] = str(Path(cfg["node_local_path"]) / replica_id)
+
+        if experiment_dir:
+            cfg["experiment_directory"] = str(Path(experiment_dir).expanduser().resolve())
 
         tmp = tempfile.NamedTemporaryFile(
             mode="w",

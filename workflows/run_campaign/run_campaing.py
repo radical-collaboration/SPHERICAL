@@ -34,19 +34,18 @@ Config file structure
 If no config file is provided, hard-coded defaults are used for local testing.
 """
 
-import argparse
-import asyncio
-import sys
-from pathlib import Path
-from typing import Optional
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import sys  # noqa: E402
+from pathlib import Path  # noqa: E402
 
-import yaml
+import yaml  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.campaign import AsyncCampaignManager
-from src.inference.utils import load_config, init_collector
-from src.utils.nvml_monitor import NvmlMonitor
+from src.campaign import AsyncCampaignManager as CampaignManager  # noqa: E402
+from src.inference.utils import load_config  # noqa: E402
+from src.utils.workflow import _expand_env  # noqa: E402
 
 
 def _expand_workflow_configs(config: dict, config_dir: Path) -> dict:
@@ -60,9 +59,11 @@ def _expand_workflow_configs(config: dict, config_dir: Path) -> dict:
         cfg_file = wf_cfg.pop("config_file", None)
         if not cfg_file:
             continue
-        cfg_path = config_dir / cfg_file
+        cfg_path = Path(os.path.expandvars(cfg_file))
+        if not cfg_path.is_absolute():
+            cfg_path = config_dir / cfg_path
         with open(cfg_path) as f:
-            wf_specific = yaml.safe_load(f) or {}
+            wf_specific = _expand_env(yaml.safe_load(f) or {})
         # Scheduling params in config.yaml win; workflow file fills the rest.
         wf_specific.update(wf_cfg)
         wf_cfg.clear()
@@ -70,76 +71,71 @@ def _expand_workflow_configs(config: dict, config_dir: Path) -> dict:
     return config
 
 
-from ddsim_workflow import DDSimWorkflow
-from ddmd_workflow import DDMdWrapperWorkflow
-from inference_workflow import InferenceWorkflow
-from miniapps_workflow import MiniAppsWrapperWorkflow
+def _build_registry(config: dict) -> dict:
+    """Dynamically import workflow classes from the 'workflow_registry' config section."""
+    import importlib
 
-# Maps config workflow names → workflow classes
-WORKFLOW_REGISTRY = {
-    "dummy": DDSimWorkflow,
-    "md": DDMdWrapperWorkflow,
-    "miniapps": MiniAppsWrapperWorkflow,
-    "inference": InferenceWorkflow,
-}
-
-_DEFAULT_CONFIG_FILE = Path(__file__).parent / "config.yaml"
-
-DEFAULT_CONFIG = {
-    "workflows": {
-        "ddsim": {
-            "replicas": 2,
-            "dependencies": [],
-            "engine": "concurrent",
-            "home_dir": str(Path.home() / "DDSim"),
-            "num_inputs": 5,
-            "max_sim_batch": 4,
-            "training_cores": 1,
-            "training_threshold": 0.5,
-            "prediction_threshold": 0.5,
-            "start_training_threshold": 1,
-            "training_epochs": 1,
-            "free_resources_for_train": True,
-            "sleep_time": 30,
-            "ddsim_config": str(
-                Path("/ocean/projects/dmr170002p/goliyad/DeepDriveSim")
-                / "workflows/ddmd_workflow/data/new_lassen-keras-dbscan.yaml"
-            ),
-        },
-        "inference": {"replicas": 1, "dependencies": ["ddsim"], "dependency_threshold": 1},
-    },
-}
+    registry = {}
+    for name, cls_path in config.get("workflow_registry", {}).items():
+        module_name, cls_name = cls_path.rsplit(".", 1)
+        module = importlib.import_module(module_name)
+        registry[name] = getattr(module, cls_name)
+    return registry
 
 
-async def main(config_file: Optional[str]) -> None:
-    if config_file is None and _DEFAULT_CONFIG_FILE.exists():
-        config_file = str(_DEFAULT_CONFIG_FILE)
-    config = load_config(config_file) if config_file else DEFAULT_CONFIG
-    config_dir = Path(config_file).parent if config_file else Path(__file__).parent
+async def main(config_file: str) -> None:
+    config_path = Path(config_file)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_file}")
+    config = load_config(config_file)
+    config_dir = config_path.parent
     _expand_workflow_configs(config, config_dir)
 
-    # ── Telemetry collector (Dragon only; no-op when Dragon not active) ────
+    engine_type = config.get("engine", "dragon")
+
+    # ── Build backend and asyncflow (mirrors workflow run_workflow.py pattern) ─
+    engine_dragon = None
+    asyncflow = None
+
+    if engine_type == "dragon":
+        try:
+            from radical.asyncflow import WorkflowEngine
+            from rhapsody.backends import DragonExecutionBackendV3
+
+            engine_dragon = await DragonExecutionBackendV3()
+            asyncflow = await WorkflowEngine.create(engine_dragon)
+            print("Dragon backend started")
+        except ImportError:
+            engine_type = "concurrent"
+
+    else:
+        from radical.asyncflow import WorkflowEngine
+        from rhapsody.backends import ConcurrentExecutionBackend
+
+        backend = await ConcurrentExecutionBackend()
+        asyncflow = await WorkflowEngine.create(backend)
+        print("ConcurrentExecutionBackend started")
+
+    # ── Telemetry ─────────────────────────────────────────────────────────────
     tel_cfg = config.get("telemetry", {})
-    collector = None
+    telemetry = None
     if tel_cfg.get("collect_telemetry", False):
-        telemetry_dir = tel_cfg.get("telemetry_dir", "data/telemetry")
-        collector = init_collector(telemetry_dir)
-        if collector:
-            collector.start()
-            print(f"DragonTelemetryCollector started → {telemetry_dir}")
+        telemetry_dir = tel_cfg.get("telemetry_dir", "data/telemetry-results")
+        if hasattr(asyncflow, "start_telemetry"):
+            telemetry = await asyncflow.start_telemetry(
+                resource_poll_interval=0.5,
+                checkpoint_path=telemetry_dir,
+            )
+            print(f"Started Asyncflow telemetry → {telemetry_dir}")
 
-    # ── NVML monitor (runs in main process; provides ground-truth GPU util) ─
-    nvml_dir = tel_cfg.get("nvml_telemetry_dir", "data/nvml-telemetry")
-    nvml_rate = float(tel_cfg.get("nvml_collection_rate", 1.0))
-    nvml_checkpoint = float(tel_cfg.get("nvml_checkpoint_interval", 30.0))
-    nvml_monitor = NvmlMonitor(
-        output_dir=nvml_dir,
-        collection_rate=nvml_rate,
-        checkpoint_interval=nvml_checkpoint,
+    # ── Campaign ──────────────────────────────────────────────────────────────
+    registry = _build_registry(config)
+    cm = CampaignManager.from_config(
+        config,
+        registry,
+        asyncflow=asyncflow,
+        engine_dragon=engine_dragon,
     )
-    nvml_monitor.start()
-
-    cm = AsyncCampaignManager.from_config(config, WORKFLOW_REGISTRY)
 
     groups = config.get("workflows", {})
     print(
@@ -154,10 +150,13 @@ async def main(config_file: Optional[str]) -> None:
         await cm.start()  # launch groups with no unmet dependencies
         await cm.wait()  # block until all groups (including dependents) finish
     finally:
-        if collector:
-            collector.stop()
-            print("DragonTelemetryCollector stopped")
-        nvml_monitor.stop()
+        await cm.close()
+
+        if telemetry:
+            await telemetry.stop()
+            print("Asyncflow telemetry stopped")
+
+        await asyncflow.shutdown()
 
     # ── Summary ────────────────────────────────────────────────────────────
     print("\n── Campaign complete ──")
@@ -176,15 +175,13 @@ async def main(config_file: Optional[str]) -> None:
             f"replicas_finished={s.replicas_finished}"
         )
 
-    await cm.close()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SPHERICAL campaign runner")
     parser.add_argument(
         "--config",
-        default=None,
-        help="Path to YAML config file (defaults to config.yaml next to this script)",
+        default="config.yaml",
+        help="Path to YAML config file (default: config.yaml)",
     )
 
     args = parser.parse_args()

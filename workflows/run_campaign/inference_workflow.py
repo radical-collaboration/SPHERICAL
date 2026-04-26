@@ -18,7 +18,7 @@ Lifecycle
 
 import asyncio
 from pathlib import Path
-from typing import ClassVar, List, Optional
+from typing import ClassVar, Optional
 
 from src.campaign import BaseWorkflow
 from src.utils.logger import Logger
@@ -31,8 +31,8 @@ class InferenceWorkflow(BaseWorkflow):
     # Shared state — lives across all replicas in the campaign            #
     # ------------------------------------------------------------------ #
 
-    _svc_handles: ClassVar[Optional[List]] = None  # one handle per service
-    _svc_locks: ClassVar[Optional[List[asyncio.Lock]]] = None  # one lock per service
+    _svc_handles: ClassVar[Optional[list]] = None  # one handle per service
+    _svc_locks: ClassVar[Optional[list[asyncio.Lock]]] = None  # one lock per service
     _asyncflow: ClassVar = None  # shared WorkflowEngine
     _init_lock: ClassVar[Optional[asyncio.Lock]] = None  # one-time init guard
     _num_services: ClassVar[int] = 0
@@ -71,8 +71,16 @@ class InferenceWorkflow(BaseWorkflow):
     # ------------------------------------------------------------------ #
 
     async def _run_real_inference(self, replica_id: str, cfg: dict) -> None:
-        from src.inference.esm2_service.esm2_service import ESM2InferenceService
+        # Probe transformers before spawning any server: if it's missing this
+        # raises immediately and _ensure_initialized (which launches Dragon
+        # server processes) is never reached, preventing port-conflict cascades.
+        import os as _os
+
+        _os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        import transformers  # noqa: F401
+
         from src.inference.esm2_service.esm2_client import ESM2Client
+        from src.inference.esm2_service.esm2_service import ESM2InferenceService
         from src.inference.utils import export_metrics
 
         await self._ensure_initialized(cfg, ESM2InferenceService, asyncflow=self.asyncflow)
@@ -85,7 +93,15 @@ class InferenceWorkflow(BaseWorkflow):
         svc = handle.service
 
         async with lock:
-            # Wait for previous replica's _result_writer on this service to finish.
+            # Wait for all in-flight executor threads to finish first.  Worker
+            # task_done on work_queue is called only after run_in_executor returns
+            # (thread fully done), so this guarantees all processed_queue puts have
+            # happened before we drain processed_queue.  Without this ordering,
+            # processed_queue.join() can return while a slow thread is still mid-
+            # flight and will later put a stale batch_id that the next replica's
+            # _result_writer sees without a matching reply_store entry.
+            await svc.work_queue.join()
+            # Now drain the result writer — all puts are guaranteed to be in flight.
             await svc.processed_queue.join()
             # Reset per-run queue state so init_queue can repopulate.
             self._reset_service_queues(svc)
@@ -228,6 +244,7 @@ class InferenceWorkflow(BaseWorkflow):
 
         for h in cls._svc_handles:
             svc = h.service
+            await svc.work_queue.join()
             await svc.processed_queue.join()
             await svc.shutdown()
         cls._svc_handles = None

@@ -22,9 +22,7 @@ def ssh_and_kill(host):
     ssh_cmd = f"ssh -o BatchMode=yes -o StrictHostKeyChecking=no {host} '{COMMAND_TO_RUN}'"
     print(f"[INFO] Killing on {host}...")
     try:
-        result = subprocess.run(
-            ssh_cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        result = subprocess.run(ssh_cmd, shell=True, check=True, capture_output=True)
         print(f"[SUCCESS] {host}: {result.stdout.decode().strip()}")
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] {host}: {e.stderr.decode().strip()}")

@@ -104,23 +104,25 @@ echo "── Step 2: Bootstrapping pip ──"
 "${PY}" -m pip install -q --upgrade pip wheel
 "${PIP}" install -q --force-reinstall "setuptools<71" sympy
 
-# ── 3. Core ML stack: PyTorch 2.3.0+cu121, TensorFlow, JAX ──────────────────
+# ── 3. Core ML stack: PyTorch 2.4.0+cu121, TensorFlow, JAX ──────────────────
+# transformers >= 4.44 requires PyTorch >= 2.4; use 2.4.0 to match bridges2
+# and keep PyG wheel URLs consistent.
 echo ""
-echo "── Step 3: PyTorch 2.3.0+cu121 ──"
+echo "── Step 3: PyTorch 2.4.0+cu121 ──"
 "${PIP}" install -q \
-    torch==2.3.0+cu121 \
-    torchvision==0.18.0+cu121 \
-    torchaudio==2.3.0+cu121 \
+    torch==2.4.0+cu121 \
+    torchvision==0.19.0+cu121 \
+    torchaudio==2.4.0+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 
 echo ""
-echo "── Step 3b: PyTorch Geometric (cu121, torch 2.3.0) ──"
+echo "── Step 3b: PyTorch Geometric (cu121, torch 2.4.0) ──"
 "${PIP}" install -q \
-    "https://data.pyg.org/whl/torch-2.3.0%2Bcu121/pyg_lib-0.4.0%2Bpt23cu121-cp311-cp311-linux_x86_64.whl" \
-    "https://data.pyg.org/whl/torch-2.3.0%2Bcu121/torch_scatter-2.1.2%2Bpt23cu121-cp311-cp311-linux_x86_64.whl" \
-    "https://data.pyg.org/whl/torch-2.3.0%2Bcu121/torch_sparse-0.6.18%2Bpt23cu121-cp311-cp311-linux_x86_64.whl" \
-    "https://data.pyg.org/whl/torch-2.3.0%2Bcu121/torch_cluster-1.6.3%2Bpt23cu121-cp311-cp311-linux_x86_64.whl" \
-    "https://data.pyg.org/whl/torch-2.3.0%2Bcu121/torch_spline_conv-1.2.2%2Bpt23cu121-cp311-cp311-linux_x86_64.whl" \
+    "https://data.pyg.org/whl/torch-2.4.0%2Bcu121/pyg_lib-0.4.0%2Bpt24cu121-cp311-cp311-linux_x86_64.whl" \
+    "https://data.pyg.org/whl/torch-2.4.0%2Bcu121/torch_scatter-2.1.2%2Bpt24cu121-cp311-cp311-linux_x86_64.whl" \
+    "https://data.pyg.org/whl/torch-2.4.0%2Bcu121/torch_sparse-0.6.18%2Bpt24cu121-cp311-cp311-linux_x86_64.whl" \
+    "https://data.pyg.org/whl/torch-2.4.0%2Bcu121/torch_cluster-1.6.3%2Bpt24cu121-cp311-cp311-linux_x86_64.whl" \
+    "https://data.pyg.org/whl/torch-2.4.0%2Bcu121/torch_spline_conv-1.2.2%2Bpt24cu121-cp311-cp311-linux_x86_64.whl" \
     torch-geometric
 
 echo ""
@@ -145,9 +147,9 @@ echo "── Step 4: Dragon HPC + Rhapsody + Radical ──"
 
 # Re-pin torch + numpy after steps 3b/4 which may upgrade them via transitive deps.
 "${PIP}" install -q --force-reinstall \
-    torch==2.3.0+cu121 \
-    torchvision==0.18.0+cu121 \
-    torchaudio==2.3.0+cu121 \
+    torch==2.4.0+cu121 \
+    torchvision==0.19.0+cu121 \
+    torchaudio==2.4.0+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 "${PIP}" install -q --force-reinstall "numpy>=1.26.3,<1.27" "ml-dtypes==0.3.2"
 
@@ -213,7 +215,8 @@ echo "── Step 5: Bio/ML packages ──"
     "tornado>=6.1" \
     "poetry-core"
 
-# vit-pytorch 1.19.1 declares torch>=2.4 but works fine with 2.3; install without deps.
+# vit-pytorch 1.19.1 requires torch>=2.4 (now satisfied); install without deps to
+# avoid pulling in a newer torch that would override the cu121 pin.
 "${PIP}" install -q --no-deps "vit-pytorch==1.19.1"
 # calm 0.1.1 from GitHub (PyPI only has 0.1.3+; this commit has no tornado/iso8601 conflicts).
 "${PIP}" install -q "git+https://github.com/martinez-zacharya/CaLM.git@2b3a9b8985b0940ed8277e4d11d21e530b6aaf34"
@@ -230,9 +233,9 @@ echo "amortized_bo.pth written"
 
 # Re-pin torch after TRILL which upgrades it to latest.
 "${PIP}" install -q --force-reinstall \
-    torch==2.3.0+cu121 \
-    torchvision==0.18.0+cu121 \
-    torchaudio==2.3.0+cu121 \
+    torch==2.4.0+cu121 \
+    torchvision==0.19.0+cu121 \
+    torchaudio==2.4.0+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 
 # ── 7. SPHERICAL (editable) ────────────────────────────────────────────────────
@@ -248,9 +251,9 @@ echo "── Step 8: Re-pinning critical versions ──"
 
 # Re-pin PyTorch (must use cu121 index to get the correct CUDA variant).
 "${PIP}" install -q --force-reinstall \
-    torch==2.3.0+cu121 \
-    torchvision==0.18.0+cu121 \
-    torchaudio==2.3.0+cu121 \
+    torch==2.4.0+cu121 \
+    torchvision==0.19.0+cu121 \
+    torchaudio==2.4.0+cu121 \
     --index-url https://download.pytorch.org/whl/cu121
 
 # Re-pin NumPy and other TF/sklearn/numba-constrained packages.
@@ -309,7 +312,12 @@ else
     echo "seqkit already installed, skipping"
 fi
 
-# ── 11. Verify ────────────────────────────────────────────────────────────────
+# ── 11. Apply slurm patch  ────────────────────────────────────────────────────────────────
+echo ""
+echo "── Verifying installation ──"
+"${PY}" ${SPHERICAL_DIR}/workflows/apply_slurm_patch.py
+
+# ── 12. Verify ────────────────────────────────────────────────────────────────
 echo ""
 echo "── Verifying installation ──"
 _check() {

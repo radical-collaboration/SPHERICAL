@@ -78,6 +78,19 @@ class HookWorkflow(BaseWorkflow):
         HookWorkflow.calls.append((replica_id, final_state))
 
 
+class FailingHookWorkflow(BaseWorkflow):
+    """Raises during run; records (replica_id, final_state) in on_replica_done."""
+
+    workflow_id = "failing_hook"
+    calls: list = []
+
+    async def run(self, replica_id: str) -> None:
+        raise RuntimeError("deliberate failure")
+
+    async def on_replica_done(self, replica_id, cm, final_state):
+        FailingHookWorkflow.calls.append((replica_id, final_state))
+
+
 # Sync variants for CampaignManager (thread-pool) tests
 
 
@@ -110,6 +123,7 @@ def reset_class_state():
     """Clear class-level recording lists before every test."""
     RecordingWorkflow.ran = []
     HookWorkflow.calls = []
+    FailingHookWorkflow.calls = []
     SyncRecordingWorkflow.ran = []
     SyncHookWorkflow.calls = []
     yield
@@ -159,6 +173,26 @@ class TestBaseWorkflow:
         wf = BaseWorkflow()
         with pytest.raises(NotImplementedError):
             wf.run("r0")
+
+    def test_resolve_entry_point_both_raises(self):
+        class BothWorkflow(BaseWorkflow):
+            workflow_id = "both"
+
+            def run(self, replica_id):
+                pass
+
+            def start(self, replica_id):
+                pass
+
+        with pytest.raises(ValueError, match="both 'run' and 'start'"):
+            AsyncCampaignManager._resolve_entry_point(BothWorkflow)
+
+    def test_resolve_entry_point_neither_raises(self):
+        class NeitherWorkflow(BaseWorkflow):
+            workflow_id = "neither"
+
+        with pytest.raises(ValueError, match="must define either"):
+            AsyncCampaignManager._resolve_entry_point(NeitherWorkflow)
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +282,25 @@ class TestAsyncCampaignManager:
         assert len(HookWorkflow.calls) == 2
         assert {rid for rid, _ in HookWorkflow.calls} == {"a_0", "a_1"}
         assert all(st == "done" for _, st in HookWorkflow.calls)
+
+    async def test_run_exception_marks_replica_failed(self, acm):
+        """An exception in run() sets final_state="failed"; campaign still completes."""
+        acm.register_group("a", FailingHookWorkflow, replicas=2)
+        await acm.start()
+        assert await acm.wait(timeout=3.0)
+        assert len(FailingHookWorkflow.calls) == 2
+        assert all(st == "failed" for _, st in FailingHookWorkflow.calls)
+        assert acm.status()["groups"]["a"]["status"] == "done"
+
+    async def test_status_transitions_pending_running_done(self, acm):
+        """Status progresses: pending before start → running during → done after."""
+        acm.register_group("a", SleepWorkflow, replicas=1)
+        assert acm.status()["groups"]["a"]["status"] == "pending"
+        await acm.start()
+        await asyncio.sleep(0.005)  # yield to let the replica task begin
+        assert acm.status()["groups"]["a"]["status"] == "running"
+        assert await acm.wait(timeout=3.0)
+        assert acm.status()["groups"]["a"]["status"] == "done"
 
     async def test_empty_campaign_finishes_immediately(self, acm):
         await acm.start()
@@ -450,6 +503,24 @@ class TestResourcePool:
         rp = ResourcePool(total_cpus=8, total_gpus=2)
         d = rp.as_dict()
         assert set(d) == {"total_cpus", "available_cpus", "total_gpus", "available_gpus"}
+
+    def test_usage_str_tracks_used(self):
+        rp = ResourcePool(total_cpus=8, total_gpus=4)
+        rp.allocate(3, 2)
+        s = rp.usage_str()
+        assert "3/8" in s
+        assert "2/4" in s
+
+    def test_available_str_tracks_free(self):
+        rp = ResourcePool(total_cpus=8, total_gpus=4)
+        rp.allocate(3, 2)
+        s = rp.available_str()
+        assert "5/8" in s
+        assert "2/4" in s
+
+    def test_unlimited_usage_str_returns_dash(self):
+        rp = ResourcePool(total_cpus=0, total_gpus=0)
+        assert rp.usage_str() == "—"
 
 
 # ---------------------------------------------------------------------------

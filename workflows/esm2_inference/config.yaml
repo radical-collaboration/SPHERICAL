@@ -40,12 +40,13 @@ use_streaming: false
 health_check_timeout: 300  # seconds to wait for servers (default 300)
 
 # -----------------------------------------------------------------------------
-# Output Settings
+# ESM2 Settings
 # -----------------------------------------------------------------------------
-output_dir: "data/outputs_test"
-results_dir: "data/outputs_test/results"
-telemetry_dir: "data/outputs_test/telemetry-results"
-metrics_dir: "data/outputs_test"
+ESM2_dir: "ESM2"
+results_dir: "ESM2/results"
+telemetry: true
+telemetry_dir: "ESM2/telemetry-results"
+metrics_dir: "ESM2"
 metrics_file_prefix: "metrics"
 metrics_log_interval: 20
 
@@ -63,22 +64,16 @@ SEQUENCES:
 # -----------------------------------------------------------------------------
 debug: false
 mode: server
-engine: concurrent
+engine: dragon
 # Python executable used to launch the inference service workers.
 # Must point to an env with torch + transformers (e.g. campaign_manager).
-service_python: "/ocean/projects/dmr170002p/goliyad/conda_env/campaign_manager/bin/python"
-dragon_workers: 2500
-collect_telemetry: true
-slurm_config: slurm.yaml
+service_python: "${VE_HOME}/esm2/bin/python"
 
 # -----------------------------------------------------------------------------
-# Task configuration for ResourceManager (if enabled)
+# Tmp / Scratch Settings
 # -----------------------------------------------------------------------------
-tasks_config: 
-    client_req:
-        priority:       0
-        ranks:          1
-        cores_per_rank: 1
-        gpus_per_rank:  1
-
-ddsim_config: "/ocean/projects/dmr170002p/goliyad/DeepDriveSim/pipelines/ddmd_pipeline/data/new_lassen-keras-dbscan.yaml"
+# tmp_dir: node-local scratch for intermediate files; set to /tmp for single-node
+# or a Lustre path for multi-node (so all nodes can read shared data).
+# Leave unset to skip tmp directory management.
+tmp_dir: ""
+clean_tmp: false   # set true to remove tmp_dir on exit

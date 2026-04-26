@@ -20,7 +20,7 @@ export WORK_DIR="${BASE_DIR}/DeepDriveSim/workflows/ddmd_workflow"
 export CONDA_ENV="${BASE_DIR}/conda_env"
 export INPUT_DIR="${WORK_DIR}/data"
 export DUMMY_DIR="${BASE_DIR}/DeepDriveSim/workflows/dummy_workflow"
-export INF_DIR="${BASE_DIR}/htp/SPHERICAL/examples/esm2_inference"
+export INF_DIR="${BASE_DIR}/htp/SPHERICAL/workflows/esm2_inference"
 export MINAPPS_DIR="${BASE_DIR}/DeepDriveSim/workflows/miniapps_workflow"
 export MD_DIR="${WORK_DIR}"
 
@@ -59,7 +59,7 @@ sed -i "s|\${PROJECT}|$PROJECT|g" $MINAPPS_DIR/config.yaml
 cp  $DUMMY_DIR/template_config.yaml $DUMMY_DIR/config.yaml
 sed -i "s|\${PROJECT}|$PROJECT|g" $DUMMY_DIR/config.yaml
 
-cd $BASE_DIR/htp/SPHERICAL/examples/run_campaign
+cd $BASE_DIR/htp/SPHERICAL/workflows/run_campaign
 rm -rf data/telemetry-results
 rm -rf data/nvml-telemetry
 
