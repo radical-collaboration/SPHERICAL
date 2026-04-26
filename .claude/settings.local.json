@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python3:*)",
-      "WebFetch(domain:github.com)",
-      "Bash(python run_campaign.py:*)"
-    ]
-  }
-}

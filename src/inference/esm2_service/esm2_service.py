@@ -236,8 +236,13 @@ class ESM2InferenceService(InferenceService):
         if not batch_seqs:
             raise StopAsyncIteration
 
+        return_tensors = "np" if self.client_mode else "pt"
         toks = self.tokenizer(
-            batch_seqs, return_tensors="pt", padding=True, truncation=True, max_length=1024
+            batch_seqs,
+            return_tensors=return_tensors,
+            padding=True,
+            truncation=True,
+            max_length=1024,
         )
         num_tokens = int(toks["attention_mask"].sum().item())
         return num_tokens, toks

@@ -19,11 +19,10 @@ import sys
 from typing import Any, Optional
 
 from aiohttp import web
-from radical.asyncflow import WorkflowEngine
 
 from ..utils.logger import Logger
 from .server import get_app, init_server
-from .utils import get_devices_for_node, get_slurm_nodes, ensure_dir, init_collector
+from .utils import get_devices_for_node, get_slurm_nodes
 
 logger = Logger(use_colors=True)
 
@@ -36,6 +35,132 @@ __all__ = [
     "init_clients",
     "ServiceHandle",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------------------
+
+
+async def wait_for_healthy(
+    endpoints: list[str],
+    timeout: int = 60,
+    check_interval: int = 2,
+) -> list[str]:
+    """
+    Wait for servers to be ready and perform health checks.
+
+    Args:
+        endpoints: List of server endpoints
+        timeout: Maximum time to wait in seconds
+        check_interval: Time between health checks in seconds
+
+    Returns:
+        List of healthy endpoints
+    """
+    import time
+
+    import aiohttp
+
+    logger.separator(title="WAITING FOR SERVERS TO BE READY")
+
+    start_time = time.time()
+
+    async def check_endpoint(endpoint: str) -> bool:
+        """Check if endpoint is healthy."""
+        health_url = f"{endpoint}/health"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        return True
+                    return False
+        except Exception:
+            return False
+
+    healthy = []
+    prev_healthy = -1
+    last_log_time = 0
+    while (time.time() - start_time) < timeout:
+        health_checks = [check_endpoint(ep) for ep in endpoints]
+        health_results = await asyncio.gather(*health_checks)
+
+        healthy = [
+            ep for ep, is_healthy in zip(endpoints, health_results, strict=False) if is_healthy
+        ]
+
+        if len(healthy) == len(endpoints):
+            logger.info(f"All {len(healthy)} servers are healthy!")
+            return healthy
+
+        elapsed = int(time.time() - start_time)
+        now = time.time()
+        # Log when status changes or every 30s to avoid flooding
+        if len(healthy) != prev_healthy or (now - last_log_time) >= 30:
+            logger.info(
+                f"{len(healthy)}/{len(endpoints)} servers ready, waiting... ({elapsed}s/{timeout}s)"
+            )
+            prev_healthy = len(healthy)
+            last_log_time = now
+
+        await asyncio.sleep(check_interval)
+
+    if healthy:
+        logger.warning(f"Timeout: {len(healthy)}/{len(endpoints)} servers healthy")
+    else:
+        logger.error("Timeout: No healthy servers found!")
+
+    return healthy
+
+
+# ---------------------------------------------------------------------------
+# Service handle with Dragon process lifecycle support
+# ---------------------------------------------------------------------------
+
+
+class ServiceHandle:
+    """
+    Wrapper for a running inference service with its endpoint.
+
+    Supports two modes:
+    - In-process: holds local service + aiohttp runner
+    - Remote (Dragon): holds client-mode service + remote process reference
+    """
+
+    def __init__(
+        self,
+        endpoint: Optional[str],
+        service: Optional[Any],
+        runner: Optional[web.AppRunner] = None,
+        dragon_process: Optional[Any] = None,
+    ):
+        self.endpoint = endpoint
+        self.service = service
+        self.runner = runner
+        self.dragon_process = dragon_process
+
+    async def close(self):
+        """Shutdown the service and cleanup resources."""
+        logger.separator(title="SHUTTING DOWN SERVERS")
+        try:
+            logger.info(f"Shutting down {self.endpoint}...")
+            if self.dragon_process is not None:
+                # Remote mode (Dragon): terminate the server process
+                self.dragon_process.terminate()
+                self.dragon_process.join(timeout=30)
+                logger.info(f"Remote process for {self.endpoint} terminated")
+            else:
+                # In-process mode: shutdown service and runner locally
+                if self.service and hasattr(self.service, "shutdown"):
+                    await self.service.shutdown()
+                if self.runner:
+                    await self.runner.cleanup()
+        except Exception as e:
+            logger.error(f"Error shutting down {self.endpoint}: {e}")
+
+    def __iter__(self):
+        """Allow unpacking as (endpoint, service) for backward compatibility."""
+        return iter((self.endpoint, self.service))
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +189,10 @@ def _server_node_main(config, node_rank, hostname, port, service_class, use_http
 
     from aiohttp import web as _web
 
-    from src.utils.logger import Logger as _Logger
-    from src.inference.server import get_app as _get_app, init_server as _init_server
+    from src.inference.server import get_app as _get_app
+    from src.inference.server import init_server as _init_server
     from src.inference.utils import get_devices_for_node as _get_devices
+    from src.utils.logger import Logger as _Logger
 
     log = _Logger(use_colors=True)
 
@@ -266,8 +392,8 @@ async def _launch_servers_dragon(
     from pathlib import Path
 
     try:
-        from dragon.native.process import Process
         from dragon.infrastructure.policy import Policy
+        from dragon.native.process import Process
     except ImportError:
         logger.error("Dragon is not available. Install Dragon or set engine to 'concurrent'.")
         return []
@@ -288,7 +414,7 @@ async def _launch_servers_dragon(
         script_dir = os.getcwd()
 
     # Write config to shared filesystem so remote processes can read it
-    config_dir = Path(config.get("output_dir", "."))
+    config_dir = Path(config.get("output_dir", config.get("ESM2_dir", ".")))
     config_dir.mkdir(parents=True, exist_ok=True)
     config_json_path = str(config_dir / f"_dragon_config_{os.getpid()}.json")
     with open(config_json_path, "w") as f:
@@ -299,12 +425,23 @@ async def _launch_servers_dragon(
     for rank, hostname in enumerate(nodes):
         port = base_port + rank
         protocol = "https" if use_https else "http"
-        endpoint = f"{protocol}://{hostname}:{port}"
 
-        policy = Policy(
-            placement=Policy.Placement.HOST_NAME,
-            host_name=hostname,
-        )
+        # Under `dragon -s` (single-node) Dragon reports 'localhost'.
+        # Use the real hostname for the HTTP endpoint URL so health checks work.
+        endpoint_host = socket.gethostname() if hostname == "localhost" else hostname
+        endpoint = f"{protocol}://{endpoint_host}:{port}"
+
+        # Policy placement:
+        # - 'localhost' (dragon -s): DEFAULT avoids the ~54s host_id=-1 timeout
+        #   and the "not found" error from specifying the real short hostname.
+        # - real hostname: HOST_NAME with short name (strip FQDN domain suffix).
+        if hostname == "localhost":
+            policy = Policy(placement=Policy.Placement.DEFAULT)
+        else:
+            policy = Policy(
+                placement=Policy.Placement.HOST_NAME,
+                host_name=hostname.split(".")[0],
+            )
 
         service_python = config.get("service_python", sys.executable)
         cmd = [
@@ -315,7 +452,7 @@ async def _launch_servers_dragon(
             "--node-rank",
             str(rank),
             "--hostname",
-            hostname,
+            endpoint_host,
             "--port",
             str(port),
             "--service-module",
@@ -338,7 +475,7 @@ async def _launch_servers_dragon(
         )
         proc.start()
 
-        logger.info(f"[Server {rank}] Dragon process spawned on {hostname}")
+        logger.info(f"[Server {rank}] Dragon process spawned on {endpoint_host}")
         servers.append((endpoint, None, proc))
 
     logger.info(f"Spawned {len(servers)} Dragon server processes")
@@ -364,7 +501,9 @@ async def _launch_servers_async(
 
     if use_subprocess:
         # Reuse the Dragon-path subprocess launch logic (no Dragon placement).
-        import inspect, json, os
+        import inspect
+        import json
+        import os
         from pathlib import Path
 
         launcher_script = str(Path(__file__).parent / "dragon_launcher.py")
@@ -374,7 +513,7 @@ async def _launch_servers_async(
             script_dir = str(Path(inspect.getfile(service_class)).resolve().parent)
         except (TypeError, OSError):
             script_dir = os.getcwd()
-        config_dir = Path(config.get("output_dir", "."))
+        config_dir = Path(config.get("output_dir", config.get("ESM2_dir", ".")))
         config_dir.mkdir(parents=True, exist_ok=True)
         config_json_path = str(config_dir / f"_async_config_{os.getpid()}.json")
         with open(config_json_path, "w") as f:
@@ -436,130 +575,6 @@ async def _launch_servers_async(
 
 
 # ---------------------------------------------------------------------------
-# Health checks
-# ---------------------------------------------------------------------------
-
-
-async def wait_for_healthy(
-    endpoints: list[str],
-    timeout: int = 60,
-    check_interval: int = 2,
-) -> list[str]:
-    """
-    Wait for servers to be ready and perform health checks.
-
-    Args:
-        endpoints: List of server endpoints
-        timeout: Maximum time to wait in seconds
-        check_interval: Time between health checks in seconds
-
-    Returns:
-        List of healthy endpoints
-    """
-    import time
-
-    import aiohttp
-
-    logger.separator(title="WAITING FOR SERVERS TO BE READY")
-
-    start_time = time.time()
-
-    async def check_endpoint(endpoint: str) -> bool:
-        """Check if endpoint is healthy."""
-        health_url = f"{endpoint}/health"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(health_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status == 200:
-                        return True
-                    return False
-        except Exception:
-            return False
-
-    healthy = []
-    prev_healthy = -1
-    last_log_time = 0
-    while (time.time() - start_time) < timeout:
-        health_checks = [check_endpoint(ep) for ep in endpoints]
-        health_results = await asyncio.gather(*health_checks)
-
-        healthy = [ep for ep, is_healthy in zip(endpoints, health_results) if is_healthy]
-
-        if len(healthy) == len(endpoints):
-            logger.info(f"All {len(healthy)} servers are healthy!")
-            return healthy
-
-        elapsed = int(time.time() - start_time)
-        now = time.time()
-        # Log when status changes or every 30s to avoid flooding
-        if len(healthy) != prev_healthy or (now - last_log_time) >= 30:
-            logger.info(
-                f"{len(healthy)}/{len(endpoints)} servers ready, waiting... ({elapsed}s/{timeout}s)"
-            )
-            prev_healthy = len(healthy)
-            last_log_time = now
-
-        await asyncio.sleep(check_interval)
-
-    if healthy:
-        logger.warning(f"Timeout: {len(healthy)}/{len(endpoints)} servers healthy")
-    else:
-        logger.error("Timeout: No healthy servers found!")
-
-    return healthy
-
-
-# ---------------------------------------------------------------------------
-# Service handle with Dragon process lifecycle support
-# ---------------------------------------------------------------------------
-
-
-class ServiceHandle:
-    """
-    Wrapper for a running inference service with its endpoint.
-
-    Supports two modes:
-    - In-process: holds local service + aiohttp runner
-    - Remote (Dragon): holds client-mode service + remote process reference
-    """
-
-    def __init__(
-        self,
-        endpoint: Optional[str],
-        service: Optional[Any],
-        runner: Optional[web.AppRunner] = None,
-        dragon_process: Optional[Any] = None,
-    ):
-        self.endpoint = endpoint
-        self.service = service
-        self.runner = runner
-        self.dragon_process = dragon_process
-
-    async def close(self):
-        """Shutdown the service and cleanup resources."""
-        logger.separator(title="SHUTTING DOWN SERVERS")
-        try:
-            logger.info(f"Shutting down {self.endpoint}...")
-            if self.dragon_process is not None:
-                # Remote mode (Dragon): terminate the server process
-                self.dragon_process.terminate()
-                self.dragon_process.join(timeout=30)
-                logger.info(f"Remote process for {self.endpoint} terminated")
-            else:
-                # In-process mode: shutdown service and runner locally
-                if self.service and hasattr(self.service, "shutdown"):
-                    await self.service.shutdown()
-                if self.runner:
-                    await self.runner.cleanup()
-        except Exception as e:
-            logger.error(f"Error shutting down {self.endpoint}: {e}")
-
-    def __iter__(self):
-        """Allow unpacking as (endpoint, service) for backward compatibility."""
-        return iter((self.endpoint, self.service))
-
-
-# ---------------------------------------------------------------------------
 # Service orchestration
 # ---------------------------------------------------------------------------
 
@@ -585,7 +600,7 @@ async def start_services_local(
     # each service uses exactly the GPU the campaign manager allocated to it,
     # rather than defaulting to cuda:0.  Falls back to auto-detection when no
     # assignment is present (e.g. local testing without the CM).
-    from .utils import get_available_device_count, detect_device_type
+    from .utils import detect_device_type, get_available_device_count
 
     device_type = detect_device_type()
     if device_type == "cuda":
@@ -614,9 +629,8 @@ async def start_services_local(
         # Run the constructor in a thread so that synchronous model loading
         # (tokenizer + model weights, possibly downloading from HuggingFace)
         # does not block the asyncio event loop.
-        _rank, _devices = rank, devices  # capture loop variables
         service = await asyncio.to_thread(
-            lambda: service_class(config=config, devices=_devices, rank=_rank)
+            lambda r=rank, d=devices: service_class(config=config, devices=d, rank=r)
         )
         handles.append(ServiceHandle(endpoint=None, service=service))
         logger.info(f"[Server {rank}] Local Inference service initialized on devices: {devices}")
@@ -697,7 +711,8 @@ async def init_clients(
     config: dict[str, Any],
     services: list[ServiceHandle],
     client_class: type,
-) -> tuple[Optional[list[Any]], Optional[Any]]:
+    asyncflow: Any,
+) -> Optional[list[Any]]:
     """
     Initialize clients for the given services.
 
@@ -709,36 +724,6 @@ async def init_clients(
     Returns:
         Tuple of (list of client instances, telemetry collector or None)
     """
-    engine = config.get("engine", "concurrent").lower()
-    collector = None
-    asyncflow = None
-
-    if "concurrent" in engine:
-        from rhapsody.backends import ConcurrentExecutionBackend
-
-        engine = await ConcurrentExecutionBackend
-        engine_name = "ConcurrentExecutionBackend"
-    elif "dragon" in engine:
-        from rhapsody.backends import DragonExecutionBackendV3
-
-        dragon_workers = config.get("dragon_workers", 100)
-        engine = await DragonExecutionBackendV3(
-            num_workers=dragon_workers, disable_background_batching=False
-        )
-        engine_name = "DragonExecutionBackendV3"
-        # Initialize telemetry collector if running with dragon
-        collect_telemetry = config.get("collect_telemetry", False)
-        if collect_telemetry:
-            collector_dir = ensure_dir(config.get("telemetry_dir", "telemetry-results"))
-            collector = init_collector(collector_dir)
-    else:
-        from rhapsody.backends import DaskExecutionBackend
-
-        engine = await DaskExecutionBackend
-        engine_name = "DaskExecutionBackend"
-
-    asyncflow = await WorkflowEngine.create(engine)
-    logger.info(f"Asyncflow enabled with {engine_name} backend")
 
     clients = []
     for rank, handle in enumerate(services):
@@ -774,7 +759,7 @@ async def init_clients(
 
     if not clients:
         logger.error("No clients were created!")
-        return None, collector
+        return None
 
     logger.info(f"Created {len(clients)} clients")
-    return clients, collector
+    return clients

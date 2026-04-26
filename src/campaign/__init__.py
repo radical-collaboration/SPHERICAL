@@ -1,11 +1,16 @@
 """Campaign management for multi-workflow orchestration."""
 
-from .campaign_manager import CampaignManager, BaseWorkflow, ResourcePool, WorkflowStats
-from .async_campaign_manager import AsyncCampaignManager
+from .campaign_manager import (
+    AsyncCampaignManager,
+    BaseWorkflow,
+    CampaignManager,
+    ResourcePool,
+    WorkflowStats,
+)
 
 __all__ = [
-    "CampaignManager",
     "AsyncCampaignManager",
+    "CampaignManager",
     "BaseWorkflow",
     "ResourcePool",
     "WorkflowStats",

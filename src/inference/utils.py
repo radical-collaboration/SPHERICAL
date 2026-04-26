@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 import yaml
 
+from src.utils.workflow import _expand_env
+
 
 def read_slurm_config(path: str | Path) -> dict[str, Any]:
     with open(path) as f:
@@ -66,7 +68,7 @@ def load_config(config_path: str) -> dict[str, Any]:
 
     if os.path.exists(config_path):
         with open(config_path) as f:
-            user_config = yaml.safe_load(f) or {}
+            user_config = _expand_env(yaml.safe_load(f) or {})
             config.update(user_config)
 
     return config
@@ -84,7 +86,7 @@ def ensure_dir(path: Path, clean: bool = True) -> Path:
     """
     path = Path(path)
 
-    if path.exists():
+    if clean and path.exists():
         # ignore_errors: multiple nodes may clean the same shared-filesystem
         # directory concurrently, so files can disappear mid-iteration.
         shutil.rmtree(path, ignore_errors=True)
@@ -183,10 +185,17 @@ def get_slurm_nodes(config: dict[str, Any]) -> list[str]:
 
     engine = config.get("engine", "").lower()
     if "dragon" in engine:
-        # Dragon reads node hostnames from its own slurm.yaml config
-        slurm_config = config.get("slurm_config", "slurm.yaml")
-        hosts = read_slurm_config(slurm_config)
-        nodes = [host["host_name"] for host in hosts.values()]
+        # System().nodes returns huids (integer node IDs), not hostnames.
+        # Node(huid).hostname gives the real string name Dragon's policy
+        # evaluator expects.  Under `dragon -s` (single-node) the hostname
+        # is 'localhost' which resolves to host_id=-1 and causes a ~54 s
+        # scheduling timeout; substitute the real hostname in that case.
+        from dragon.native.machine import Node, System
+
+        nodes = []
+        for huid in System().nodes:
+            node = Node(huid)
+            nodes.append(node.hostname)  # keep 'localhost' as-is; handled in _launch_servers_dragon
         return nodes
 
     else:

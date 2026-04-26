@@ -24,6 +24,10 @@ from ..utils.logger import Logger
 from .utils import export_metrics
 
 
+async def _null_coro():
+    """No-op coroutine used as a placeholder for None futures in gather."""
+
+
 class InferenceClient:
     """
     Generic HTTP client for remote inference.
@@ -239,8 +243,6 @@ class InferenceClient:
         """Export metrics and shut down asyncflow."""
         self.logger.info(f"[Client {self.rank}] Closing")
         await export_metrics(Path(self.metrics_dir, f"client_{self.rank}.json"), self.metrics)
-        if self.flow:
-            await self.flow.shutdown()
 
     async def init_queue(self) -> None:
         """Populate the sequence queue via the service."""
@@ -350,60 +352,61 @@ class InferenceClient:
     # ------------------------------------------------------------------
 
     async def _flush_tasks(self, tasks: list, batch_ids: list = None):
-        """Await a batch of tasks and aggregate metrics."""
+        """Schedule all tasks concurrently and aggregate metrics."""
         if not tasks:
             return
 
         self.logger.debug(f"[Client {self.rank}] Flushing {len(tasks)} tasks")
 
+        futs = []
         for i, task in enumerate(tasks):
-            if self.debug:
-                self.logger.debug(
-                    f"[Client {self.rank}] Awaiting task {i}/{len(tasks)}, "
-                    f"type={type(task).__name__}"
-                )
-            try:
-                if asyncio.isfuture(task) or asyncio.iscoroutine(task):
-                    task_fut = asyncio.ensure_future(task)
-                elif hasattr(task, "__await__"):
+            if asyncio.isfuture(task) or asyncio.iscoroutine(task):
+                futs.append(asyncio.ensure_future(task))
+            elif hasattr(task, "__await__"):
+                t = task
 
-                    async def _wrap():
-                        return await task
+                async def _wrap(t=t):
+                    return await t
 
-                    task_fut = asyncio.ensure_future(_wrap())
-                elif hasattr(task, "result"):
-                    task_fut = asyncio.ensure_future(
+                futs.append(asyncio.ensure_future(_wrap()))
+            elif hasattr(task, "result"):
+                futs.append(
+                    asyncio.ensure_future(
                         asyncio.get_event_loop().run_in_executor(None, task.result)
                     )
-                else:
-                    self.logger.error(
-                        f"[Client {self.rank}] Task {i} is not awaitable: {type(task)}"
-                    )
-                    self.metrics["failed"] += 1
-                    continue
+                )
+            else:
+                self.logger.error(f"[Client {self.rank}] Task {i} is not awaitable: {type(task)}")
+                self.metrics["failed"] += 1
+                futs.append(None)
 
-                result = await asyncio.wait_for(task_fut, timeout=self.timeout)
-                if self.debug:
-                    self.logger.debug(f"[Client {self.rank}] Task {i} completed: {result}")
+        wrapped = [
+            asyncio.wait_for(f, timeout=self.timeout) if f is not None else _null_coro()
+            for f in futs
+        ]
+        results = await asyncio.gather(*wrapped, return_exceptions=True)
 
-                if isinstance(result, dict):
-                    self.metrics["successful"] += result.get("successful", 0)
-                    self.metrics["failed"] += result.get("failed", 0)
-                    self.metrics["retries"] += result.get("retries", 0)
-                    if result.get("status") == "error":
-                        batch_id = result.get("batch_id", "?")
-                        error = result.get("error", "Unknown")
-                        self.metrics["error_msgs"].append(f"batch {batch_id}: {error}")
-                        self.logger.error(f"[Client {self.rank}] Batch {batch_id}: {error}")
-
-            except asyncio.TimeoutError:
+        for i, result in enumerate(results):
+            if self.debug:
+                self.logger.debug(f"[Client {self.rank}] Task {i}: {result!r}")
+            if isinstance(result, asyncio.TimeoutError):
                 self.logger.error(f"[Client {self.rank}] Task {i} timed out after {self.timeout}s")
                 self.metrics["failed"] += 1
-            except Exception as e:
+            elif isinstance(result, Exception):
                 self.logger.error(
-                    f"[Client {self.rank}] Task {i} failed with {type(e).__name__}: {e}"
+                    f"[Client {self.rank}] Task {i} failed with {type(result).__name__}: {result}"
                 )
                 import traceback
 
                 self.logger.debug(f"[Client {self.rank}] Traceback: {traceback.format_exc()}")
+                self.metrics["failed"] += 1
+            elif isinstance(result, dict):
+                self.metrics["successful"] += result.get("successful", 0)
+                self.metrics["failed"] += result.get("failed", 0)
+                self.metrics["retries"] += result.get("retries", 0)
+                if result.get("status") == "error":
+                    batch_id = result.get("batch_id", "?")
+                    error = result.get("error", "Unknown")
+                    self.metrics["error_msgs"].append(f"batch {batch_id}: {error}")
+                    self.logger.error(f"[Client {self.rank}] Batch {batch_id}: {error}")
                 self.metrics["failed"] += 1

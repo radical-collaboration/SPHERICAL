@@ -16,8 +16,8 @@ from typing import Any, Optional
 
 from aiohttp import web
 
-from .inference_service import InferenceService
 from ..utils.logger import Logger
+from .inference_service import InferenceService
 
 logger = Logger(use_colors=True)
 inference_service: Optional[InferenceService] = None
