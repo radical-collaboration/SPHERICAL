@@ -380,8 +380,11 @@ class SGDESWorkflow:
         #   single-node → DES_TMPDIR (/tmp): fast local I/O, ~10 s/createdb step
         #   multi-node  → None (Lustre):      shared across nodes, ~27-130 s/step
         # See run_workflow.py for the full rationale.
-        _workdir_base = self.des_workdir_base if self.des_workdir_base is not None \
+        _workdir_base = (
+            self.des_workdir_base
+            if self.des_workdir_base is not None
             else os.path.dirname(des_fasta)
+        )
         workdir = tempfile.mkdtemp(prefix="fsim_", dir=_workdir_base)
 
         # foldseek_search's internal scratch stays on node-local /tmp regardless.
@@ -501,6 +504,7 @@ class SGDESWorkflow:
                 os.remove(cand_fa)
                 os.remove(out_tsv)
                 import glob as _glob
+
                 for _f in _glob.glob(f"{cand_db}*"):
                     try:
                         os.remove(_f)
