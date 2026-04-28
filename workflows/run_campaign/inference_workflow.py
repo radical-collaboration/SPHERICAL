@@ -192,7 +192,7 @@ class InferenceWorkflow(BaseWorkflow):
     # ------------------------------------------------------------------ #
 
     async def on_replica_done(self, replica_id: str, cm, final_state: str) -> None:
-        """Queue a DDSim replica per completed inference run; teardown on last."""
+        """Queue 1 downstream replica per successful inference; teardown on last."""
         status = cm.status()
         g = status["groups"].get("inference", {})
         finished = g.get("replicas_finished", 0) + 1
@@ -205,18 +205,9 @@ class InferenceWorkflow(BaseWorkflow):
         )
 
         if final_state == "done":
-            InferenceWorkflow._log.info(
-                "queuing 1 ddsim replica",
-                component="workflow",
-                task_name=replica_id,
-            )
-            await cm.add_replicas("dummy", n=1)
-        else:
-            InferenceWorkflow._log.warning(
-                f"skipping ddsim replica (state={final_state})",
-                component="workflow",
-                task_name=replica_id,
-            )
+            # Each successful inference result triggers 1 downstream replica.
+            # The count is determined here by execution logic, not by config.
+            await self._trigger_dependent("dummy", replicas=1)
 
         if finished >= total:
             InferenceWorkflow._log.info(

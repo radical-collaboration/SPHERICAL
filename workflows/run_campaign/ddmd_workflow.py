@@ -64,7 +64,7 @@ class DDMdWrapperWorkflow(BaseWorkflow):
                 asyncflow=asyncflow,
                 config=replica_config_path,
                 name=name,
-                on_ready=self._on_ready,
+                on_ready=lambda: self._signal_done(),
                 policies=self.policies,
                 engine_dragon=self.engine_dragon,
             )

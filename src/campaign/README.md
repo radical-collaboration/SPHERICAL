@@ -3,7 +3,7 @@
 RADICAL asyncflow-native orchestrator for multi-workflow HPC campaigns.  Runs
 concurrent replicas of heterogeneous workflows inside a single `asyncio` event
 loop backed by `radical.asyncflow`, with priority-based scheduling,
-sliding-window concurrency caps, resource-pool gating, and workflow-driven
+sliding-window concurrency caps, resource-pool gating, and adaptive cascading
 dependency signalling.
 
 ---
@@ -29,19 +29,21 @@ All user workflows subclass `BaseWorkflow`.
 class BaseWorkflow:
     workflow_id: str = "base"   # unique prefix for replica IDs
 
-    def __init__(self, config, on_ready, asyncflow, policies, engine_dragon): ...
+    def __init__(self, config, _cm, _group_name, asyncflow, policies, engine_dragon): ...
 
-    async def run(self, replica_id: str): ...           # entry point (override run OR start)
-    async def on_replica_done(self, replica_id, cm, final_state): ...  # optional hook
-    async def _signal_ready(self): ...                  # call from run() to unblock dependents
+    async def run(self, replica_id: str): ...                          # entry point (override run OR start)
+    async def on_replica_done(self, replica_id, cm, final_state): ... # optional hook
+    async def _signal_done(self): ...           # broadcast signal to all dependent groups
+    async def _trigger_dependent(self, name, replicas=1): ...  # explicit activation of a named group
 ```
 
-The CM injects five objects at construction time:
+The CM injects six objects at construction time:
 
 | Injected attribute | Type | Purpose |
 |--------------------|------|---------|
 | `self.config` | `dict` | per-group config section (CM scheduling keys stripped) |
-| `self._on_ready` | async callable | calls `cm.signal_ready(group_name)` |
+| `self._cm` | `AsyncCampaignManager` | reference to the running CM (`None` in unit tests without a CM) |
+| `self._group_name` | `str` | name of this replica's group (used by `_signal_done`) |
 | `self.asyncflow` | `WorkflowEngine` | shared `radical.asyncflow` engine |
 | `self.policies` | `list[Policy]` | one Dragon `Policy` per assigned GPU (empty on concurrent backend) |
 | `self.engine_dragon` | backend handle | Dragon backend; `None` on concurrent |
@@ -66,13 +68,13 @@ has:
 
 | Field | Meaning |
 |-------|---------|
-| `replicas` | total replicas to complete |
+| `replicas` | total replicas to complete (omit / set to 0 for dependent groups) |
 | `max_replicas` | sliding-window concurrency cap (defaults to `replicas` if 0) |
 | `min_replicas` | minimum guaranteed concurrent slots (Pass 1 of scheduler) |
 | `priority` | higher → scheduled first |
 | `required_cpus` | CPU cores reserved from the pool while a replica runs |
 | `required_gpus` | GPU slots reserved from the pool while a replica runs |
-| `dependencies` | list of group names that must signal ready first |
+| `dependencies` | upstream groups; used to route `_signal_done()` and gate scheduling |
 | `dependency_threshold` | count-based fallback: N finished replicas in a dep group counts as "ready" (default 1) |
 
 ### ResourcePool
@@ -104,10 +106,80 @@ replica finishes.
 
 ---
 
+## Adaptive cascading dependency model
+
+### Two group modes
+
+A workflow group is **independent** or **dependent**, controlled entirely by
+the config — no workflow code changes required to switch between modes.
+
+**Independent** — `replicas: N` present; group starts immediately on `cm.start()`.
+
+**Dependent** — `replicas` omitted (defaults to 0); group stays inactive until an
+upstream replica signals the CM.  Each signal adds more replicas to the queue;
+signals can repeat throughout the lifetime of the upstream run.
+
+### Two signalling methods
+
+#### `_signal_done()` — broadcast, topology-driven
+
+```python
+await self._signal_done()
+```
+
+Called from `run()` to indicate that this iteration has produced output.
+The CM auto-routes the signal to **every group** that lists the caller's group
+in its `dependencies` config field, adding +1 replica to each.  The caller
+does not need to know downstream group names — the pipeline topology lives
+entirely in the config.
+
+Use this for **data-driven fan-out**: one upstream replica fires once per
+result, and the CM decides which downstream groups get a new replica based on
+the config graph.
+
+```
+md ──signal_done()──► CM routes ──► miniapps (+1 replica per signal)
+```
+
+#### `_trigger_dependent(name, replicas=N)` — explicit, named
+
+```python
+await self._trigger_dependent("downstream_group", replicas=1)
+```
+
+Called from `run()` or `on_replica_done()` when the upstream workflow
+decides—based on its own logic—to start a specific number of downstream
+replicas.  Each call is additive: calling it again queues more replicas.
+If the group was already marked done, it is re-opened for scheduling.
+
+Use this when the **calling workflow knows** the target name and controls
+exactly how many replicas to spawn per event (e.g. one inference result
+triggers exactly one downstream job).
+
+```
+inference ──_trigger_dependent("dummy", replicas=1)──► dummy (+1 per result)
+```
+
+### Scheduler re-runs on every signal
+
+Every call to `_signal_done()` or `_trigger_dependent()` increments the
+target group's `replicas` counter and immediately re-runs the two-pass
+scheduler.  If resources are available the new replica starts at once;
+otherwise it queues until resources free up.
+
+### Campaign completion
+
+Groups registered with `replicas=0` (dependent groups that were never
+triggered) are **excluded** from the all-done check.  The campaign completes
+when all groups that were actually triggered have finished, plus all
+independent groups are done.
+
+---
+
 ## Scheduling model
 
 The CM runs a **two-pass greedy scheduler** on every state change (replica
-start, replica finish, `signal_ready`, `add_replicas`):
+start, replica finish, `signal_done`, `trigger_dependent`):
 
 1. **Pass 1** — guarantee `min_replicas` concurrent slots for all eligible
    groups, highest priority first.
@@ -120,43 +192,76 @@ and a WARNING is emitted.
 
 A group is **eligible** when every dependency group is **ready**:
 
-- **Workflow-driven** (preferred): the dependency called
-  `await self._signal_ready()` at any point during execution.  This fires
-  immediately, regardless of how many replicas have finished.
+- **Workflow-driven** (preferred): a dependency group called `_signal_done()`
+  at any point during execution (`group.ready = True`).
 - **Count-based fallback**: `dep.finished_replicas >= dep_threshold` (default 1).
 
 ---
 
 ## Authoring a workflow
 
+### Independent workflow
+
 ```python
 from src.campaign import BaseWorkflow
 
-class MyWorkflow(BaseWorkflow):
-    workflow_id = "my_wf"
+class SimWorkflow(BaseWorkflow):
+    workflow_id = "sim"
 
     async def run(self, replica_id: str) -> None:
         # self.config  — dict forwarded from YAML workflow section
         # self.asyncflow — shared WorkflowEngine
         # self.policies  — Dragon Policy list (empty on concurrent backend)
-        await do_simulation(self.asyncflow, self.config)
+        result = await do_simulation(self.asyncflow, self.config)
 
-        # Unblock dependent groups immediately (does not wait for run() to return).
-        await self._signal_ready()
+        # Signal the CM every time a result is ready.
+        # CM auto-routes +1 replica to every group in config's dependencies.
+        await self._signal_done()
+```
 
-        await do_training(self.asyncflow, self.config)
+### Dependent workflow (topology-driven via _signal_done)
+
+No changes needed in the dependent workflow itself — it just runs normally.
+The CM starts it when an upstream `_signal_done()` fires.
+
+```yaml
+# config.yaml
+workflows:
+  sim:
+    replicas: 4        # independent: starts immediately
+    ...
+
+  analysis:
+    dependencies: [sim] # dependent: starts at replicas=0; sim's _signal_done() adds replicas
+    ...                  # no "replicas:" key — the count comes from signals at runtime
+```
+
+### Dependent workflow (explicit via _trigger_dependent)
+
+Use when this workflow decides the count and the target name based on its
+execution logic (e.g. a quality filter on results).
+
+```python
+class InferenceWorkflow(BaseWorkflow):
+    workflow_id = "inference"
+
+    async def run(self, replica_id: str) -> None:
+        results = await run_inference(self.asyncflow, self.config)
+        for r in results:
+            if r.quality > THRESHOLD:
+                # Explicitly queue 1 more replica of the downstream group.
+                await self._trigger_dependent("downstream", replicas=1)
 
     async def on_replica_done(self, replica_id, cm, final_state):
-        # Optional: called after run() returns or raises.
-        # final_state is "done" or "failed".
-        if final_state == "done":
-            await cm.add_replicas("downstream_group", n=1)
+        # on_replica_done fires after run() returns; useful for teardown
+        # that should happen once per replica (e.g. releasing shared services).
+        ...
 ```
 
 Rules:
 - Define **either** `run()` or `start()` — not both.
-- `_signal_ready()` is idempotent at the CM level; call it as many times as
-  needed, only the first call has effect.
+- Both `_signal_done()` and `_trigger_dependent()` are no-ops when no CM was
+  injected (safe to call in unit tests).
 - `on_replica_done` may be `async def` or `def`; the CM handles both.
 - Do **not** call `asyncflow.shutdown()` from within a replica — the engine is
   owned by the caller and shut down after `cm.close()`.
@@ -168,11 +273,11 @@ Rules:
 ```python
 from src.campaign import AsyncCampaignManager
 
-WORKFLOW_REGISTRY = {"my_wf": MyWorkflow, "downstream": DownstreamWorkflow}
+WORKFLOW_REGISTRY = {"sim": SimWorkflow, "analysis": AnalysisWorkflow}
 
 cm = AsyncCampaignManager.from_config(config, WORKFLOW_REGISTRY)
-await cm.start()    # schedules all groups with satisfied dependencies
-await cm.wait()     # blocks until every group is done
+await cm.start()    # schedules all groups with replicas > 0
+await cm.wait()     # blocks until every triggered group is done
 await cm.close()    # releases CM resources (does NOT shut down asyncflow)
 # caller shuts down asyncflow separately, after telemetry is stopped
 ```
@@ -201,7 +306,6 @@ await asyncflow.shutdown()
 
 ```yaml
 # ── Cluster resource budget ──────────────────────────────────────────────────
-# Set either to 0 to disable tracking (unlimited).
 resources:
   total_cpus: 128
   total_gpus: 4
@@ -210,26 +314,57 @@ resources:
 engine: dragon    # "dragon" or "concurrent" (falls back to concurrent if Dragon unavailable)
 
 # ── Workflow groups ──────────────────────────────────────────────────────────
+#
+# Two modes — controlled by whether 'replicas' is present:
+#
+#   Independent (replicas: N):
+#     Group starts immediately on cm.start().
+#
+#   Dependent (no replicas / replicas: 0):
+#     Group starts at 0 replicas; stays inactive until an upstream replica
+#     calls _signal_done() or _trigger_dependent().  Each call is additive —
+#     the upstream workflow decides when and how many replicas to add based on
+#     its own execution logic.  Calls can repeat across the lifetime of one
+#     upstream replica (e.g. once per iteration, once per result).
+#
+# To switch a dependent group to independent: add 'replicas: N' and remove
+# 'dependencies'.  No workflow code needs to change.
+
 workflows:
-  ddsim:
-    replicas:             8
-    min_replicas:         2       # guaranteed concurrent minimum
-    max_replicas:         4       # sliding-window cap
-    priority:             5
-    required_cpus:        20      # cores held while one replica runs
-    required_gpus:        0       # ddsim is CPU-only
-    dependencies:         []
-    dependency_threshold: 1       # unused when no deps
+  md:
+    replicas:      2          # independent: starts immediately
+    min_replicas:  1
+    max_replicas:  2
+    priority:      10
+    required_cpus: 4
+    required_gpus: 1
+    # Each iteration calls _signal_done() → CM routes +1 replica to miniapps.
+
+  miniapps:
+    priority:      8
+    min_replicas:  1
+    max_replicas:  2
+    required_cpus: 4
+    required_gpus: 1
+    dependencies:  [md]       # dependent: no replicas key → starts at 0
+                              # md's _signal_done() adds replicas at runtime
 
   inference:
-    replicas:             16
-    min_replicas:         1
-    max_replicas:         4
-    priority:             10      # higher → scheduled before ddsim overflow slots
-    required_cpus:        32
-    required_gpus:        1       # one GPU per inference replica
-    dependencies:         [ddsim]
-    dependency_threshold: 1
+    replicas:      8          # independent
+    min_replicas:  1
+    max_replicas:  4
+    priority:      6
+    required_cpus: 4
+    required_gpus: 1
+    # on_replica_done calls _trigger_dependent("dummy", replicas=1) per result.
+
+  dummy:
+    priority:      5
+    min_replicas:  2
+    max_replicas:  4
+    required_cpus: 4
+    required_gpus: 0
+    dependencies:  [inference] # dependent: inference triggers via _trigger_dependent
 ```
 
 Config keys consumed by the CM and stripped before forwarding to `workflow.config`:
@@ -249,11 +384,12 @@ min_replicas  max_replicas  required_cpus  required_gpus
 |--------|-------------|
 | `from_config(config, registry, asyncflow=None, engine_dragon=None)` | Build from YAML config dict + `{name: cls}` registry |
 | `register_group(name, cls, ...)` | Register a workflow group |
-| `start()` | Schedule all eligible groups; creates the shared asyncflow engine if not pre-built |
-| `wait(timeout=None)` | Async-block until all groups complete; returns `True` on success |
+| `start()` | Schedule all groups with `replicas > 0`; creates the shared asyncflow engine if not pre-built |
+| `wait(timeout=None)` | Async-block until all triggered groups complete; returns `True` on success |
 | `close()` | Release CM resources (does NOT shut down asyncflow) |
-| `signal_ready(group_name)` | Mark a group ready; unblock its dependents |
-| `add_replicas(group_name, n)` | Dynamically extend a group (capped at `configured_replicas`) |
+| `signal_done(group_name)` | Called by `_signal_done()`; adds +1 replica to every group that lists `group_name` in `dependencies` |
+| `trigger_dependent(name, replicas, config=None)` | Called by `_trigger_dependent()`; adds `replicas` to the named group and re-opens it if done |
+| `add_replicas(group_name, n)` | Dynamically extend a group up to its `configured_replicas` cap |
 | `status()` | Snapshot dict of all group states + `"resources"` key |
 | `stats()` | Per-group `WorkflowStats(replicas_started, replicas_finished)` |
 
@@ -261,7 +397,7 @@ min_replicas  max_replicas  required_cpus  required_gpus
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
-| `replicas` | `1` | Total replicas |
+| `replicas` | `1` | Total replicas (0 for dependent groups) |
 | `min_replicas` | `0` | Guaranteed concurrent minimum |
 | `max_replicas` | `0` | Sliding-window cap (0 → equals `replicas`) |
 | `priority` | `0` | Scheduling priority (higher = first) |
@@ -282,9 +418,11 @@ plain blocking calls.  Same `from_config` / `register_group` / `start` /
 |--------------------|-------------|
 | `workflow_id` | class-level string; used as replica ID prefix |
 | `config` | dict forwarded from the group's config section (CM keys stripped) |
+| `_cm` | reference to the running `AsyncCampaignManager` (`None` if no CM) |
+| `_group_name` | name of this group in the CM (used by `_signal_done`) |
 | `asyncflow` | shared `WorkflowEngine` |
 | `policies` | list of Dragon `Policy` objects for assigned GPUs (empty on concurrent) |
 | `engine_dragon` | Dragon backend handle (`None` on concurrent) |
-| `_on_ready` | injected async callable; invoke via `_signal_ready()` |
-| `_signal_ready()` | fires the on-ready callback; no-op if not injected |
+| `_signal_done()` | broadcast signal to CM; adds +1 replica to all downstream groups; no-op without a CM |
+| `_trigger_dependent(name, replicas)` | explicitly queue N replicas of a named group; no-op without a CM |
 | `on_replica_done(replica_id, cm, state)` | post-replica hook; override as needed |

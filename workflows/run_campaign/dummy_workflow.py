@@ -57,7 +57,8 @@ class DDSimWorkflow(BaseWorkflow):
                 name=name,
                 asyncflow=asyncflow,
                 home_dir=str(home_base),
-                on_ready=self._on_ready,
+                _cm=self._cm,
+                _group_name=self._group_name,
                 policies=self.policies,
             )
         except Exception:

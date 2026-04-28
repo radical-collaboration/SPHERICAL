@@ -67,7 +67,8 @@ class MiniAppsWrapperWorkflow(BaseWorkflow):
                 asyncflow=asyncflow,
                 home_dir=str(home_base),
                 name=name,
-                on_ready=self._on_ready,
+                _cm=self._cm,
+                _group_name=self._group_name,
                 policies=self.policies,
             )
         except Exception:

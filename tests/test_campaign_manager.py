@@ -55,14 +55,25 @@ class RecordingWorkflow(BaseWorkflow):
         RecordingWorkflow.ran.append(replica_id)
 
 
-class SignalWorkflow(BaseWorkflow):
-    """Fires _signal_ready() immediately then finishes after a tiny sleep."""
+class SignalDoneWorkflow(BaseWorkflow):
+    """Fires _signal_done() immediately then finishes after a tiny sleep."""
 
-    workflow_id = "signal"
+    workflow_id = "signal_done"
 
     async def run(self, replica_id: str) -> None:
-        await self._signal_ready()
+        await self._signal_done()
         await asyncio.sleep(0.01)
+
+
+class TriggerWorkflow(BaseWorkflow):
+    """Triggers a dependent group named 'downstream' then finishes."""
+
+    workflow_id = "trigger"
+    dependent_name: str = "downstream"
+    dependent_replicas: int = 1
+
+    async def run(self, replica_id: str) -> None:
+        await self._trigger_dependent(self.dependent_name, replicas=self.dependent_replicas)
 
 
 class HookWorkflow(BaseWorkflow):
@@ -149,25 +160,25 @@ async def acm():
 
 
 class TestBaseWorkflow:
-    async def test_signal_ready_no_callback_is_noop(self):
+    async def test_signal_done_no_cm_is_noop(self):
         wf = NullWorkflow()
-        await wf._signal_ready()  # must not raise
+        await wf._signal_done()  # must not raise
 
-    async def test_signal_ready_calls_sync_callback(self):
-        called = []
-        wf = NullWorkflow(on_ready=lambda: called.append(1))
-        await wf._signal_ready()
-        assert called == [1]
+    async def test_trigger_dependent_no_cm_is_noop(self):
+        wf = NullWorkflow()
+        await wf._trigger_dependent("some_group", replicas=2)  # must not raise
 
-    async def test_signal_ready_awaits_async_callback(self):
-        called = []
+    async def test_signal_done_calls_cm(self):
+        cm_mock = AsyncMock()
+        wf = NullWorkflow(_cm=cm_mock, _group_name="mygroup")
+        await wf._signal_done()
+        cm_mock.signal_done.assert_awaited_once_with("mygroup")
 
-        async def cb():
-            called.append(1)
-
-        wf = NullWorkflow(on_ready=cb)
-        await wf._signal_ready()
-        assert called == [1]
+    async def test_trigger_dependent_calls_cm(self):
+        cm_mock = AsyncMock()
+        wf = NullWorkflow(_cm=cm_mock)
+        await wf._trigger_dependent("dep", replicas=3)
+        cm_mock.trigger_dependent.assert_awaited_once_with("dep", replicas=3)
 
     def test_base_run_raises_not_implemented(self):
         wf = BaseWorkflow()
@@ -258,9 +269,9 @@ class TestAsyncCampaignManager:
         b_idx = next(i for i, (wf, _) in enumerate(order) if wf == "B")
         assert all(wf == "A" for wf, _ in order[:b_idx])
 
-    async def test_dependency_via_signal_ready(self, acm):
-        """_signal_ready() unblocks B even before all of A's replicas finish."""
-        acm.register_group("a", SignalWorkflow, replicas=1)
+    async def test_dependency_via_signal_done(self, acm):
+        """_signal_done() unblocks B even before all of A's replicas finish."""
+        acm.register_group("a", SignalDoneWorkflow, replicas=1)
         acm.register_group(
             "b",
             NullWorkflow,
@@ -274,6 +285,25 @@ class TestAsyncCampaignManager:
         s = acm.status()
         assert s["groups"]["a"]["ready"] is True
         assert s["groups"]["b"]["status"] == "done"
+
+    async def test_trigger_dependent_activates_group(self, acm):
+        """Parent workflow calls _trigger_dependent to start a replicas=0 group."""
+        acm.register_group("upstream", TriggerWorkflow, replicas=1)
+        acm.register_group("downstream", RecordingWorkflow, replicas=0)
+        await acm.start()
+        assert await acm.wait(timeout=3.0)
+
+        s = acm.status()
+        assert s["groups"]["downstream"]["status"] == "done"
+        assert "downstream_0" in RecordingWorkflow.ran
+
+    async def test_untriggered_group_does_not_block_completion(self, acm):
+        """A replicas=0 group that is never triggered must not prevent _all_done."""
+        acm.register_group("a", NullWorkflow, replicas=1)
+        acm.register_group("never_triggered", NullWorkflow, replicas=0)
+        await acm.start()
+        assert await acm.wait(timeout=3.0)
+        assert acm.status()["groups"]["a"]["status"] == "done"
 
     async def test_on_replica_done_hook_called(self, acm):
         acm.register_group("a", HookWorkflow, replicas=2)
@@ -328,7 +358,8 @@ class TestAsyncCampaignManager:
         config = {
             "workflows": {
                 "x": {"replicas": 2, "max_replicas": 1, "priority": 3},
-                "y": {"replicas": 1, "dependencies": ["x"], "dependency_threshold": 2},
+                # y has dependencies → replicas defaults to 0 (triggered group)
+                "y": {"dependencies": ["x"], "dependency_threshold": 2},
             }
         }
         cm = AsyncCampaignManager.from_config(config, {"x": NullWorkflow, "y": NullWorkflow})
@@ -336,6 +367,7 @@ class TestAsyncCampaignManager:
         assert s["x"]["replicas_total"] == 2
         assert s["x"]["max_replicas"] == 1
         assert s["x"]["priority"] == 3
+        assert s["y"]["replicas_total"] == 0  # triggered group: not yet activated
         assert s["y"]["dependencies"] == ["x"]
         assert s["y"]["dep_threshold"] == 2
 
@@ -443,15 +475,20 @@ class TestCampaignManager:
         config = {
             "workflows": {
                 "alpha": {"replicas": 3, "max_replicas": 2, "priority": 7},
+                # beta has dependencies → replicas defaults to 0 (triggered group)
+                "beta": {"dependencies": ["alpha"]},
             }
         }
-        cm = CampaignManager.from_config(config, {"alpha": SyncRecordingWorkflow})
+        cm = CampaignManager.from_config(
+            config, {"alpha": SyncRecordingWorkflow, "beta": SyncRecordingWorkflow}
+        )
         s = cm.status()["groups"]
         cm.close()
         assert "alpha" in s
         assert s["alpha"]["replicas_total"] == 3
         assert s["alpha"]["max_replicas"] == 2
         assert s["alpha"]["priority"] == 7
+        assert s["beta"]["replicas_total"] == 0  # triggered group: not yet activated
 
     def test_unknown_group_skipped_in_from_config(self):
         config = {"workflows": {"ghost": {"replicas": 1}}}
