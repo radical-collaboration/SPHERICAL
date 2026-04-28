@@ -3,7 +3,7 @@
 Plot replica execution timeline from a campaign SLURM log.
 
 Usage:
-    python plot_replicas.py slurm-17715157.out [--out timeline.png]
+    python plot_cm_timeline.py slurm-XXXXXX.out [--out timeline.png]
 """
 
 import argparse
@@ -23,6 +23,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.gridspec as gridspec
+import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 
@@ -35,13 +36,16 @@ _GROUP_RE = re.compile(
     r"min=(\d+) max=(\d+) deps=\[([^\]]*)\] dep_threshold=(\d+) "
     r"resources=\(cpus=(\d+), gpus=(\d+)\)"
 )
-_GPU_ASSIGN_RE = re.compile(r"GPU assign: '(\w+)' \u2192 GPU\(s\) \[([^\]]*)\]")
-# "resources: cpus=USED/TOTAL  gpus=USED/TOTAL" from scheduler log
+_GPU_ASSIGN_RE = re.compile(r"GPU assign: '(\w+)' → GPU\(s\) \[([^\]]*)\]")
 _USAGE_RE = re.compile(r"resources: cpus=(\d+)/(\d+)\s+gpus=(\d+)/(\d+)")
-# "available: cpus=AVAIL/TOTAL  gpus=AVAIL/TOTAL" from replica-finished log
 _AVAIL_RE = re.compile(r"available: cpus=(\d+)/(\d+)\s+gpus=(\d+)/(\d+)")
 _TOTAL_RES_RE = re.compile(r"Resource pool: total_cpus=(\d+)\s+total_gpus=(\d+)")
-_READY_RE = re.compile(r"Group '(\w+)' signaled ready")
+
+# Signal events — new dependency model
+# "signal_done":     'md' signaled done → +1 replica for ['miniapps']
+# "trigger_dep":     trigger_dependent: 'dummy' +1 replicas (total=3)
+_SIGNAL_DONE_RE = re.compile(r"'(\w+)' signaled done.*?\+(\d+) replica.*?\['([\w,\s]*)'\]")
+_TRIGGER_DEP_RE = re.compile(r"trigger_dependent: '(\w+)' \+(\d+) replicas \(total=(\d+)\)")
 
 GROUP_COLORS = {
     "inference": "#4C72B0",
@@ -55,12 +59,16 @@ GROUP_ORDER = ["md", "miniapps", "inference", "dummy"]
 
 
 def parse_log(path: str):
-    """Parse SLURM log; return spans, group_meta, resource_timeline, gpu_assignments."""
+    """Parse SLURM log; return spans, group_meta, resource_timeline,
+    gpu_assignments, signal_events."""
     starts: dict[str, datetime] = {}
     spans = []
     group_meta = {}
     gpu_assignments = {}
-    resource_timeline = []  # (elapsed_s, used_cpus, total_cpus, used_gpus, total_gpus)
+    resource_timeline = []
+    # (elapsed_s, source_group, target_groups, n_replicas, kind)
+    # kind: "signal_done" | "trigger_dep"
+    signal_events = []
     t0_dt = None
     total_cpus = total_gpus = 0
 
@@ -74,7 +82,6 @@ def parse_log(path: str):
 
     with open(path) as fh:
         for raw in fh:
-            # Group registration lines (no timestamp required)
             if m := _GROUP_RE.search(raw):
                 name = m.group(1)
                 deps_raw = m.group(6)
@@ -102,6 +109,7 @@ def parse_log(path: str):
             dt = datetime.strptime(f"{date_ref} {ts_m.group(1)}", "%Y-%m-%d %H:%M:%S.%f")
             if t0_dt is None:
                 t0_dt = dt
+            elapsed = (dt - t0_dt).total_seconds()
 
             if m := _GPU_ASSIGN_RE.search(raw):
                 rid = m.group(1)
@@ -109,17 +117,37 @@ def parse_log(path: str):
                 gpu_ids = [int(x) for x in gpu_str.split(",") if x.strip()] if gpu_str else []
                 gpu_assignments[rid] = gpu_ids
 
-            # Resource usage from scheduler summary line
             if m := _USAGE_RE.search(raw):
-                uc, tc, ug, tg = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-                elapsed = (dt - t0_dt).total_seconds() if t0_dt else 0
+                uc, tc, ug, tg = (
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    int(m.group(3)),
+                    int(m.group(4)),
+                )
                 resource_timeline.append((elapsed, uc, tc, ug, tg))
-
-            # Resource available from replica-finished line (convert to used)
             elif m := _AVAIL_RE.search(raw):
-                ac, tc, ag, tg = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-                elapsed = (dt - t0_dt).total_seconds() if t0_dt else 0
+                ac, tc, ag, tg = (
+                    int(m.group(1)),
+                    int(m.group(2)),
+                    int(m.group(3)),
+                    int(m.group(4)),
+                )
                 resource_timeline.append((elapsed, tc - ac, tc, tg - ag, tg))
+
+            # Signal events — new dependency model
+            if m := _SIGNAL_DONE_RE.search(raw):
+                src = m.group(1)
+                n = int(m.group(2))
+                targets_raw = m.group(3)
+                targets = [t.strip().strip("'\"") for t in targets_raw.split(",") if t.strip()]
+                for tgt in targets:
+                    signal_events.append((elapsed, src, tgt, n, "signal_done"))
+
+            if m := _TRIGGER_DEP_RE.search(raw):
+                tgt = m.group(1)
+                n = int(m.group(2))
+                # Source unknown from log line — mark as "trigger_dep"
+                signal_events.append((elapsed, None, tgt, n, "trigger_dep"))
 
             if m := _START_RE.search(raw):
                 starts[m.group(1)] = dt
@@ -138,14 +166,31 @@ def parse_log(path: str):
         group = rid.rsplit("_", 1)[0]
         spans.append((rid, group, start, start, None))
 
-    # Sort resource timeline and deduplicate by elapsed
     resource_timeline.sort(key=lambda x: x[0])
+    signal_events.sort(key=lambda x: x[0])
 
     t0 = min(s[2] for s in spans) if spans else t0_dt
-    return spans, group_meta, resource_timeline, gpu_assignments, t0, (total_cpus, total_gpus)
+    return (
+        spans,
+        group_meta,
+        resource_timeline,
+        gpu_assignments,
+        signal_events,
+        t0,
+        (total_cpus, total_gpus),
+    )
 
 
-def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resources, out_path):
+def plot(
+    spans,
+    group_meta,
+    resource_timeline,
+    gpu_assignments,
+    signal_events,
+    t0,
+    total_resources,
+    out_path,
+):
     if not spans:
         print("No replica events found.", file=sys.stderr)
         return
@@ -188,7 +233,7 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
 
     # ── Gantt chart ──────────────────────────────────────────────────────────
     yticks, ylabels = [], []
-    group_row_ranges = {}  # group -> (first_row, last_row)
+    group_row_ranges = {}
 
     prev_group = None
     for row, (rid, group, start, end, ok) in enumerate(spans):
@@ -201,18 +246,15 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
         lw = 1.5 if ok is False else 0
         alpha = 0.45 if ok is None else 0.88
 
-        # Draw separator line between groups
         if group != prev_group and prev_group is not None:
             ax_gantt.axhline(row - 0.5, color="grey", lw=0.6, alpha=0.5, linestyle="--")
         prev_group = group
 
-        # Track row ranges per group
         if group not in group_row_ranges:
             group_row_ranges[group] = [row, row]
         else:
             group_row_ranges[group][1] = row
 
-        # Alternating background per group
         g_idx = GROUP_ORDER.index(group) if group in GROUP_ORDER else len(GROUP_ORDER)
         if g_idx % 2 == 0:
             ax_gantt.axhspan(row - 0.5, row + 0.5, color="grey", alpha=0.04, linewidth=0)
@@ -228,7 +270,6 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
             alpha=alpha,
         )
 
-        # Annotate bar with GPU assignment or CPU count
         gpu_ids = gpu_assignments.get(rid, [])
         meta = group_meta.get(group, {})
         if gpu_ids:
@@ -254,14 +295,15 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
         yticks.append(row)
         ylabels.append(rid)
 
-    # Group section labels on the right of the Gantt
+    # Group section labels on the right
     for group, (r0, r1) in group_row_ranges.items():
         meta = group_meta.get(group, {})
         mid = (r0 + r1) / 2
         pri = meta.get("priority", "?")
         cpus = meta.get("cpus", 0)
         gpus = meta.get("gpus", 0)
-        info = f"priority={pri}\ncpu={cpus}  gpu={gpus}"
+        mode = "dep." if meta.get("deps") else "indep."
+        info = f"priority={pri}\ncpu={cpus}  gpu={gpus}\n{mode}"
         ax_gantt.text(
             1.002,
             1.0 - (mid + 0.5) / n_rows,
@@ -274,48 +316,155 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
             fontweight="bold",
         )
 
-    # Build a lookup: group -> sorted list of (row, start, end, ok) for its spans
-    group_spans = {}
+    # Build group_spans lookup: group -> sorted list of (row, start_dt, end_dt, ok)
+    group_spans: dict[str, list] = {}
     for row, (_, group, start, end, ok) in enumerate(spans):
         group_spans.setdefault(group, []).append((row, start, end, ok))
 
-    # Dependency arrows:
-    #   tail  — midpoint of first dep-group replica bar (where signal_ready likely fires)
-    #   head  — start of first dependent-group replica bar
-    #   vline — trigger moment (start of first dependent replica)
+    # ── Dependency signal arrows ─────────────────────────────────────────────
+    # Each signal event gets its own arrow: signal point → triggered replica start.
+    consumed_tgt_rows: set[int] = set()
+    consumed_src_rows: set[int] = set()
+    # Round-robin counters for signal_done — distributes signals evenly across
+    # parallel replicas when the log doesn't record which replica sent each signal.
+    signal_done_rr: dict[str, int] = {}
+    # available target replicas per group, sorted by start time
+    available: dict[str, list] = {
+        g: sorted(sl, key=lambda s: s[1]) for g, sl in group_spans.items()
+    }
+
+    for sig_elapsed, src_group, tgt_group, _n, kind in signal_events:
+        if tgt_group not in available:
+            continue
+
+        # Find the earliest unconsumed target replica that starts at or after signal
+        tgt_span = None
+        for s in available[tgt_group]:
+            if s[0] not in consumed_tgt_rows and (s[1] - t0).total_seconds() >= sig_elapsed - 0.5:
+                tgt_span = s
+                break
+        if tgt_span is None:
+            continue
+        consumed_tgt_rows.add(tgt_span[0])
+
+        tgt_row = tgt_span[0]
+        tgt_start_t = (tgt_span[1] - t0).total_seconds()
+
+        # Determine the row to use for the signal source.
+        # For trigger_dep events src_group is None — infer from tgt_group's own
+        # dependency list (what tgt_group depends ON, not who depends on it).
+        resolved_src = src_group
+        if not resolved_src:
+            tgt_deps = group_meta.get(tgt_group, {}).get("deps", [])
+            resolved_src = tgt_deps[0] if tgt_deps else None
+
+        if resolved_src and resolved_src in group_row_ranges:
+            r0, r1 = group_row_ranges[resolved_src]
+            src_spans = group_spans.get(resolved_src, [])
+
+            if kind == "trigger_dep":
+                # Signal fires from on_replica_done — the source replica may not
+                # yet have its "finished" line in the log.  Find the closest
+                # unconsumed source replica by finish time, without a direction
+                # constraint.
+                candidates = [s for s in src_spans if s[0] not in consumed_src_rows]
+                if candidates:
+                    best = min(
+                        candidates,
+                        key=lambda s: abs((s[2] - t0).total_seconds() - sig_elapsed),
+                    )
+                    src_row = best[0]
+                    consumed_src_rows.add(best[0])
+                else:
+                    src_row = (r0 + r1) / 2
+            else:
+                # signal_done fires from within run() — multiple replicas may be
+                # running in parallel and the log doesn't record which sent it.
+                # Distribute signals round-robin across the running replicas.
+                running = [
+                    s
+                    for s in src_spans
+                    if (s[1] - t0).total_seconds()
+                    <= sig_elapsed
+                    <= (s[2] - t0).total_seconds() + 0.5
+                ]
+                if running:
+                    rr_idx = signal_done_rr.get(resolved_src, 0)
+                    src_row = running[rr_idx % len(running)][0]
+                    signal_done_rr[resolved_src] = rr_idx + 1
+                else:
+                    src_row = (r0 + r1) / 2
+
+            src_color = GROUP_COLORS.get(resolved_src, DEFAULT_COLOR)
+        else:
+            src_row = tgt_row - 1.5
+            src_color = GROUP_COLORS.get(tgt_group, DEFAULT_COLOR)
+
+        # Draw diamond marker at signal point on source row
+        ax_gantt.plot(
+            sig_elapsed,
+            src_row,
+            "D",
+            markersize=5,
+            color=src_color,
+            zorder=5,
+            markeredgecolor="white",
+            markeredgewidth=0.5,
+        )
+
+        # Draw arrow from signal diamond to triggered replica start
+        ax_gantt.annotate(
+            "",
+            xy=(tgt_start_t, tgt_row),
+            xytext=(sig_elapsed, src_row),
+            arrowprops=dict(
+                arrowstyle="->",
+                color="#555555",
+                lw=1.1,
+                connectionstyle="arc3,rad=0.25",
+            ),
+            annotation_clip=False,
+        )
+
+    # Fall back to a single structural arrow for deps with no logged signals
+    # (e.g. log truncated or dep_threshold path)
+    drawn_dep_pairs: set[tuple[str, str]] = set()
+    for _, src, tgt, _, kind in signal_events:
+        if src:
+            drawn_dep_pairs.add((src, tgt))
+        elif kind == "trigger_dep":
+            # src is None for trigger_dep log lines — resolve from tgt's dep list
+            tgt_deps = group_meta.get(tgt, {}).get("deps", [])
+            if tgt_deps:
+                drawn_dep_pairs.add((tgt_deps[0], tgt))
     for group, _ in group_row_ranges.items():
         meta = group_meta.get(group, {})
         for dep_name in meta.get("deps", []):
+            if (dep_name, group) in drawn_dep_pairs:
+                continue
             if dep_name not in group_spans or group not in group_spans:
                 continue
-
-            dep_first = group_spans[dep_name][0]  # (row, start, end, ok) of first dep replica
-            grp_first = group_spans[group][
-                0
-            ]  # (row, start, end, ok) of first replica of this group
-
+            dep_first = group_spans[dep_name][0]
+            grp_first = group_spans[group][0]
             dep_row, dep_start, dep_end, _ = dep_first
-            grp_row, grp_start, _grp_end, _ = grp_first
-
-            dep_bar_mid_t = (dep_start - t0).total_seconds()
+            grp_row, grp_start, _, _ = grp_first
+            dep_mid_t = (dep_start - t0).total_seconds()
             if dep_end != dep_start:
-                dep_bar_mid_t += ((dep_end - dep_start).total_seconds()) / 2
-
-            grp_bar_start_t = (grp_start - t0).total_seconds()
-
+                dep_mid_t += (dep_end - dep_start).total_seconds() / 2
+            grp_start_t = (grp_start - t0).total_seconds()
             ax_gantt.annotate(
                 "",
-                xy=(grp_bar_start_t, grp_row),  # head: start of first dependent replica
-                xytext=(dep_bar_mid_t, dep_row),  # tail: mid of first dep replica bar
+                xy=(grp_start_t, grp_row),
+                xytext=(dep_mid_t, dep_row),
                 arrowprops=dict(
                     arrowstyle="->",
-                    color="#555555",
-                    lw=1.3,
+                    color="#888888",
+                    lw=1.0,
                     connectionstyle="arc3,rad=0.35",
+                    linestyle="dashed",
                 ),
                 annotation_clip=False,
             )
-            ax_gantt.axvline(grp_bar_start_t, color="#555555", lw=0.6, linestyle=":", alpha=0.5)
 
     ax_gantt.set_yticks(yticks)
     ax_gantt.set_yticklabels(ylabels, fontsize=7)
@@ -328,6 +477,15 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
     legend_patches += [
         mpatches.Patch(facecolor="white", edgecolor="red", linewidth=1.2, label="error"),
         mpatches.Patch(color="grey", alpha=0.45, label="still running"),
+        mlines.Line2D(
+            [0],
+            [0],
+            marker="D",
+            color="w",
+            markerfacecolor="#666666",
+            markersize=6,
+            label="signal / trigger",
+        ),
     ]
     ax_gantt.legend(handles=legend_patches, loc="lower right", fontsize=7, framealpha=0.8)
 
@@ -340,19 +498,12 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
             g for g in group_meta if g not in GROUP_ORDER
         ]
 
-        col_labels = [
-            "Work\nflow",
-            "Priority",
-            "CPUs",
-            "GPUs",
-            "min/max\nreplicas",
-            "Total\nreplicas",
-            "Deps",
-        ]
+        col_labels = ["Workflow", "Priority", "CPUs", "GPUs", "min/max", "Mode", "Deps"]
         rows_data, row_colors = [], []
         for gname in info_groups:
             m = group_meta[gname]
             deps = ", ".join(m.get("deps", [])) or "—"
+            mode = "dep." if m.get("deps") else "indep."
             rows_data.append(
                 [
                     gname,
@@ -360,7 +511,7 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
                     str(m.get("cpus", 0)),
                     str(m.get("gpus", 0)),
                     f"{m.get('min', 0)}/{m.get('max', 0)}",
-                    str(m.get("replicas", "?")),
+                    mode,
                     deps,
                 ]
             )
@@ -378,25 +529,30 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
         tbl.set_fontsize(7.5)
         tbl.scale(1.0, 1.5)
 
-        # Style header row
         for j in range(len(col_labels)):
             tbl[0, j].set_facecolor("#333333")
             tbl[0, j].set_text_props(color="white", fontweight="bold")
 
-        # Dependency chain text
-        dep_chains = []
+        # Signal-based dependency graph
+        dep_lines = []
+        # Collect unique dep relationships with signal counts
+        sig_counts: dict[tuple[str, str], int] = {}
+        for _, src, tgt, n, _kind in signal_events:
+            if src:
+                sig_counts[(src, tgt)] = sig_counts.get((src, tgt), 0) + n
+
         for gname in info_groups:
             m = group_meta[gname]
-            deps = m.get("deps", [])
-            if deps:
-                thr = m.get("dep_threshold", 1)
-                dep_chains.append(f"  {', '.join(deps)} →(≥{thr}) {gname}")
+            for dep_name in m.get("deps", []):
+                count = sig_counts.get((dep_name, gname), 0)
+                count_str = f" ×{count}" if count else ""
+                dep_lines.append(f"  {dep_name} —signals→ {gname}{count_str}")
 
-        if dep_chains:
-            dep_str = "Dependency graph:\n" + "\n".join(dep_chains)
+        if dep_lines:
+            dep_str = "Dependency graph (signals):\n" + "\n".join(dep_lines)
             ax_info.text(
                 0.5,
-                0.2,
+                0.22,
                 dep_str,
                 transform=ax_info.transAxes,
                 va="bottom",
@@ -406,21 +562,26 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
                 bbox=dict(boxstyle="round,pad=0.5", facecolor="#f0f4ff", edgecolor="#aabbdd"),
             )
 
-        # Scheduling logic note
         sched_note = (
+            "Dependency model:\n"
+            "  Independent: starts on cm.start()\n"
+            "  Dependent: waits for upstream signal\n"
+            "    ◆ _signal_done() → +1 replica per\n"
+            "      downstream group in dependencies\n"
+            "    ◆ _trigger_dependent() → explicit N\n"
+            "\n"
             "Scheduler:\n"
-            "  Pass 1: guarantee min replicas (by priority)\n"
-            "Pass 2: fill up to max replicas (by priority)\n"
-            "Blocked by: resource limits & unmet deps"
+            "  Pass 1: guarantee min replicas (priority)\n"
+            "  Pass 2: fill up to max replicas (priority)"
         )
         ax_info.text(
             0.5,
-            0.5,
+            0.52,
             sched_note,
             transform=ax_info.transAxes,
             va="bottom",
             ha="center",
-            fontsize=9,
+            fontsize=8,
             bbox=dict(boxstyle="round,pad=0.5", facecolor="#fffbe6", edgecolor="#ccaa00"),
         )
 
@@ -449,6 +610,11 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
         ax_res.set_ylabel("GPUs in use", color="#4C72B0", fontsize=8)
         ax_res.tick_params(axis="y", labelcolor="#4C72B0", labelsize=7)
         ax_res.set_ylim(bottom=0)
+
+        # Mark signal events on resource plot
+        for sig_elapsed, src, tgt, _n, _kind in signal_events:
+            color = GROUP_COLORS.get(src or tgt, "#888888")
+            ax_res.axvline(sig_elapsed, color=color, lw=0.7, alpha=0.5, linestyle=":")
 
         ax_cpu = ax_res.twinx()
         ax_cpu.step(times, used_cpus, where="post", color="#DD8452", lw=1.8, label="CPUs used")
@@ -482,7 +648,7 @@ def plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resour
 
 
 def parse_config(path: str) -> dict:
-    """Load group_meta from a campaign config.yaml (authoritative source)."""
+    """Load group_meta from a campaign config.yaml."""
     if not _HAVE_YAML:
         print("PyYAML not installed — falling back to log-parsed group metadata", file=sys.stderr)
         return {}
@@ -490,8 +656,10 @@ def parse_config(path: str) -> dict:
         cfg = yaml.safe_load(fh)
     group_meta = {}
     for name, wf in cfg.get("workflows", {}).items():
+        has_deps = bool(wf.get("dependencies", []))
+        default_replicas = 0 if has_deps else 1
         group_meta[name] = {
-            "replicas": int(wf.get("replicas", 1)),
+            "replicas": int(wf.get("replicas", default_replicas)),
             "priority": int(wf.get("priority", 0)),
             "min": int(wf.get("min_replicas", 0)),
             "max": int(wf.get("max_replicas", 0)),
@@ -504,38 +672,40 @@ def parse_config(path: str) -> dict:
 
 
 def _default_out(log_path: str) -> str:
-    stem = Path(log_path).stem  # e.g. "slurm-17716610"
+    stem = Path(log_path).stem
     m = re.search(r"(\d+)", stem)
     run_num = m.group(1) if m else stem
-    return f"replica_timeline_{run_num}.png"
+    return f"cm_timeline_{run_num}.png"
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Plot campaign manager replica timeline")
     parser.add_argument("log", help="SLURM output file")
     parser.add_argument(
         "--config",
         default=None,
-        help="Campaign config.yaml (authoritative source for group metadata). "
-        "Auto-detected as config.yaml next to the log file if not given.",
+        help="Campaign config.yaml (auto-detected as config.yaml next to log if not given)",
     )
-    parser.add_argument(
-        "--out", default=None, help="Output PNG (default: replica_timeline_<run>.png)"
-    )
+    parser.add_argument("--out", default=None, help="Output PNG (default: cm_timeline_<run>.png)")
     args = parser.parse_args()
 
     if args.out is None:
         args.out = _default_out(args.log)
 
-    # Auto-detect config.yaml next to the log file
     if args.config is None:
         candidate = Path(args.log).parent / "config.yaml"
         if candidate.exists():
             args.config = str(candidate)
 
-    spans, group_meta_log, resource_timeline, gpu_assignments, t0, total_resources = parse_log(
-        args.log
-    )
+    (
+        spans,
+        group_meta_log,
+        resource_timeline,
+        gpu_assignments,
+        signal_events,
+        t0,
+        total_resources,
+    ) = parse_log(args.log)
 
     if args.config:
         group_meta = parse_config(args.config)
@@ -548,12 +718,20 @@ def main():
         f"Parsed {len(spans)} replica spans, "
         f"{len(group_meta)} groups, "
         f"{len(resource_timeline)} resource events, "
-        f"{len(gpu_assignments)} GPU assignments"
+        f"{len(gpu_assignments)} GPU assignments, "
+        f"{len(signal_events)} signal events"
     )
-    plot(spans, group_meta, resource_timeline, gpu_assignments, t0, total_resources, args.out)
+    plot(
+        spans,
+        group_meta,
+        resource_timeline,
+        gpu_assignments,
+        signal_events,
+        t0,
+        total_resources,
+        args.out,
+    )
 
 
 if __name__ == "__main__":
     main()
-
-# python plot_replicas.py slurm-17715157.out --out replica_timeline.png

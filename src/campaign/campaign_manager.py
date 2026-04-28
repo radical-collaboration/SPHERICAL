@@ -14,9 +14,10 @@ The CM runs a two-pass greedy scheduler on every state change:
   Pass 2 — fill remaining capacity up to ``max_replicas`` (highest priority
             first).
 
-A group becomes *eligible* when each dependency group has either explicitly
-called ``signal_ready()`` (workflow-driven) or has ``dep_threshold`` or more
-finished replicas (count-based fallback, default 1).
+A group becomes *eligible* either when a parent workflow calls
+``_trigger_dependent()`` (explicit activation) or when each dependency group
+has ``dep_threshold`` or more finished replicas / has called ``_signal_done()``
+(count-based fallback, default 1).
 
 Usage
 -----
@@ -122,14 +123,16 @@ class BaseWorkflow:
     def __init__(
         self,
         config: Optional[dict] = None,
-        on_ready: Optional[object] = None,
+        _cm: Optional[object] = None,
+        _group_name: Optional[str] = None,
         asyncflow: Optional[object] = None,
         policies: Optional[list] = None,
         engine_dragon: Optional[object] = None,
     ) -> None:
         self.config = config
-        # Async callable injected by AsyncCampaignManager; invoke via _signal_ready().
-        self._on_ready = on_ready
+        # AsyncCampaignManager reference injected at construction.
+        self._cm = _cm
+        self._group_name = _group_name
         # Shared WorkflowEngine injected by AsyncCampaignManager (optional).
         self.asyncflow = asyncflow
         # One Dragon Policy per assigned GPU, injected by AsyncCampaignManager.
@@ -138,20 +141,34 @@ class BaseWorkflow:
         # Dragon backend handle for routing tasks to specific backends.
         self.engine_dragon: Optional[object] = engine_dragon
 
-    async def _signal_ready(self) -> None:
+    async def _trigger_dependent(
+        self,
+        name: str,
+        replicas: int = 1,
+        **kwargs,
+    ) -> None:
         """
-        Signal the CM that this workflow has produced enough data for its
-        dependents to start.
+        Tell the CM to activate a dependent workflow group with *replicas* replicas.
 
-        Calls the ``on_ready`` coroutine injected by the CM at construction.
-        No-op if no callback was provided.
+        The group must already be registered (via config or register_group) with
+        ``replicas=0``.  Calling this mid-run is the canonical way to start a
+        workflow that depends on data produced by the current workflow.
+        No-op when no CM was injected.
         """
-        import asyncio
+        if self._cm is not None:
+            await self._cm.trigger_dependent(name, replicas=replicas, **kwargs)
 
-        if self._on_ready is not None:
-            result = self._on_ready()
-            if asyncio.iscoroutine(result):
-                await result
+    async def _signal_done(self) -> None:
+        """
+        Signal the CM that this workflow has finished producing data for
+        its dependents (count-based dependency fallback).
+
+        Marks this group ``ready=True`` in the CM, which unblocks any groups
+        that list this one as a dependency with ``dep_threshold > finished_replicas``.
+        No-op when no CM was injected.
+        """
+        if self._cm is not None and self._group_name is not None:
+            await self._cm.signal_done(self._group_name)
 
     def run(self, replica_id: str) -> None:
         """
@@ -387,10 +404,14 @@ class AsyncCampaignManager:
                 cm._log.warning(f"from_config: no class registered for {name!r} — skipping")
                 continue
 
+            # Groups with dependencies default to replicas=0 — they remain
+            # inactive until a parent workflow calls _trigger_dependent().
+            has_deps = bool(wf_cfg.get("dependencies", []))
+            default_replicas = 0 if has_deps else 1
             cm.register_group(
                 name=name,
                 workflow_class=wf_class,
-                replicas=int(wf_cfg.get("replicas", 1)),
+                replicas=int(wf_cfg.get("replicas", default_replicas)),
                 dependencies=list(wf_cfg.get("dependencies", [])),
                 dep_threshold=int(wf_cfg.get("dependency_threshold", 1)),
                 priority=int(wf_cfg.get("priority", 0)),
@@ -637,22 +658,65 @@ class AsyncCampaignManager:
     # Monitoring
     # ------------------------------------------------------------------
 
-    async def signal_ready(self, group_name: str) -> None:
+    async def signal_done(self, group_name: str) -> None:
         """
-        Mark *group_name* as having produced enough data for its dependents.
+        Signal that *group_name* has produced output and downstream work should run.
 
-        Called by a workflow via ``self._signal_ready()`` (injected at construction).
-        Once set, the flag overrides the ``dep_threshold`` replica-count check so
-        dependent groups are unblocked immediately.
+        Called by a workflow via ``self._signal_done()`` — can be called multiple
+        times per replica (e.g. once per iteration).  Each call queues **1 more
+        replica** in every group that lists *group_name* in its ``dependencies``.
+        The CM routes the signal to the right downstream groups automatically, so
+        the calling workflow does not need to know their names.
 
-        Idempotent — subsequent calls for the same group are no-ops.
+        Also sets ``group.ready = True`` to satisfy count-based dep checks.
         """
         async with self._lock:
             group = self._groups.get(group_name)
-            if group is None or group.ready:
+            if group is None:
                 return
             group.ready = True
-            self._log.info(f"Group {group_name!r} signaled ready — unblocking dependents")
+            dependents = [g for g in self._groups.values() if group_name in g.dependencies]
+            for dep in dependents:
+                dep.replicas += 1
+                dep.configured_replicas += 1
+                if dep.status == "done":
+                    dep.status = "pending"
+            if dependents:
+                self._log.info(
+                    f"{group_name!r} signaled done → +1 replica for {[d.name for d in dependents]}"
+                )
+        await self._schedule()
+
+    async def trigger_dependent(
+        self,
+        name: str,
+        replicas: int = 1,
+        config: Optional[dict] = None,
+    ) -> None:
+        """
+        Queue *replicas* more runs of the dependent group *name*.
+
+        Called by a parent workflow (via ``self._trigger_dependent()``) each
+        time its execution logic decides to launch downstream work.  May be
+        called multiple times — each call adds *replicas* to the group's
+        total and re-opens the group for scheduling if it had already finished.
+
+        The group must be pre-registered (via config or ``register_group``).
+        """
+        async with self._lock:
+            group = self._groups.get(name)
+            if group is None:
+                self._log.warning(f"trigger_dependent: group {name!r} not registered — ignoring")
+                return
+            group.replicas += replicas
+            group.configured_replicas += replicas
+            if group.status == "done":
+                group.status = "pending"
+            if config:
+                group.group_config = {**(group.group_config or {}), **config}
+            self._log.info(
+                f"trigger_dependent: {name!r} +{replicas} replicas (total={group.replicas})"
+            )
         await self._schedule()
 
     async def add_replicas(self, group_name: str, n: int = 1) -> None:
@@ -739,7 +803,11 @@ class AsyncCampaignManager:
             return False
         if group.started_count >= group.replicas:
             return False
-        if group.running_count >= group.max_replicas:
+        # max_replicas == 0 means "no explicit cap — use replicas count".
+        # This handles dependent groups registered with replicas=0 that later
+        # receive replicas via trigger_dependent() or signal_done().
+        effective_max = group.max_replicas if group.max_replicas > 0 else group.replicas
+        if group.running_count >= effective_max:
             return False
         if not self._deps_satisfied_locked(group):
             return False
@@ -816,7 +884,7 @@ class AsyncCampaignManager:
         for g in eligible:
             if (
                 g.started_count < g.replicas
-                and g.running_count < g.max_replicas
+                and g.running_count < (g.max_replicas if g.max_replicas > 0 else g.replicas)
                 and self._deps_satisfied_locked(g)
                 and not self._resources.can_fit(g.required_cpus, g.required_gpus)
             ):
@@ -901,7 +969,8 @@ class AsyncCampaignManager:
             }
         wf = group.workflow_class(
             config=replica_config,
-            on_ready=lambda: self.signal_ready(group.name),
+            _cm=self,
+            _group_name=group.name,
             asyncflow=self._asyncflow,
             policies=policies,
             engine_dragon=self._engine_dragon,
@@ -1005,7 +1074,13 @@ class AsyncCampaignManager:
         await self._schedule()
 
         async with self._lock:
-            all_done = bool(self._groups) and all(g.status == "done" for g in self._groups.values())
+            # Groups registered with replicas=0 (triggered dependents not yet activated)
+            # are excluded from the completion check — they only count once triggered.
+            all_done = (
+                bool(self._groups)
+                and all(g.status == "done" or g.replicas == 0 for g in self._groups.values())
+                and any(g.replicas > 0 for g in self._groups.values())
+            )
 
         if all_done:
             self._all_done.set()
@@ -1131,10 +1206,12 @@ class CampaignManager:
             wf_class = workflow_registry.get(name)
             if wf_class is None:
                 continue
+            has_deps = bool(wf_cfg.get("dependencies", []))
+            default_replicas = 0 if has_deps else 1
             cm.register_group(
                 name=name,
                 workflow_class=wf_class,
-                replicas=int(wf_cfg.get("replicas", 1)),
+                replicas=int(wf_cfg.get("replicas", default_replicas)),
                 dependencies=list(wf_cfg.get("dependencies", [])),
                 dep_threshold=int(wf_cfg.get("dependency_threshold", 1)),
                 priority=int(wf_cfg.get("priority", 0)),
