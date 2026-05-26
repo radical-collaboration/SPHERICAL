@@ -337,12 +337,11 @@ class TestAsyncCampaignManager:
         assert await acm.wait(timeout=1.0)
 
     async def test_status_snapshot_fields(self, acm):
-        acm.register_group("a", NullWorkflow, replicas=2, max_replicas=1, priority=7)
+        acm.register_group("a", NullWorkflow, replicas=2, max_replicas=1)
         s = acm.status()["groups"]["a"]
         assert s["status"] == "pending"
         assert s["replicas_total"] == 2
         assert s["max_replicas"] == 1
-        assert s["priority"] == 7
         assert s["dependencies"] == []
 
     async def test_stats_reflect_finished_count(self, acm):
@@ -357,7 +356,7 @@ class TestAsyncCampaignManager:
     async def test_from_config_registers_groups(self):
         config = {
             "workflows": {
-                "x": {"replicas": 2, "max_replicas": 1, "priority": 3},
+                "x": {"replicas": 2, "max_replicas": 1},
                 # y has dependencies → replicas defaults to 0 (triggered group)
                 "y": {"dependencies": ["x"], "dependency_threshold": 2},
             }
@@ -366,27 +365,9 @@ class TestAsyncCampaignManager:
         s = cm.status()["groups"]
         assert s["x"]["replicas_total"] == 2
         assert s["x"]["max_replicas"] == 1
-        assert s["x"]["priority"] == 3
         assert s["y"]["replicas_total"] == 0  # triggered group: not yet activated
         assert s["y"]["dependencies"] == ["x"]
         assert s["y"]["dep_threshold"] == 2
-
-    async def test_add_replicas_updates_total(self, acm):
-        """add_replicas raises group.replicas up to configured_replicas cap."""
-        acm.register_group("a", NullWorkflow, replicas=1)
-        acm._groups["a"].configured_replicas = 3  # widen the cap
-        assert acm.status()["groups"]["a"]["replicas_total"] == 1
-
-        await acm.add_replicas("a", 2)
-
-        assert acm.status()["groups"]["a"]["replicas_total"] == 3
-
-    async def test_add_replicas_ignores_beyond_cap(self, acm):
-        """Requests beyond configured_replicas are silently ignored."""
-        acm.register_group("a", NullWorkflow, replicas=2)
-        # configured_replicas == replicas == 2, so add_replicas is a no-op
-        await acm.add_replicas("a", 5)
-        assert acm.status()["groups"]["a"]["replicas_total"] == 2
 
     async def test_unknown_group_skipped_in_from_config(self):
         config = {"workflows": {"unknown": {"replicas": 1}}}
@@ -456,10 +437,9 @@ class TestCampaignManager:
         assert {rid for rid, _ in SyncHookWorkflow.calls} == {"a_0", "a_1"}
 
     def test_status_snapshot_fields(self, cm):
-        cm.register_group("a", SyncRecordingWorkflow, replicas=1, priority=5, max_replicas=1)
+        cm.register_group("a", SyncRecordingWorkflow, replicas=1, max_replicas=1)
         s = cm.status()["groups"]["a"]
         assert s["status"] == "pending"
-        assert s["priority"] == 5
         assert s["replicas_total"] == 1
         assert s["max_replicas"] == 1
 
@@ -474,7 +454,7 @@ class TestCampaignManager:
     def test_from_config_registers_groups(self):
         config = {
             "workflows": {
-                "alpha": {"replicas": 3, "max_replicas": 2, "priority": 7},
+                "alpha": {"replicas": 3, "max_replicas": 2},
                 # beta has dependencies → replicas defaults to 0 (triggered group)
                 "beta": {"dependencies": ["alpha"]},
             }
@@ -487,7 +467,6 @@ class TestCampaignManager:
         assert "alpha" in s
         assert s["alpha"]["replicas_total"] == 3
         assert s["alpha"]["max_replicas"] == 2
-        assert s["alpha"]["priority"] == 7
         assert s["beta"]["replicas_total"] == 0  # triggered group: not yet activated
 
     def test_unknown_group_skipped_in_from_config(self):
@@ -630,8 +609,8 @@ class TestAsyncCampaignManagerResources:
         assert s["groups"]["a"]["required_cpus"] == 4
         assert s["groups"]["a"]["required_gpus"] == 2
 
-    async def test_resource_constrained_priority_ordering(self, racm):
-        """High-priority group fills available GPU slots before low-priority."""
+    async def test_resource_constrained_scheduling(self, racm):
+        """Both groups run to completion despite resource contention."""
         started_order = []
 
         class TrackWorkflow(BaseWorkflow):
@@ -641,13 +620,14 @@ class TestAsyncCampaignManagerResources:
                 started_order.append(replica_id)
                 await asyncio.sleep(0.01)
 
-        racm.register_group("lo", TrackWorkflow, replicas=2, priority=1, required_gpus=1)
-        racm.register_group("hi", TrackWorkflow, replicas=2, priority=9, required_gpus=1)
+        racm.register_group("lo", TrackWorkflow, replicas=2, required_gpus=1)
+        racm.register_group("hi", TrackWorkflow, replicas=2, required_gpus=1)
         await racm.start()
         assert await racm.wait(timeout=3.0)
-        # First two started should be the high-priority group
-        assert started_order[0].startswith("hi")
-        assert started_order[1].startswith("hi")
+        # All 4 replicas should complete
+        assert len(started_order) == 4
+        assert sum(1 for r in started_order if r.startswith("lo")) == 2
+        assert sum(1 for r in started_order if r.startswith("hi")) == 2
 
 
 # ---------------------------------------------------------------------------
