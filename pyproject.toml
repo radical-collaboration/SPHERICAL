@@ -8,10 +8,10 @@ version = "0.1.0"
 description = "Multi-GPU Inference Service Framework with Worker Pool Management"
 
 authors = [
-    {name = "Masha", email = "masha@example.com"},
+    {name = "Masha", email = "mg2347@soe.rutgers.edu"},
 ]
 maintainers = [
-    {name = "Masha", email = "masha@example.com"},
+    {name = "Masha", email = "mg2347@soe.rutgers.edu"},
 ]
 readme = "README.md"
 requires-python = ">=3.10"

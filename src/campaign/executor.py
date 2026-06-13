@@ -6,11 +6,11 @@ state (``_groups``, ``_resources``, ``_sharders``, ``_monitor``, ``_log``).
 """
 
 import asyncio
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from .backpressure import BPState
 from .gpu import make_policies
-from .types import _GroupInfo
+from .types import _WorkflowInfo
 
 if TYPE_CHECKING:
     from .base_workflow import BaseWorkflow
@@ -41,144 +41,293 @@ def _campaign_complete(groups: dict, sharders: dict) -> bool:
 
 class ExecutorMixin:
 
-    async def _run_replica(self, group: _GroupInfo, replica_idx: int) -> None:
-        """Execute one replica of a workflow group."""
+    async def _run_replica(self, group: _WorkflowInfo, replica_idx: int) -> None:
+        """Execute one replica of a workflow group.
+
+        Wrapped in try/finally so _handle_replica_done always runs, even when
+        workflow construction, getattr(entry), or any setup step raises.
+        Without this guard, an exception before entry() would leak the CPU
+        and GPU resources allocated by _allocate_locked and never decrement
+        running_count, eventually deadlocking the group.
+        """
         replica_id = f"{group.name}_{replica_idx}"
         final_state = "done"
+        wf: "Optional[BaseWorkflow]" = None
 
-        gpu_ids = self._replica_gpu_assignments.get(replica_id, [])
-        policies = make_policies(self._gpu_pool, gpu_ids)
+        try:
+            gpu_ids = self._replica_gpu_assignments.get(replica_id, [])
+            policies = make_policies(self._gpu_pool, gpu_ids)
 
-        res_tag = ""
-        if group.required_cpus > 0 or group.required_gpus > 0:
-            res_tag = f" [cpus={group.required_cpus} gpus={group.required_gpus}]"
-        if gpu_ids:
-            host = self._gpu_pool[0][0] if self._gpu_pool else "?"
-            res_tag += f" [gpu_affinity={gpu_ids} host={host}]"
-        self._log.info(f"  starting replica {replica_id!r}{res_tag}")
+            res_tag = ""
+            if group.required_cpus > 0 or group.required_gpus > 0 or group.required_memory_gb > 0:
+                res_tag = (
+                    f" [cpus={group.required_cpus} gpus={group.required_gpus}"
+                    + (f" mem={group.required_memory_gb}GB" if group.required_memory_gb > 0 else "")
+                    + "]"
+                )
+            if gpu_ids:
+                host = self._gpu_pool[0][0] if self._gpu_pool else "?"
+                res_tag += f" [gpu_affinity={gpu_ids} host={host}]"
+            self._log.info(f"  starting replica {replica_id!r}{res_tag}")
 
-        # Build per-replica config: start from group config, layer in GPU and candidate info.
-        replica_config = group.group_config
-        if gpu_ids:
-            replica_config = {
-                **(replica_config or {}),
-                "assigned_gpu_ids": gpu_ids,
-                "group_gpu_ids": list(group.running_gpu_ids),
-            }
-        candidate_id = self._replica_candidate_assignments.pop(replica_id, None)
-        score = None
-        if candidate_id and self._candidate_log:
-            h = self._candidate_log.get(candidate_id)
-            if h:
-                score = h.latest_score
+            # Build per-replica config: start from group config, layer in GPU and candidate info.
+            replica_config = group.workflow_config
+            if gpu_ids:
                 replica_config = {
                     **(replica_config or {}),
-                    "candidate_id":       candidate_id,
-                    "candidate_score":    h.latest_score,       # upstream quality score
-                    "candidate_surr":     h.latest_surrogate_pred,  # surrogate model prediction
-                    "candidate_surr_unc": h.latest_surrogate_unc,   # surrogate uncertainty
-                    "candidate_scaffold": h.scaffold_class,          # chemical scaffold class
+                    "assigned_gpu_ids": gpu_ids,
+                    "group_gpu_ids": list(group.running_gpu_ids),
                 }
-            else:
-                replica_config = {**(replica_config or {}), "candidate_id": candidate_id}
-        self._metrics.record_replica_start(group.name, replica_id, candidate_id=candidate_id, score=score)
-        wf = group.workflow_class(
-            config=replica_config,
-            _cm=self,
-            _group_name=group.name,
-            asyncflow=self._asyncflow,
-            policies=policies,
-            engine_dragon=self._engine_dragon,
-        )
+            candidate_id = self._replica_candidate_assignments.pop(replica_id, None)
+            score = None
+            if candidate_id and self._candidate_log:
+                h = self._candidate_log.get(candidate_id)
+                if h:
+                    score = h.latest_score
+                    # ADVANCE flag: Triage stamped the latest StageResult
+                    # decision="triaged_advance" when this candidate's
+                    # surrogate prediction cleared advance_threshold at low
+                    # uncertainty.  Workflows that honour the flag skip the
+                    # expensive computation and pass through with the
+                    # predicted score (dreamer skips its simulated sleep).
+                    triage_advance = bool(
+                        h.results
+                        and h.results[-1].decision == "triaged_advance"
+                    )
+                    replica_config = {
+                        **(replica_config or {}),
+                        "candidate_id":             candidate_id,
+                        "candidate_score":          h.latest_score,
+                        "candidate_surr":           h.latest_surrogate_pred,
+                        "candidate_surr_unc":       h.latest_surrogate_unc,
+                        "candidate_scaffold":       h.scaffold_class,
+                        "candidate_triage_advance": triage_advance,
+                    }
+                else:
+                    replica_config = {**(replica_config or {}), "candidate_id": candidate_id}
+            self._metrics.record_replica_start(group.name, replica_id, candidate_id=candidate_id, score=score)
 
-        entry = getattr(wf, group.entry_point)
-        try:
-            if asyncio.iscoroutinefunction(entry):
-                await entry(replica_id)
-            else:
-                await asyncio.to_thread(entry, replica_id)
+            wf = group.workflow_class(
+                config=replica_config,
+                _cm=self,
+                _group_name=group.name,
+                asyncflow=self._asyncflow,
+                policies=policies,
+                engine_dragon=self._engine_dragon,
+            )
+            entry = getattr(wf, group.entry_point)
+
+            try:
+                if asyncio.iscoroutinefunction(entry):
+                    await entry(replica_id)
+                else:
+                    await asyncio.to_thread(entry, replica_id)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                self._log.error(f"Replica {replica_id!r} raised: {type(exc).__name__}: {exc}")
+                final_state = "failed"
         except asyncio.CancelledError:
+            final_state = "failed"
             raise
         except BaseException as exc:
-            self._log.error(f"Replica {replica_id!r} raised: {type(exc).__name__}: {exc}")
+            # Setup, construction, or getattr(entry) failed before the entry
+            # point ran.  Mark failed and fall through to the finally block
+            # so resources still get released.
+            self._log.error(
+                f"Replica {replica_id!r} setup failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
             final_state = "failed"
-
-        await self._handle_replica_done(wf, group, replica_id, replica_idx, final_state)
+        finally:
+            try:
+                await self._handle_replica_done(
+                    wf, group, replica_id, replica_idx, final_state
+                )
+            except Exception as exc:
+                import traceback as _tb, sys as _sys
+                _tb.print_exc(file=_sys.stderr)
+                _sys.stderr.flush()
+                self._log.error(
+                    f"Replica {replica_id!r} cleanup raised: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     async def _handle_replica_done(
         self,
-        wf: "BaseWorkflow",
-        group: _GroupInfo,
+        wf: "Optional[BaseWorkflow]",
+        group: _WorkflowInfo,
         replica_id: str,
         replica_idx: int,
         final_state: str,
     ) -> None:
-        """Call workflow hook, then update group state and re-schedule."""
-        try:
-            hook = wf.on_replica_done
-            if asyncio.iscoroutinefunction(hook):
-                await hook(replica_id, self, final_state)
-            else:
-                hook(replica_id, self, final_state)
-        except Exception as exc:
-            self._log.error(f"Replica {replica_id!r} on_replica_done raised: {exc}")
+        """Call workflow hook, then update group state and re-schedule.
+
+        wf is None when workflow construction failed before the instance was
+        built; in that case the on_replica_done hook is skipped and we go
+        straight to resource release via _on_replica_finished.
+        """
+        if wf is not None:
+            try:
+                hook = wf.on_replica_done
+                if asyncio.iscoroutinefunction(hook):
+                    await hook(replica_id, self, final_state)
+                else:
+                    hook(replica_id, self, final_state)
+            except Exception as exc:
+                self._log.error(f"Replica {replica_id!r} on_replica_done raised: {exc}")
 
         self._metrics.record_replica_finish(group.name, replica_id, final_state)
         await self._on_replica_finished(group, replica_id)
 
-    async def _on_replica_finished(self, group: _GroupInfo, replica_id: str) -> None:
-        """Update group counters, notify sharders, run monitor, then re-schedule."""
-        group_done = False
-        async with self._lock:
-            group.finished_replicas += 1
-            group.running_count -= 1
-            self._resources.release(group.required_cpus, group.required_gpus)
-            self._stats[group.name].replicas_finished = group.finished_replicas
+    def _propagate_status_done_locked(self) -> list[str]:
+        """Mark all groups whose replicas are complete AND deps are done.
 
-            if group.finished_replicas >= group.replicas:
-                # Dependent groups receive triggers incrementally while their
-                # upstream runs, so finished==replicas fires spuriously after
-                # every single completion (e.g. 1/1 when only 1 trigger has
-                # arrived and more are still coming).  Only mark truly done
-                # when all upstream dependencies are also done — i.e., no
-                # more triggers can arrive from them.
-                deps_done = not group.dependencies or all(
-                    self._groups.get(d) is not None
-                    and self._groups[d].status == "done"
-                    for d in group.dependencies
+        Iterates until no more transitions happen, so a single upstream
+        completion can cascade status="done" through any number of
+        downstream groups that were waiting only on that upstream.
+
+        Returns the list of groups that transitioned to "done" in this call,
+        in topological (upstream-first) order.
+        """
+        newly_done: list[str] = []
+        changed = True
+        while changed:
+            changed = False
+            for g in self._workflows.values():
+                if g.status == "done":
+                    continue
+                if g.replicas == 0:
+                    continue
+                if g.finished_replicas < g.replicas:
+                    continue
+                if g.running_count > 0:
+                    continue
+                deps_done = not g.dependencies or all(
+                    self._workflows.get(d) is not None
+                    and self._workflows[d].status == "done"
+                    for d in g.dependencies
                 )
                 if deps_done:
-                    group.status = "done"
-                    group_done = True
+                    g.status = "done"
+                    newly_done.append(g.name)
+                    changed = True
+        return newly_done
 
-            # Update scheduling bandit: reward for this group based on downstream BP.
+    def _compute_scheduling_reward(self, group: _WorkflowInfo) -> float:
+        """Continuous reward in [0.1, 1.0] for scheduling this workflow.
+
+        Combines downstream queue pressure (cost of feeding more if downstream
+        is saturated) and downstream hunger (benefit of feeding more if
+        downstream is idle).  Terminal workflows get a high but bounded
+        reward so non-terminal workflows with idle downstreams can still
+        compete.
+
+        The function is smooth across BP state boundaries — no discontinuous
+        jumps that the bandit posterior has to absorb.
+
+        Components:
+          hunger        ∈ [0,1]: 1 when downstream idle, 0 when fully busy
+          queue_pressure∈ [0,1]: 0 when queue empty, 1 at BP high-water
+          reward = 0.1 + 0.8 × hunger × (1 - queue_pressure)
+                   clipped to [0.1, 1.0]
+        """
+        downstream_name = (group.workflow_config or {}).get("trigger_downstream")
+        if downstream_name is None:
+            # Terminal workflow — capped just below 1.0 so non-terminal
+            # workflows with idle downstreams can still tie.
+            return 0.95
+
+        downstream = self._workflows.get(downstream_name)
+        if downstream is None:
+            return 0.5
+
+        # Queue pressure: 0 when empty, 1 at BP high-water (or 2×cap fallback).
+        queue_depth = max(0, downstream.replicas - downstream.started_count)
+        bp_ctrl = self._bp.get(downstream_name)
+        if bp_ctrl is not None:
+            high_water = max(1, bp_ctrl.high_water)
+            queue_pressure = min(1.0, queue_depth / high_water)
+        else:
+            cap_proxy = downstream.concurrency_cap if downstream.concurrency_cap > 0 else 1
+            queue_pressure = min(1.0, queue_depth / (cap_proxy * 2))
+
+        # Hunger: 1 when downstream is idle, 0 when at full concurrency.
+        if downstream.concurrency_cap > 0:
+            hunger = 1.0 - min(1.0, downstream.running_count / downstream.concurrency_cap)
+        else:
+            hunger = 0.5
+
+        reward = 0.1 + 0.8 * hunger * (1.0 - queue_pressure)
+        return max(0.1, min(1.0, reward))
+
+    def _compute_passthrough(
+        self,
+        upstream_name: str,
+        downstream_name: str,
+    ) -> Optional[float]:
+        """Observed pass-through fraction for upstream → downstream.
+
+        Counts downstream.replicas (dispatched count) PLUS sharder buffer
+        (pending dispatches) so strict-stratify accumulation doesn't
+        falsely report a near-zero pass-through during normal batching.
+
+        Returns None when the upstream hasn't finished any replicas yet
+        (no signal) or either group is missing.
+        """
+        upstream = self._workflows.get(upstream_name)
+        downstream = self._workflows.get(downstream_name)
+        if upstream is None or downstream is None:
+            return None
+        if upstream.finished_replicas <= 0:
+            return None
+        sharder = self._sharders.get(downstream_name)
+        buffered = sharder.buffered if sharder else 0
+        return (downstream.replicas + buffered) / upstream.finished_replicas
+
+    async def _on_replica_finished(self, group: _WorkflowInfo, replica_id: str) -> None:
+        """Update group counters, notify sharders, run monitor, then re-schedule."""
+        newly_done: list[str] = []
+        async with self._lock:
+            # running_count is derived from started_count - finished_replicas;
+            # incrementing finished_replicas implicitly decrements running_count.
+            group.finished_replicas += 1
+            self._resources.release(
+                group.required_cpus, group.required_gpus, group.required_memory_gb
+            )
+            self._stats[group.name].replicas_finished = group.finished_replicas
+            # Drop this replica's candidate-tracking entry so subsequent
+            # sharder dispatches see an accurate "running scaffolds" set.
+            self._running_candidates.pop(replica_id, None)
+
+            # Propagate status="done" through the cascade.  Handles the
+            # current group transitioning AND any downstream group that
+            # was waiting only on this group's completion.
+            newly_done = self._propagate_status_done_locked()
+            group_done = group.name in newly_done
+
+            # When ReplanningController is DRAINING, signal completion
+            # the moment all in-flight work has finished.  is_paused()
+            # is true for any non-NORMAL state; we only signal drain on
+            # the DRAINING branch.
+            if self._replanning is not None and self._replanning.is_paused():
+                total_running = sum(
+                    w.running_count for w in self._workflows.values()
+                )
+                if total_running == 0:
+                    self._replanning.drained()
+
+            # Update scheduling bandit with a smooth reward in [0.1, 1.0].
+            # The previous formula had step discontinuities at BP state
+            # boundaries — the Beta posterior absorbed those as widened
+            # uncertainty, which can cause oscillation near thresholds.
             if self._scheduling_bandit is not None:
-                downstream_name = (group.group_config or {}).get("trigger_downstream")
-                bp_ctrl = self._bp.get(downstream_name) if downstream_name else None
-                if bp_ctrl is not None and bp_ctrl.state in (BPState.THROTTLE, BPState.WIDEN):
-                    # Use BP state only for the extreme cases where it carries a clear
-                    # directional signal: THROTTLE means this stage is flooding its
-                    # downstream (back off), WIDEN means downstream is starved (run more).
-                    sched_reward = 0.8 if bp_ctrl.state == BPState.WIDEN else 0.2
-                else:
-                    # BP HOLD (healthy) or no BP at all: use downstream utilisation as a
-                    # fine-grained reward signal.  This lets the bandit differentiate
-                    # stages even when BP never fires (all high_waters are above peak queue).
-                    # Terminal stage (no downstream) → max reward; every finish directly
-                    # counts toward the campaign target.
-                    if downstream_name is None:
-                        sched_reward = 1.0
-                    else:
-                        downstream_grp = self._groups.get(downstream_name)
-                        if downstream_grp is not None and downstream_grp.max_replicas > 0:
-                            util = downstream_grp.running_count / downstream_grp.max_replicas
-                            sched_reward = max(0.2, 1.0 - 0.5 * util)
-                        else:
-                            sched_reward = 0.5
+                sched_reward = self._compute_scheduling_reward(group)
                 self._scheduling_bandit.update(group.name, sched_reward)
 
-        freed_gpu_ids = self._replica_gpu_assignments.pop(replica_id, [])
-        self._free_gpu_ids.extend(freed_gpu_ids)
+            freed_gpu_ids = self._replica_gpu_assignments.pop(replica_id, [])
+            self._free_gpu_ids.extend(freed_gpu_ids)
+
         for gid in freed_gpu_ids:
             try:
                 group.running_gpu_ids.remove(gid)
@@ -204,10 +353,11 @@ class ExecutorMixin:
                 )
 
         release_tag = ""
-        if group.required_cpus > 0 or group.required_gpus > 0:
+        if group.required_cpus > 0 or group.required_gpus > 0 or group.required_memory_gb > 0:
             release_tag = (
                 f" | released cpus={group.required_cpus} gpus={group.required_gpus}"
-                f" | available: {self._resources.available_str()}"
+                + (f" mem={group.required_memory_gb}GB" if group.required_memory_gb > 0 else "")
+                + f" | available: {self._resources.available_str()}"
             )
         if freed_gpu_ids:
             release_tag += (
@@ -215,16 +365,17 @@ class ExecutorMixin:
             )
         self._log.info(f"Replica {replica_id!r} finished{release_tag}")
 
-        if group_done:
-            self._log.info(f"Workflow group {group.name!r} completed")
-            # Notify downstream sharders: no more triggers from this group,
-            # so strict-stratify partial tails are safe to flush.
+        # Notify downstream sharders for every group that just transitioned
+        # to "done" (the current group AND any downstream group that
+        # propagated through _propagate_status_done_locked).
+        for done_name in newly_done:
+            self._log.info(f"Workflow group {done_name!r} completed")
             for sh_name, sharder in self._sharders.items():
-                sh_group = self._groups.get(sh_name)
-                if sh_group and group.name in sh_group.dependencies:
+                sh_group = self._workflows.get(sh_name)
+                if sh_group and done_name in sh_group.dependencies:
                     sharder.mark_upstream_done()
                     self._log.info(
-                        f"Sharder [{sh_name}]: upstream {group.name!r} done "
+                        f"Sharder [{sh_name}]: upstream {done_name!r} done "
                         f"— partial tail ({sharder.buffered}) will flush next cycle"
                     )
 
@@ -235,56 +386,144 @@ class ExecutorMixin:
 
         # ── Monitor: pass-through and budget drift checks ─────────────────────
         if self._monitor and group.finished_replicas > 0:
-            grp_cfg = group.group_config or {}
-            trigger_name = grp_cfg.get("trigger_downstream")
-            expected_frac = float(grp_cfg.get("trigger_fraction", 1.0))
+            trigger_name = (group.workflow_config or {}).get("trigger_downstream")
+            expected_frac = float((group.workflow_config or {}).get("trigger_fraction", 1.0))
             _MIN_PASSTHROUGH_SAMPLE = 10
-            if (trigger_name and trigger_name in self._groups and expected_frac < 1.0
+            if (trigger_name and trigger_name in self._workflows and expected_frac < 1.0
                     and group.finished_replicas >= _MIN_PASSTHROUGH_SAMPLE):
-                downstream_total = self._groups[trigger_name].replicas
-                observed_frac = downstream_total / group.finished_replicas
-                ev = self._monitor.check_passthrough(group.name, observed_frac, expected_frac)
-                if ev:
-                    tag = " [ESCALATING]" if self._monitor.is_escalating(ev) else ""
-                    self._log.warning(
-                        f"Monitor [{group.name}] pass_through drift{tag}: "
-                        f"observed={observed_frac:.3f}  expected={expected_frac:.3f}"
-                        f"  dev={ev.deviation_pct:.1f}%  breach={ev.breach_count}"
+                # Use the shared buffer-aware helper so the reactive path
+                # agrees with the periodic monitor (monitor_mixin.py).
+                observed_frac = self._compute_passthrough(group.name, trigger_name)
+                if observed_frac is not None:
+                    ev = self._monitor.check_passthrough(
+                        group.name, observed_frac, expected_frac
                     )
+                    if ev:
+                        tag = " [ESCALATING]" if self._monitor.is_escalating(ev) else ""
+                        self._log.warning(
+                            f"Monitor [{group.name}] pass_through drift{tag}: "
+                            f"observed={observed_frac:.3f}  expected={expected_frac:.3f}"
+                            f"  dev={ev.deviation_pct:.1f}%  breach={ev.breach_count}"
+                        )
 
-            budget = float(grp_cfg.get("budget_node_hours") or 0)
-            if budget > 0 and group.replicas > 0:
-                pilot = grp_cfg.get("pilot", {})
-                nodes = int(pilot.get("nodes", 1))
-                walltime_h = float(pilot.get("walltime_h", 1))
-                spent_actual    = nodes * walltime_h * group.finished_replicas / group.replicas
-                expected_so_far = budget * group.finished_replicas / group.replicas
-                ev = self._monitor.check_budget(group.name, spent_actual, expected_so_far)
-                if ev:
-                    self._log.warning(
-                        f"Monitor [{group.name}] budget drift: "
-                        f"spent={spent_actual:.1f}  expected={expected_so_far:.1f} node-hours"
-                        f"  dev={ev.deviation_pct:.1f}%"
+        # ── BudgetController tick — independent of monitor.  Runs whenever
+        # a BudgetController is registered for the stage, regardless of
+        # whether features.monitor is enabled.  Previously this was nested
+        # under the monitor guard and silently disabled when monitor=False.
+        if group.finished_replicas > 0:
+            # ── BudgetController tick — feeds back into Triage cutoffs ────
+            # Runs on every finish; the controller's internal warmup ensures
+            # it doesn't act on early-stage noise.  Bound-locked outcomes
+            # escalate to a BUDGET_LOCKED DriftEvent for the replan path.
+            bc = self._budget_controllers.get(group.name)
+            if bc is not None:
+                # Compute spend from measured wall-time so ADVANCE-skipped
+                # replicas actually register as ~zero cost.  Falls back to
+                # the pilot reservation when no duration data is available.
+                stage_wall_s = self._metrics.stage_wall_s(group.name)
+                if stage_wall_s > 0:
+                    spend_actual = stage_wall_s * bc.pilot_nodes / 3600.0
+                else:
+                    spend_actual = (
+                        bc.pilot_nodes * bc.pilot_walltime_h * group.finished_replicas
                     )
+                bev = bc.evaluate(
+                    finished_replicas=group.finished_replicas,
+                    actual_node_hours=spend_actual,
+                )
+                if bev is not None:
+                    # Record every tick (in_band, nudged, bound_locked) so
+                    # plot_budget_control.py has a full trajectory.
+                    self._metrics.record_budget(
+                        stage_id=group.name,
+                        kind=bev.kind,
+                        burn_ratio=bev.burn_ratio,
+                        progress=bev.progress,
+                        spend_node_hours=spend_actual,
+                        finished=group.finished_replicas,
+                        score_cutoff=bev.score_cutoff,
+                        uncertainty_cutoff=bev.uncertainty_cutoff,
+                        score_at_bound=bev.score_at_bound,
+                        unc_at_bound=bev.unc_at_bound,
+                        consecutive_hits=bev.consecutive_hits,
+                        frozen=bev.frozen,
+                    )
+                if bev is not None and bev.kind != "in_band":
+                    if bev.kind == "bound_locked":
+                        self._log.warning(
+                            f"BudgetController [{group.name}] BOUND-LOCKED  "
+                            f"burn_ratio={bev.burn_ratio:.2f}  "
+                            f"score_cutoff={bev.score_cutoff:.3f} (at_bound={bev.score_at_bound})  "
+                            f"unc_cutoff={bev.uncertainty_cutoff:.3f} (at_bound={bev.unc_at_bound})  "
+                            f"consecutive={bev.consecutive_hits} → replan recommended"
+                        )
+                        # Convert to a DriftEvent and route through the
+                        # ReplanningController (when configured).  Fire and
+                        # forget: the handshake runs asynchronously while
+                        # _on_replica_finished proceeds with cleanup.
+                        if self._replanning is not None:
+                            from .monitor import DriftEvent, DriftKind
+                            ev = DriftEvent(
+                                kind=DriftKind.BUDGET_LOCKED,
+                                stage_id=group.name,
+                                observed=bev.burn_ratio,
+                                expected=1.0,
+                                deviation_pct=abs(bev.burn_ratio - 1.0) * 100,
+                                breach_count=bev.consecutive_hits,
+                            )
+                            policy = (
+                                self._plan.replan.on_drift
+                                if self._plan is not None else "log_only"
+                            )
+                            asyncio.get_running_loop().create_task(
+                                self._replanning.on_drift(ev, policy=policy)
+                            )
+                    else:
+                        self._log.info(
+                            f"BudgetController [{group.name}] nudged  "
+                            f"burn_ratio={bev.burn_ratio:.2f}  "
+                            f"progress={bev.progress:.1%}  "
+                            f"score_cutoff={bev.score_cutoff:.3f}  "
+                            f"unc_cutoff={bev.uncertainty_cutoff:.3f}"
+                        )
 
-        # ── Early termination: downstream_input_target ────────────────────────
-        # Check BEFORE scheduling so that when the target is hit, _schedule_locked
-        # sees _all_done=True and returns [] immediately — no new replicas start.
+            # Monitor's budget drift check — only runs when monitor is enabled.
+            if self._monitor:
+                _wfcfg = group.workflow_config or {}
+                budget = float(_wfcfg.get("budget_node_hours") or 0)
+                if budget > 0 and group.replicas > 0:
+                    pilot = _wfcfg.get("pilot", {})
+                    nodes = int(pilot.get("nodes", 1))
+                    walltime_h = float(pilot.get("walltime_h", 1))
+                    spent_actual    = nodes * walltime_h * group.finished_replicas / group.replicas
+                    expected_so_far = budget * group.finished_replicas / group.replicas
+                    ev = self._monitor.check_budget(group.name, spent_actual, expected_so_far)
+                    if ev:
+                        self._log.warning(
+                            f"Monitor [{group.name}] budget drift: "
+                            f"spent={spent_actual:.1f}  expected={expected_so_far:.1f} node-hours"
+                            f"  dev={ev.deviation_pct:.1f}%"
+                        )
+
+        # ── Early termination: campaign_target ───────────────────────────────
+        # Only fires when campaign_target > 0 (explicitly set in config).
+        # downstream_input_target is the BudgetController denominator only and
+        # must NOT trigger early stopping — plan configs always set it for every
+        # stage even when early stop is not intended.
         if not self._all_done.is_set():
-            for gname, g in self._groups.items():
-                target = int((g.group_config or {}).get("downstream_input_target") or 0)
+            for gname, g in self._workflows.items():
+                target = int((g.workflow_config or {}).get("campaign_target") or 0)
                 if target > 0 and g.finished_replicas >= target:
                     self._all_done.set()
                     self._log.info(
                         f"Campaign target reached: {gname!r} finished "
                         f"{g.finished_replicas}/{target} replicas — stopping early"
                     )
-                    return   # _schedule_locked will be a no-op for all future calls
 
         await self._schedule()
 
         async with self._lock:
-            all_done = _campaign_complete(self._groups, self._sharders)
+            all_done = _campaign_complete(self._workflows, self._sharders)
 
         if all_done:
             self._all_done.set()

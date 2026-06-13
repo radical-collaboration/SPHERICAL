@@ -10,15 +10,15 @@ Every state change (replica finished, trigger received) calls ``_schedule``,
 which holds the lock, calls ``_schedule_locked``, then fires the resulting
 tasks outside the lock.
 
-Pass 1 — guarantee ``min_replicas`` for all eligible groups (highest priority).
-Pass 2 — fill remaining capacity up to ``max_replicas`` (highest priority).
+Pass 1 — guarantee ``concurrency_floor`` for all eligible groups (highest priority).
+Pass 2 — fill remaining capacity up to ``concurrency_cap`` (highest priority).
 
 A group is eligible when its dependencies are satisfied and it has replicas
 waiting to be started.
 """
 
 from .backpressure import BPState
-from .types import _GroupInfo
+from .types import _WorkflowInfo
 
 
 class SchedulerMixin:
@@ -27,7 +27,7 @@ class SchedulerMixin:
     # Dependency and resource checks (must be called under self._lock)
     # ------------------------------------------------------------------
 
-    def _deps_satisfied_locked(self, group: _GroupInfo) -> bool:
+    def _deps_satisfied_locked(self, group: _WorkflowInfo) -> bool:
         """True when every dependency group is considered ready.
 
         Ready means any of:
@@ -40,7 +40,7 @@ class SchedulerMixin:
         fully completes every replica, not just the first dep_threshold ones.
         """
         for dep_name in group.dependencies:
-            dep = self._groups.get(dep_name)
+            dep = self._workflows.get(dep_name)
             if dep is None:
                 return False
             if dep.status == "done":
@@ -49,33 +49,45 @@ class SchedulerMixin:
                 return False
         return True
 
-    def _can_start_locked(self, group: _GroupInfo) -> bool:
+    def _can_start_locked(self, group: _WorkflowInfo) -> bool:
         """True if one more replica of *group* can be started right now."""
         if group.status == "done":
             return False
         if group.started_count >= group.replicas:
             return False
-        # max_replicas == 0 means "no explicit cap — use replicas count".
-        effective_max = group.max_replicas if group.max_replicas > 0 else group.replicas
+        # concurrency_cap == 0 means "no explicit cap — use replicas count".
+        effective_max = group.concurrency_cap if group.concurrency_cap > 0 else group.replicas
         if group.running_count >= effective_max:
             return False
         if not self._deps_satisfied_locked(group):
             return False
-        if not self._resources.can_fit(group.required_cpus, group.required_gpus):
+        if not self._resources.can_fit(
+            group.required_cpus, group.required_gpus, group.required_memory_gb
+        ):
             return False
         return True
 
-    def _allocate_locked(self, group: _GroupInfo) -> int:
-        """Record one replica start for *group*; update counters; return replica idx."""
+    def _allocate_locked(self, group: _WorkflowInfo) -> int:
+        """Record one replica start for *group*; update counters; return replica idx.
+
+        running_count is derived from started_count - finished_replicas;
+        only started_count is mutated here.
+        """
         idx = group.started_count
         group.started_count += 1
-        group.running_count += 1
-        self._resources.allocate(group.required_cpus, group.required_gpus)
+        group._consecutive_stalls = 0
+        self._resources.allocate(
+            group.required_cpus, group.required_gpus, group.required_memory_gb
+        )
         self._stats[group.name].replicas_started = group.started_count
         replica_id = f"{group.name}_{idx}"
         # Assign the next pending candidate ID to this replica (FIFO from shard dispatch).
         if group._pending_candidates:
-            self._replica_candidate_assignments[replica_id] = group._pending_candidates.popleft()
+            cand_id = group._pending_candidates.popleft()
+            self._replica_candidate_assignments[replica_id] = cand_id
+            # Persist for the replica's full lifetime so _flush_sharders_locked
+            # can compute diversity against the actual set of running scaffolds.
+            self._running_candidates[replica_id] = cand_id
         gpu_ids = [
             self._free_gpu_ids.pop(0)
             for _ in range(group.required_gpus)
@@ -104,16 +116,19 @@ class SchedulerMixin:
         for name, sharder in self._sharders.items():
             if sharder.buffered <= 0:
                 continue
-            g = self._groups.get(name)
+            g = self._workflows.get(name)
             if g is None:
                 continue
             bp        = self._bp.get(name)
-            cap       = g.max_replicas if g.max_replicas > 0 else max(g.replicas, 1)
+            cap       = g.concurrency_cap if g.concurrency_cap > 0 else max(g.replicas, 1)
             occupancy = min(1.0, g.running_count / cap)
             # Collect scaffold classes of currently-running replicas for diversity scoring.
+            # Read from _running_candidates (lifetime = full replica run), not
+            # _replica_candidate_assignments (lifetime = allocation → _run_replica start),
+            # so the diversity penalty reflects scaffolds actually executing.
             running_scaffolds: set[str] = set()
             if self._candidate_log:
-                for rid, cid in self._replica_candidate_assignments.items():
+                for rid, cid in self._running_candidates.items():
                     if rid.startswith(f"{name}_"):
                         h = self._candidate_log.get(cid)
                         if h and h.scaffold_class:
@@ -142,15 +157,22 @@ class SchedulerMixin:
     # Main scheduler (must be called under self._lock)
     # ------------------------------------------------------------------
 
-    def _schedule_locked(self) -> list[tuple[_GroupInfo, int]]:
+    def _schedule_locked(self) -> list[tuple[_WorkflowInfo, int]]:
         """Two-pass greedy scheduler.  Must be called under ``self._lock``.
 
         Returns a list of (group, replica_idx) pairs to start.
         """
-        to_start: list[tuple[_GroupInfo, int]] = []
+        to_start: list[tuple[_WorkflowInfo, int]] = []
 
         # Stop scheduling immediately after early termination or natural completion.
         if self._all_done.is_set():
+            return to_start
+
+        # ReplanningController gate: while the controller is DRAINING /
+        # AWAITING_PLAN / RESUMING, refuse to launch new replicas so the
+        # handshake can complete cleanly.  In-flight replicas continue;
+        # only new ones are blocked.
+        if self._replanning is not None and self._replanning.is_paused():
             return to_start
 
         # ── Sharder: flush buffers into runnable queues ──────────────────────
@@ -160,8 +182,8 @@ class SchedulerMixin:
         # ── Backpressure: refresh state for all controlled groups ────────────
         if self._features.get("backpressure"):
             for bp_name, bp_ctrl in self._bp.items():
-                if bp_name in self._groups:
-                    g = self._groups[bp_name]
+                if bp_name in self._workflows:
+                    g = self._workflows[bp_name]
                     queue_depth = max(0, g.replicas - g.started_count)
                     old_state = bp_ctrl.state
                     bp_ctrl.step(queue_depth)
@@ -190,7 +212,7 @@ class SchedulerMixin:
 
         eligible = [
             g
-            for g in self._groups.values()
+            for g in self._workflows.values()
             if g.status != "done"
             and g.started_count < g.replicas
             and self._deps_satisfied_locked(g)
@@ -208,37 +230,51 @@ class SchedulerMixin:
             # stable sort: equal-priority groups keep registration order (FIFO).
             eligible = sorted(eligible, key=lambda g: -g.priority)
 
-        # Pass 1: guarantee min_replicas.
+        # Pass 1: guarantee concurrency_floor.
         for g in eligible:
-            deficit = g.min_replicas - g.running_count
+            deficit = g.concurrency_floor - g.running_count
             for _ in range(deficit):
                 if not self._can_start_locked(g):
                     break
                 idx = self._allocate_locked(g)
                 to_start.append((g, idx))
 
-        # Pass 2: fill remaining capacity up to max_replicas.
+        # Pass 2: fill remaining capacity up to concurrency_cap.
         for g in eligible:
             while self._can_start_locked(g):
                 idx = self._allocate_locked(g)
                 to_start.append((g, idx))
 
         # Warn about groups stalled on resources.
+        # Only log on the 1st stall and every 100th thereafter — when ADVANCE
+        # replicas complete in sleep(0) the scheduler fires thousands of times
+        # per second and emitting a WARNING each time floods the log and
+        # serialises the event loop on stdout flushes (measured: 265 s → ~30 s).
+        _STALL_WARN_EVERY = 100
         for g in eligible:
             if (
                 g.started_count < g.replicas
-                and g.running_count < (g.max_replicas if g.max_replicas > 0 else g.replicas)
+                and g.running_count < (g.concurrency_cap if g.concurrency_cap > 0 else g.replicas)
                 and self._deps_satisfied_locked(g)
-                and not self._resources.can_fit(g.required_cpus, g.required_gpus)
-            ):
-                self._log.warning(
-                    f"Group {g.name!r} stalled — waiting for resources "
-                    f"(needs cpus={g.required_cpus} gpus={g.required_gpus}  "
-                    f"available: {self._resources.available_str()})"
+                and not self._resources.can_fit(
+                    g.required_cpus, g.required_gpus, g.required_memory_gb
                 )
+            ):
+                g._consecutive_stalls += 1
+                if g._consecutive_stalls == 1 or g._consecutive_stalls % _STALL_WARN_EVERY == 0:
+                    self._log.warning(
+                        f"Workflow {g.name!r} stalled — waiting for resources "
+                        f"(needs cpus={g.required_cpus} gpus={g.required_gpus} "
+                        f"mem={g.required_memory_gb}GB  "
+                        f"available: {self._resources.available_str()})"
+                        + (f"  [×{g._consecutive_stalls}]" if g._consecutive_stalls > 1 else "")
+                    )
+            else:
+                g._consecutive_stalls = 0
 
         if to_start:
             bandit_scores: dict = {}
+            bandit_means:  dict = {}
             if self._scheduling_bandit is not None:
                 bandit_scores = {
                     g.name: self._scheduling_bandit._arms[g.name].sample(
@@ -246,10 +282,18 @@ class SchedulerMixin:
                     )
                     for g in eligible if g.name in self._scheduling_bandit._arms
                 }
+                # Posterior mean per arm — the bandit's *learned* priority,
+                # recorded for the bandit-convergence plot.  Captured for ALL
+                # arms (not just eligible) so the learning curve is continuous.
+                bandit_means = {
+                    name: arm.mean
+                    for name, arm in self._scheduling_bandit._arms.items()
+                }
             self._metrics.record_scheduling(
                 chosen_groups=[g.name for g, _ in to_start],
                 eligible_groups=[g.name for g in eligible],
                 bandit_scores=bandit_scores,
+                bandit_means=bandit_means,
             )
 
             def _gpu_tag(g, idx):
@@ -262,21 +306,21 @@ class SchedulerMixin:
             )
             _used: set[str] = set()
             _abbrevs: dict[str, str] = {}
-            for g in self._groups.values():
+            for g in self._workflows.values():
                 ch = next(
                     (c.upper() for c in g.name if c.upper() not in _used),
                     chr(ord("A") + len(_abbrevs)),
                 )
                 _abbrevs[g.name] = ch
                 _used.add(ch)
-            viz = "".join(_abbrevs[g.name] * g.running_count for g in self._groups.values())
+            viz = "".join(_abbrevs[g.name] * g.running_count for g in self._workflows.values())
             buf_str = {n: s.buffered for n, s in self._sharders.items() if s.buffered}
-            col = max(len(g.name) for g in self._groups.values()) + 2
+            col = max(len(g.name) for g in self._workflows.values()) + 2
             group_lines = "\n".join(
                 f"  {g.name:<{col}} run={g.running_count:<3} "
                 f"done={g.finished_replicas}/{g.replicas}"
                 + (f"  buf={buf_str[g.name]}" if g.name in buf_str else "")
-                for g in self._groups.values()
+                for g in self._workflows.values()
             )
             res_line = f"  {self._resources.usage_str()}"
             bandit_line = ""

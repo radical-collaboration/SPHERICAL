@@ -142,14 +142,14 @@ def reset_class_state():
 
 @pytest.fixture
 async def acm():
-    """AsyncCampaignManager with asyncflow initialization mocked out."""
+    """AsyncCampaignManager with a mock asyncflow engine.
+
+    asyncflow lifecycle is caller-owned: start() requires _asyncflow to be set,
+    so we inject a mock directly. The test workflows execute their run()/start()
+    via the CM and never touch the engine, so a mock is sufficient.
+    """
     cm = AsyncCampaignManager()
-    mock_af = AsyncMock()
-
-    async def _fake_init():
-        cm._asyncflow = mock_af
-
-    cm._init_asyncflow = _fake_init
+    cm._asyncflow = AsyncMock()
     yield cm
     await cm.close()
 
@@ -213,7 +213,7 @@ class TestBaseWorkflow:
 
 class TestAsyncCampaignManager:
     async def test_single_replica_completes(self, acm):
-        acm.register_group("a", NullWorkflow, replicas=1)
+        acm.register_workflow("a", NullWorkflow, replicas=1)
         await acm.start()
         assert await acm.wait(timeout=3.0)
         s = acm.status()
@@ -221,13 +221,13 @@ class TestAsyncCampaignManager:
         assert s["groups"]["a"]["replicas_finished"] == 1
 
     async def test_all_replicas_run(self, acm):
-        acm.register_group("a", RecordingWorkflow, replicas=4, max_replicas=4)
+        acm.register_workflow("a", RecordingWorkflow, replicas=4, concurrency_cap=4)
         await acm.start()
         assert await acm.wait(timeout=3.0)
         assert sorted(RecordingWorkflow.ran) == ["a_0", "a_1", "a_2", "a_3"]
 
-    async def test_max_replicas_cap_respected(self, acm):
-        """Concurrent running count must never exceed max_replicas."""
+    async def test_concurrency_cap_cap_respected(self, acm):
+        """Concurrent running count must never exceed concurrency_cap."""
         peak = []
 
         class PeakObserver(BaseWorkflow):
@@ -240,7 +240,7 @@ class TestAsyncCampaignManager:
                 await asyncio.sleep(0.02)
                 PeakObserver._active -= 1
 
-        acm.register_group("a", PeakObserver, replicas=6, max_replicas=2)
+        acm.register_workflow("a", PeakObserver, replicas=6, concurrency_cap=2)
         await acm.start()
         assert await acm.wait(timeout=5.0)
         assert max(peak) <= 2
@@ -261,8 +261,8 @@ class TestAsyncCampaignManager:
             async def run(self, replica_id: str) -> None:
                 order.append(("B", replica_id))
 
-        acm.register_group("a", A, replicas=2)
-        acm.register_group("b", B, replicas=1, dependencies=["a"], dep_threshold=2)
+        acm.register_workflow("a", A, replicas=2)
+        acm.register_workflow("b", B, replicas=1, dependencies=["a"], dep_threshold=2)
         await acm.start()
         assert await acm.wait(timeout=3.0)
 
@@ -271,8 +271,8 @@ class TestAsyncCampaignManager:
 
     async def test_dependency_via_signal_done(self, acm):
         """_signal_done() unblocks B even before all of A's replicas finish."""
-        acm.register_group("a", SignalDoneWorkflow, replicas=1)
-        acm.register_group(
+        acm.register_workflow("a", SignalDoneWorkflow, replicas=1)
+        acm.register_workflow(
             "b",
             NullWorkflow,
             replicas=1,
@@ -288,8 +288,8 @@ class TestAsyncCampaignManager:
 
     async def test_trigger_dependent_activates_group(self, acm):
         """Parent workflow calls _trigger_dependent to start a replicas=0 group."""
-        acm.register_group("upstream", TriggerWorkflow, replicas=1)
-        acm.register_group("downstream", RecordingWorkflow, replicas=0)
+        acm.register_workflow("upstream", TriggerWorkflow, replicas=1)
+        acm.register_workflow("downstream", RecordingWorkflow, replicas=0)
         await acm.start()
         assert await acm.wait(timeout=3.0)
 
@@ -299,14 +299,14 @@ class TestAsyncCampaignManager:
 
     async def test_untriggered_group_does_not_block_completion(self, acm):
         """A replicas=0 group that is never triggered must not prevent _all_done."""
-        acm.register_group("a", NullWorkflow, replicas=1)
-        acm.register_group("never_triggered", NullWorkflow, replicas=0)
+        acm.register_workflow("a", NullWorkflow, replicas=1)
+        acm.register_workflow("never_triggered", NullWorkflow, replicas=0)
         await acm.start()
         assert await acm.wait(timeout=3.0)
         assert acm.status()["groups"]["a"]["status"] == "done"
 
     async def test_on_replica_done_hook_called(self, acm):
-        acm.register_group("a", HookWorkflow, replicas=2)
+        acm.register_workflow("a", HookWorkflow, replicas=2)
         await acm.start()
         assert await acm.wait(timeout=3.0)
         assert len(HookWorkflow.calls) == 2
@@ -315,7 +315,7 @@ class TestAsyncCampaignManager:
 
     async def test_run_exception_marks_replica_failed(self, acm):
         """An exception in run() sets final_state="failed"; campaign still completes."""
-        acm.register_group("a", FailingHookWorkflow, replicas=2)
+        acm.register_workflow("a", FailingHookWorkflow, replicas=2)
         await acm.start()
         assert await acm.wait(timeout=3.0)
         assert len(FailingHookWorkflow.calls) == 2
@@ -324,7 +324,7 @@ class TestAsyncCampaignManager:
 
     async def test_status_transitions_pending_running_done(self, acm):
         """Status progresses: pending before start → running during → done after."""
-        acm.register_group("a", SleepWorkflow, replicas=1)
+        acm.register_workflow("a", SleepWorkflow, replicas=1)
         assert acm.status()["groups"]["a"]["status"] == "pending"
         await acm.start()
         await asyncio.sleep(0.005)  # yield to let the replica task begin
@@ -337,15 +337,15 @@ class TestAsyncCampaignManager:
         assert await acm.wait(timeout=1.0)
 
     async def test_status_snapshot_fields(self, acm):
-        acm.register_group("a", NullWorkflow, replicas=2, max_replicas=1)
+        acm.register_workflow("a", NullWorkflow, replicas=2, concurrency_cap=1)
         s = acm.status()["groups"]["a"]
         assert s["status"] == "pending"
         assert s["replicas_total"] == 2
-        assert s["max_replicas"] == 1
+        assert s["concurrency_cap"] == 1
         assert s["dependencies"] == []
 
     async def test_stats_reflect_finished_count(self, acm):
-        acm.register_group("a", NullWorkflow, replicas=3)
+        acm.register_workflow("a", NullWorkflow, replicas=3)
         await acm.start()
         assert await acm.wait(timeout=3.0)
         st = acm.stats()
@@ -356,7 +356,7 @@ class TestAsyncCampaignManager:
     async def test_from_config_registers_groups(self):
         config = {
             "workflows": {
-                "x": {"replicas": 2, "max_replicas": 1},
+                "x": {"replicas": 2, "concurrency_cap": 1},
                 # y has dependencies → replicas defaults to 0 (triggered group)
                 "y": {"dependencies": ["x"], "dependency_threshold": 2},
             }
@@ -364,7 +364,7 @@ class TestAsyncCampaignManager:
         cm = AsyncCampaignManager.from_config(config, {"x": NullWorkflow, "y": NullWorkflow})
         s = cm.status()["groups"]
         assert s["x"]["replicas_total"] == 2
-        assert s["x"]["max_replicas"] == 1
+        assert s["x"]["concurrency_cap"] == 1
         assert s["y"]["replicas_total"] == 0  # triggered group: not yet activated
         assert s["y"]["dependencies"] == ["x"]
         assert s["y"]["dep_threshold"] == 2
@@ -388,19 +388,19 @@ class TestCampaignManager:
         manager.close()
 
     def test_single_replica_runs(self, cm):
-        cm.register_group("a", SyncRecordingWorkflow, replicas=1)
+        cm.register_workflow("a", SyncRecordingWorkflow, replicas=1)
         cm.start()
         assert cm.wait(timeout=5.0)
         assert SyncRecordingWorkflow.ran == ["a_0"]
 
     def test_multiple_replicas_all_run(self, cm):
-        cm.register_group("a", SyncRecordingWorkflow, replicas=3)
+        cm.register_workflow("a", SyncRecordingWorkflow, replicas=3)
         cm.start()
         assert cm.wait(timeout=5.0)
         assert sorted(SyncRecordingWorkflow.ran) == ["a_0", "a_1", "a_2"]
 
-    def test_sliding_window_max_replicas(self, cm):
-        cm.register_group("a", SyncRecordingWorkflow, replicas=4, max_replicas=2)
+    def test_sliding_window_concurrency_cap(self, cm):
+        cm.register_workflow("a", SyncRecordingWorkflow, replicas=4, concurrency_cap=2)
         cm.start()
         assert cm.wait(timeout=5.0)
         assert sorted(SyncRecordingWorkflow.ran) == ["a_0", "a_1", "a_2", "a_3"]
@@ -421,8 +421,8 @@ class TestCampaignManager:
             def run(self, replica_id: str) -> None:
                 order.append(("B", replica_id))
 
-        cm.register_group("a", A, replicas=2)
-        cm.register_group("b", B, replicas=1, dependencies=["a"])
+        cm.register_workflow("a", A, replicas=2)
+        cm.register_workflow("b", B, replicas=1, dependencies=["a"])
         cm.start()
         assert cm.wait(timeout=5.0)
 
@@ -430,21 +430,21 @@ class TestCampaignManager:
         assert all(wf == "A" for wf, _ in order[:b_idx])
 
     def test_on_replica_done_hook_called(self, cm):
-        cm.register_group("a", SyncHookWorkflow, replicas=2)
+        cm.register_workflow("a", SyncHookWorkflow, replicas=2)
         cm.start()
         assert cm.wait(timeout=5.0)
         assert len(SyncHookWorkflow.calls) == 2
         assert {rid for rid, _ in SyncHookWorkflow.calls} == {"a_0", "a_1"}
 
     def test_status_snapshot_fields(self, cm):
-        cm.register_group("a", SyncRecordingWorkflow, replicas=1, max_replicas=1)
+        cm.register_workflow("a", SyncRecordingWorkflow, replicas=1, concurrency_cap=1)
         s = cm.status()["groups"]["a"]
         assert s["status"] == "pending"
         assert s["replicas_total"] == 1
-        assert s["max_replicas"] == 1
+        assert s["concurrency_cap"] == 1
 
     def test_stats_reflect_finished_count(self, cm):
-        cm.register_group("a", SyncRecordingWorkflow, replicas=3)
+        cm.register_workflow("a", SyncRecordingWorkflow, replicas=3)
         cm.start()
         assert cm.wait(timeout=5.0)
         st = cm.stats()
@@ -454,7 +454,7 @@ class TestCampaignManager:
     def test_from_config_registers_groups(self):
         config = {
             "workflows": {
-                "alpha": {"replicas": 3, "max_replicas": 2},
+                "alpha": {"replicas": 3, "concurrency_cap": 2},
                 # beta has dependencies → replicas defaults to 0 (triggered group)
                 "beta": {"dependencies": ["alpha"]},
             }
@@ -466,7 +466,7 @@ class TestCampaignManager:
         cm.close()
         assert "alpha" in s
         assert s["alpha"]["replicas_total"] == 3
-        assert s["alpha"]["max_replicas"] == 2
+        assert s["alpha"]["concurrency_cap"] == 2
         assert s["beta"]["replicas_total"] == 0  # triggered group: not yet activated
 
     def test_unknown_group_skipped_in_from_config(self):
@@ -518,7 +518,11 @@ class TestResourcePool:
     def test_as_dict_keys(self):
         rp = ResourcePool(total_cpus=8, total_gpus=2)
         d = rp.as_dict()
-        assert set(d) == {"total_cpus", "available_cpus", "total_gpus", "available_gpus"}
+        assert set(d) == {
+            "total_cpus", "available_cpus",
+            "total_gpus", "available_gpus",
+            "total_memory_gb", "available_memory_gb",
+        }
 
     def test_usage_str_tracks_used(self):
         rp = ResourcePool(total_cpus=8, total_gpus=4)
@@ -549,12 +553,7 @@ class TestAsyncCampaignManagerResources:
     async def racm(self):
         """AsyncCampaignManager with 4 CPUs and 2 GPUs, asyncflow mocked."""
         cm = AsyncCampaignManager(total_cpus=4, total_gpus=2)
-        mock_af = AsyncMock()
-
-        async def _fake_init():
-            cm._asyncflow = mock_af
-
-        cm._init_asyncflow = _fake_init
+        cm._asyncflow = AsyncMock()
         yield cm
         await cm.close()
 
@@ -572,14 +571,14 @@ class TestAsyncCampaignManagerResources:
                 await asyncio.sleep(0.02)
                 GpuWorkflow._active -= 1
 
-        racm.register_group("g", GpuWorkflow, replicas=6, max_replicas=6, required_gpus=1)
+        racm.register_workflow("g", GpuWorkflow, replicas=6, concurrency_cap=6, required_gpus=1)
         await racm.start()
         assert await racm.wait(timeout=5.0)
         assert max(peak) <= 2  # only 2 GPUs available
 
     async def test_resources_released_after_replica(self, racm):
         """Available resources return to full after all replicas complete."""
-        racm.register_group("g", NullWorkflow, replicas=2, required_cpus=2, required_gpus=1)
+        racm.register_workflow("g", NullWorkflow, replicas=2, required_cpus=2, required_gpus=1)
         await racm.start()
         assert await racm.wait(timeout=3.0)
         s = racm.status()["resources"]
@@ -587,7 +586,7 @@ class TestAsyncCampaignManagerResources:
         assert s["available_gpus"] == 2  # total_gpus restored
 
     async def test_status_includes_resource_snapshot(self, racm):
-        racm.register_group("g", NullWorkflow, replicas=1, required_cpus=2, required_gpus=1)
+        racm.register_workflow("g", NullWorkflow, replicas=1, required_cpus=2, required_gpus=1)
         s = racm.status()
         assert "resources" in s
         assert s["resources"]["total_cpus"] == 4
@@ -620,8 +619,8 @@ class TestAsyncCampaignManagerResources:
                 started_order.append(replica_id)
                 await asyncio.sleep(0.01)
 
-        racm.register_group("lo", TrackWorkflow, replicas=2, required_gpus=1)
-        racm.register_group("hi", TrackWorkflow, replicas=2, required_gpus=1)
+        racm.register_workflow("lo", TrackWorkflow, replicas=2, required_gpus=1)
+        racm.register_workflow("hi", TrackWorkflow, replicas=2, required_gpus=1)
         await racm.start()
         assert await racm.wait(timeout=3.0)
         # All 4 replicas should complete
@@ -663,13 +662,13 @@ class TestCampaignManagerResources:
                 with lock:
                     GpuWorkflow._active -= 1
 
-        rcm.register_group("g", GpuWorkflow, replicas=6, max_replicas=6, required_gpus=1)
+        rcm.register_workflow("g", GpuWorkflow, replicas=6, concurrency_cap=6, required_gpus=1)
         rcm.start()
         assert rcm.wait(timeout=5.0)
         assert max(peak) <= 2
 
     def test_resources_released_after_replica(self, rcm):
-        rcm.register_group("g", SyncRecordingWorkflow, replicas=2, required_cpus=2, required_gpus=1)
+        rcm.register_workflow("g", SyncRecordingWorkflow, replicas=2, required_cpus=2, required_gpus=1)
         rcm.start()
         assert rcm.wait(timeout=3.0)
         s = rcm.status()["resources"]
@@ -677,7 +676,7 @@ class TestCampaignManagerResources:
         assert s["available_gpus"] == 2
 
     def test_status_includes_resource_snapshot(self, rcm):
-        rcm.register_group("g", SyncRecordingWorkflow, replicas=1, required_cpus=1, required_gpus=0)
+        rcm.register_workflow("g", SyncRecordingWorkflow, replicas=1, required_cpus=1, required_gpus=0)
         s = rcm.status()
         assert "resources" in s
         assert s["resources"]["total_cpus"] == 4

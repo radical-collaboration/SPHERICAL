@@ -11,7 +11,7 @@ cache_dir: "cache"
 # -----------------------------------------------------------------------------
 # GPU / Service Configuration
 # -----------------------------------------------------------------------------
-num_services: 1   # Match max_replicas so each service gets its own CM-assigned GPU
+num_services: 1   # Match concurrency_cap so each service gets its own CM-assigned GPU
 num_gpus_per_service: 1
 num_cpus_per_service: 64
 num_workers_per_gpu: 4

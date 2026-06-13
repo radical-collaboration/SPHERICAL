@@ -59,6 +59,31 @@ class SchedulingEvent:
     eligible_groups: list[str]          # all eligible groups before selection
     bandit_scores:   dict[str, float]   # Thompson sample per group (empty if no bandit)
     timestamp:       float
+    bandit_means:    dict[str, float] = field(default_factory=dict)  # Beta posterior mean per arm
+
+
+@dataclass
+class BudgetEventRecord:
+    """One BudgetController.evaluate outcome, serialized for replay & plots.
+
+    Captured from executor.py whenever a stage's BudgetController ticks.
+    The fields mirror BudgetEvent (in budget_controller.py) plus the
+    timestamp the executor recorded — together they form the trajectory
+    plot_budget_control.py consumes.
+    """
+    stage_id:           str
+    kind:               str        # in_band | nudged | bound_locked
+    burn_ratio:         float
+    progress:           float
+    spend_node_hours:   float
+    finished:           int
+    score_cutoff:       float
+    uncertainty_cutoff: float
+    score_at_bound:     bool
+    unc_at_bound:       bool
+    consecutive_hits:   int
+    frozen:             bool
+    timestamp:          float
 
 
 class CampaignMetrics:
@@ -71,7 +96,9 @@ class CampaignMetrics:
         self.bp_events:        list[BPEvent]        = []
         self.shard_events:     list[ShardEvent]     = []
         self.scheduling_events: list[SchedulingEvent] = []
+        self.budget_events:    list[BudgetEventRecord] = []
         self._replica_starts:  dict[str, float]    = {}  # replica_id → start time
+        self._stage_wall_s:    dict[str, float]    = {}  # group → cumulative wall-time seconds
 
     # ── Writers ───────────────────────────────────────────────────────────────
 
@@ -97,11 +124,17 @@ class CampaignMetrics:
     ) -> None:
         t = time.time()
         start = self._replica_starts.pop(replica_id, t)
+        duration = t - start
         self.replica_events.append(ReplicaEvent(
             group=group, replica_id=replica_id,
             event="finish" if final_state == "done" else "failed",
-            timestamp=t, duration_s=t - start,
+            timestamp=t, duration_s=duration,
         ))
+        self._stage_wall_s[group] = self._stage_wall_s.get(group, 0.0) + duration
+
+    def stage_wall_s(self, group: str) -> float:
+        """Cumulative finished-replica wall-time for a group (O(1))."""
+        return self._stage_wall_s.get(group, 0.0)
 
     def record_bp_transition(
         self,
@@ -128,16 +161,45 @@ class CampaignMetrics:
             scores=scores, priorities=priorities, timestamp=time.time(),
         ))
 
+    def record_budget(
+        self,
+        stage_id:           str,
+        kind:               str,
+        burn_ratio:         float,
+        progress:           float,
+        spend_node_hours:   float,
+        finished:           int,
+        score_cutoff:       float,
+        uncertainty_cutoff: float,
+        score_at_bound:     bool,
+        unc_at_bound:       bool,
+        consecutive_hits:   int,
+        frozen:             bool,
+    ) -> None:
+        """Record one BudgetController.evaluate outcome."""
+        self.budget_events.append(BudgetEventRecord(
+            stage_id=stage_id, kind=kind,
+            burn_ratio=burn_ratio, progress=progress,
+            spend_node_hours=spend_node_hours, finished=finished,
+            score_cutoff=score_cutoff,
+            uncertainty_cutoff=uncertainty_cutoff,
+            score_at_bound=score_at_bound, unc_at_bound=unc_at_bound,
+            consecutive_hits=consecutive_hits, frozen=frozen,
+            timestamp=time.time(),
+        ))
+
     def record_scheduling(
         self,
         chosen_groups: list[str],
         eligible_groups: list[str],
         bandit_scores: dict[str, float],
+        bandit_means: Optional[dict[str, float]] = None,
     ) -> None:
         self.scheduling_events.append(SchedulingEvent(
             chosen_groups=chosen_groups,
             eligible_groups=eligible_groups,
             bandit_scores=bandit_scores,
+            bandit_means=bandit_means or {},
             timestamp=time.time(),
         ))
 
@@ -218,6 +280,7 @@ class CampaignMetrics:
             "scheduling_events": [
                 {"chosen": e.chosen_groups, "eligible": e.eligible_groups,
                  "bandit": e.bandit_scores,
+                 "bandit_means": e.bandit_means,
                  "timestamp": e.timestamp - self.start_time}
                 for e in self.scheduling_events
             ],
@@ -226,5 +289,17 @@ class CampaignMetrics:
                  "t": e.timestamp - self.start_time,
                  "dur": e.duration_s, "score": e.score}
                 for e in self.replica_events
+            ],
+            "budget_events": [
+                {"stage_id": e.stage_id, "kind": e.kind,
+                 "burn_ratio": e.burn_ratio, "progress": e.progress,
+                 "spend_node_hours": e.spend_node_hours, "finished": e.finished,
+                 "score_cutoff": e.score_cutoff,
+                 "uncertainty_cutoff": e.uncertainty_cutoff,
+                 "score_at_bound": e.score_at_bound,
+                 "unc_at_bound": e.unc_at_bound,
+                 "consecutive_hits": e.consecutive_hits, "frozen": e.frozen,
+                 "t": e.timestamp - self.start_time}
+                for e in self.budget_events
             ],
         }

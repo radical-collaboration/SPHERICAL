@@ -2,17 +2,22 @@
 """
 Plot dreamer campaign timeline and simulation statistics.
 
+Dreamer-specific superset of ``../plot_cm_timeline.py``: it shares the same
+log parser, Gantt chart, and resource-utilization row, and adds a third row of
+Dreamer emulation metrics (rows 0–1 below are the generic timeline; row 2 is
+the extension). Use ``../plot_cm_timeline.py`` for non-Dreamer campaigns.
+
 Reads:
   - A campaign log file (ANSI-colored CM output)
   - dreamer profile JSON files from dreamer-profiles/ (auto-detected next to log)
 
 Produces a 3-row figure:
-  Row 0  Gantt chart (wall-clock replica execution) + stage config table
+  Row 0  Gantt chart (wall-clock replica execution) + workflow config table
   Row 1  CPU / GPU resource utilization over wall-clock time
   Row 2  Dreamer simulation metrics:
-           2a  Simulated makespan per replica, grouped by stage
-           2b  Task ops distribution per stage (box plots from profile JSONs)
-           2c  Per-stage summary statistics table
+           2a  Simulated makespan per replica, grouped by workflow
+           2b  Task ops distribution per workflow (box plots from profile JSONs)
+           2c  Per-workflow summary statistics table
 
 Usage:
     python plot_dreamer_timeline.py log [--profiles-dir DIR] [--config FILE] [--out FILE]
@@ -40,23 +45,23 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 
-# ── Stage appearance ──────────────────────────────────────────────────────────
+# ── workflow appearance ──────────────────────────────────────────────────────────
 
-STAGE_COLORS = {
+workflow_COLORS = {
     "s1_ligand_filter": "#4C72B0",
     "s2_ml_affinity":   "#DD8452",
     "s3_docking":       "#55A868",
     "s4_md_refinement": "#C44E52",
     "s5_fep_ranking":   "#8172B2",
 }
-STAGE_ORDER = [
+workflow_ORDER = [
     "s1_ligand_filter",
     "s2_ml_affinity",
     "s3_docking",
     "s4_md_refinement",
     "s5_fep_ranking",
 ]
-STAGE_LABELS = {
+workflow_LABELS = {
     "s1_ligand_filter": "S1 Filter",
     "s2_ml_affinity":   "S2 ML",
     "s3_docking":       "S3 Dock",
@@ -209,7 +214,7 @@ def parse_config(path):
         cfg = yaml.safe_load(fh)
     out = {}
 
-    if "stages" in cfg:
+    if "workflows" in cfg:
         # cm-prototype plan format
         _PILOT_RES = {
             "cpu":      {"cpus": 16, "gpus": 0},
@@ -217,13 +222,14 @@ def parse_config(path):
             "mpi+gpu":  {"cpus": 16, "gpus": 2},
             "largemem": {"cpus":  8, "gpus": 1},
         }
-        stage_ids = {s["id"] for s in cfg.get("stages", [])}
+        workflow_ids = {s["id"] for s in cfg.get("workflows", [])}
         scale = float(cfg.get("cm", {}).get("concurrency_scale", 1.0))
-        for s in cfg.get("stages", []):
+        for s in cfg.get("workflows", []):
             sid      = s["id"]
             upstream = s.get("upstream", "")
-            deps     = [upstream] if upstream in stage_ids else []
+            deps     = [upstream] if upstream in workflow_ids else []
             cap      = int(s.get("concurrency_cap", 0))
+            # Accept legacy max_replicas key from old plan files.
             max_r    = int(s.get("max_replicas",
                                   max(1, round(cap * scale)) if cap else 0))
             pilot    = s.get("pilot", {})
@@ -246,8 +252,9 @@ def parse_config(path):
             out[name] = {
                 "replicas":      int(wf.get("replicas", 0 if has_deps else 1)),
                 "priority":      int(wf.get("priority", 0)),
-                "min":           int(wf.get("min_replicas", 0)),
-                "max":           int(wf.get("max_replicas", 0)),
+                # Accept both new and legacy keys.
+                "min":           int(wf.get("concurrency_floor", wf.get("min_replicas", 0))),
+                "max":           int(wf.get("concurrency_cap",   wf.get("max_replicas", 0))),
                 "deps":          list(wf.get("dependencies", [])),
                 "dep_threshold": int(wf.get("dependency_threshold", 1)),
                 "cpus":          int(wf.get("required_cpus", 0)),
@@ -264,10 +271,10 @@ def plot(spans, group_meta, resource_timeline, signal_events,
         print("No replica events found.", file=sys.stderr)
         return
 
-    # Stage ordering
+    # workflow ordering
     present = {s[1] for s in spans}
-    ordered = [s for s in STAGE_ORDER if s in present] + \
-              sorted(present - set(STAGE_ORDER))
+    ordered = [s for s in workflow_ORDER if s in present] + \
+              sorted(present - set(workflow_ORDER))
 
     def _sort(s):
         rid, grp, *_ = s
@@ -275,18 +282,18 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                 int(rid.rsplit("_", 1)[-1]))
     spans.sort(key=_sort)
 
-    n_stages      = len(ordered)
+    n_workflows      = len(ordered)
     total_cpus, total_gpus = total_resources
     has_resources = bool(resource_timeline)
     has_dreamer   = bool(dreamer_stats) or bool(profiles)
 
     # ── Figure layout ────────────────────────────────────────────────────────
     # Row 0  summary table   (under title, full width)
-    # Row 1  stage-level concurrency Gantt
+    # Row 1  workflow-level concurrency Gantt
     # Row 2  resource util   (CPU/GPU)
     # Row 3  makespan dist + ops dist (dreamer metrics, 2 equal panels)
     summ_h  = 1.5 if has_dreamer else 0
-    gantt_h = max(3.5, n_stages * 0.75)
+    gantt_h = max(3.5, n_workflows * 0.75)
     res_h   = 2.6 if has_resources else 0
     drm_h   = 4.2 if has_dreamer   else 0
     fig_h   = summ_h + gantt_h + res_h + drm_h + 1.2
@@ -321,7 +328,7 @@ def plot(spans, group_meta, resource_timeline, signal_events,
         ax_ops   = fig.add_subplot(inner_d[0, 1])
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 0. STAGE SUMMARY TABLE  (full-width row directly under suptitle)
+    # 0. workflow SUMMARY TABLE  (full-width row directly under suptitle)
     # ─────────────────────────────────────────────────────────────────────────
     if ax_summary is not None and dreamer_stats:
         ax_summary.axis("off")
@@ -340,13 +347,13 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                   "largest_to_fastest":  "l→fast",
                   "random":              "rand"}
 
-        ch = ["Stage", "Facility / partition", "Budget\n(node-h)",
+        ch = ["workflow", "Facility / partition", "Budget\n(node-h)",
               "Cap", "Reps", "Tasks/rep",
               "Makespan\n(avg sim)", "AvgExec\n(avg sim)", "Edge profile", "Strategy"]
         tbl_rows, tbl_cols = [], []
 
         # Enrich with config metadata when available
-        cfg_stages = {}
+        cfg_workflows = {}
         if _HAVE_YAML:
             try:
                 import yaml as _yaml
@@ -355,11 +362,11 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                 if _cfg_path.exists():
                     _raw = _yaml.safe_load(_cfg_path.read_text())
                     _edges = {e["upstream"]: e for e in _raw.get("edges", [])}
-                    for _s in _raw.get("stages", []):
+                    for _s in _raw.get("workflows", []):
                         _sid = _s["id"]
                         _pilot = _s.get("pilot", {})
                         _edge  = _edges.get(_sid, {})
-                        cfg_stages[_sid] = {
+                        cfg_workflows[_sid] = {
                             "facility":   _pilot.get("facility", "—"),
                             "partition":  _pilot.get("partition", "—"),
                             "budget":     _s.get("budget_node_hours", "—"),
@@ -374,10 +381,10 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                 continue
             a  = agg[s]
             st = "/".join(_short.get(x, x) for x in sorted(a["strat"]))
-            cm = cfg_stages.get(s, {})
+            cm = cfg_workflows.get(s, {})
             fac_part = f"{cm.get('facility','—')} / {cm.get('partition','—')}"
             tbl_rows.append([
-                STAGE_LABELS.get(s, s),
+                workflow_LABELS.get(s, s),
                 fac_part,
                 f"{cm.get('budget','—'):,}" if isinstance(cm.get("budget"), (int, float)) else "—",
                 f"{cm.get('cap','—'):,}"    if isinstance(cm.get("cap"),    (int, float)) else "—",
@@ -388,7 +395,7 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                 cm.get("profile", "—"),
                 st,
             ])
-            tbl_cols.append([STAGE_COLORS.get(s, DEFAULT_COLOR)]
+            tbl_cols.append([workflow_COLORS.get(s, DEFAULT_COLOR)]
                             + ["#f5f5f5"] * (len(ch) - 1))
 
         if tbl_rows:
@@ -405,15 +412,15 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                 tbl[0, j].set_text_props(color="white", fontweight="bold")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 1. GANTT CHART  —  actual wall-clock concurrency per stage
+    # 1. GANTT CHART  —  actual wall-clock concurrency per workflow
     #
     # X-axis = elapsed wall-clock seconds (from log).
     # Source: replica start/finish timestamps parsed from the CM log.
     #
-    # For each stage the concurrency step function is derived directly from
+    # For each workflow the concurrency step function is derived directly from
     # the log: events (+1 at replica start, -1 at replica finish) are merged
     # and integrated.  This faithfully reflects the streaming pipeline where
-    # stages overlap in wall-clock time (S1 fires S2 as its first replicas
+    # workflows overlap in wall-clock time (S1 fires S2 as its first replicas
     # finish, S3 fires while S2 is still running, etc.).
     #
     # Bar HEIGHT ∝ peak concurrency / global peak so S4/S5 (peak=1) appear
@@ -421,19 +428,19 @@ def plot(spans, group_meta, resource_timeline, signal_events,
     # readable.
     # ─────────────────────────────────────────────────────────────────────────
 
-    # Build per-stage replica spans in elapsed seconds
-    spans_by_stage: dict[str, list] = {}
+    # Build per-workflow replica spans in elapsed seconds
+    spans_by_workflow: dict[str, list] = {}
     for rid, grp, s_dt, e_dt, ok in spans:
         if grp not in ordered:
             continue
         s_el = (s_dt - t0).total_seconds()
         e_el = (e_dt - t0).total_seconds()
-        spans_by_stage.setdefault(grp, []).append((s_el, e_el, ok))
+        spans_by_workflow.setdefault(grp, []).append((s_el, e_el, ok))
 
-    def _log_sf(stage):
+    def _log_sf(workflow):
         """Concurrency step function from log spans (wall-clock seconds)."""
         events = []
-        for s, e, _ in spans_by_stage.get(stage, []):
+        for s, e, _ in spans_by_workflow.get(workflow, []):
             events.append((s, +1))
             events.append((e, -1))
         if not events:
@@ -447,46 +454,46 @@ def plot(spans, group_meta, resource_timeline, signal_events,
             xs.append(t_ev); ys.append(running)
         return xs, ys
 
-    stage_sf: dict[str, tuple] = {}
-    for stage in ordered:
-        xs, ys = _log_sf(stage)
+    workflow_sf: dict[str, tuple] = {}
+    for workflow in ordered:
+        xs, ys = _log_sf(workflow)
         if not xs:
             continue
-        wc_start = min(spans_by_stage.get(stage, [(0,0,None)])[0][:1] or [0])
-        wc_start = min(s for s, e, _ in spans_by_stage.get(stage, [(0,0,None)]))
-        wc_end   = max(e for s, e, _ in spans_by_stage.get(stage, [(0,0,None)]))
-        stage_sf[stage] = (xs, ys, wc_start, wc_end)
+        wc_start = min(spans_by_workflow.get(workflow, [(0,0,None)])[0][:1] or [0])
+        wc_start = min(s for s, e, _ in spans_by_workflow.get(workflow, [(0,0,None)]))
+        wc_end   = max(e for s, e, _ in spans_by_workflow.get(workflow, [(0,0,None)]))
+        workflow_sf[workflow] = (xs, ys, wc_start, wc_end)
 
-    wc_total = max((e for _, _, _, e in stage_sf.values()), default=1.0) or 1.0
+    wc_total = max((e for _, _, _, e in workflow_sf.values()), default=1.0) or 1.0
 
     global_max_c = max(
-        (max(ys) for _, (_, ys, _, _) in stage_sf.items() if ys), default=1
+        (max(ys) for _, (_, ys, _, _) in workflow_sf.items() if ys), default=1
     ) or 1
 
     # ── Draw ─────────────────────────────────────────────────────────────────
-    for row_idx, stage in enumerate(ordered):
-        if stage not in stage_sf:
+    for row_idx, workflow in enumerate(ordered):
+        if workflow not in workflow_sf:
             continue
-        xs, ys, wc_start, wc_end = stage_sf[stage]
+        xs, ys, wc_start, wc_end = workflow_sf[workflow]
 
-        color = STAGE_COLORS.get(stage, DEFAULT_COLOR)
-        meta  = group_meta.get(stage, {})
+        color = workflow_COLORS.get(workflow, DEFAULT_COLOR)
+        meta  = group_meta.get(workflow, {})
         dur   = wc_end - wc_start
 
-        stage_max_c = max(ys) or 1
-        n_reps = len(spans_by_stage.get(stage, []))
-        n_err  = sum(1 for _, _, ok in spans_by_stage.get(stage, []) if ok is False)
+        workflow_max_c = max(ys) or 1
+        n_reps = len(spans_by_workflow.get(workflow, []))
+        n_err  = sum(1 for _, _, ok in spans_by_workflow.get(workflow, []) if ok is False)
 
         row_bot  = row_idx - 0.45
         row_h    = 0.9
-        min_frac = 0.30   # minimum bar height so single-replica stages stay visible
-        def _scale(y, _smc=stage_max_c):
+        min_frac = 0.30   # minimum bar height so single-replica workflows stay visible
+        def _scale(y, _smc=workflow_max_c):
             if y == 0:
                 return row_bot
             raw = y / global_max_c * row_h
             return row_bot + max(raw, min_frac * row_h * y / _smc)
         ys_sc  = [_scale(y) for y in ys]
-        peak_y = _scale(stage_max_c)
+        peak_y = _scale(workflow_max_c)
 
         ax_gantt.fill_between(xs, row_bot, ys_sc,
                               color=color, alpha=0.60, zorder=2)
@@ -497,7 +504,7 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                         color=color, lw=0.6, ls="--", alpha=0.4, zorder=1)
 
         err_s = f"  ✗{n_err}" if n_err else ""
-        ann = (f"n={n_reps}{err_s}  peak={stage_max_c}"
+        ann = (f"n={n_reps}{err_s}  peak={workflow_max_c}"
                f"  {dur:.1f}s"
                f"  cpu={meta.get('cpus',0)} gpu={meta.get('gpus',0)}")
         ax_gantt.text(wc_total * 1.005, row_idx, ann,
@@ -511,15 +518,15 @@ def plot(spans, group_meta, resource_timeline, signal_events,
     # Trigger-signal markers on the Gantt
     for t_sig, tgt, _ in signal_events:
         if tgt in ordered:
-            ax_gantt.axvline(t_sig, color=STAGE_COLORS.get(tgt, "#888"),
+            ax_gantt.axvline(t_sig, color=workflow_COLORS.get(tgt, "#888"),
                              lw=0.6, ls=":", alpha=0.4, zorder=1)
 
-    ax_gantt.set_yticks(range(n_stages))
-    ax_gantt.set_yticklabels([STAGE_LABELS.get(s, s) for s in ordered],
+    ax_gantt.set_yticks(range(n_workflows))
+    ax_gantt.set_yticklabels([workflow_LABELS.get(s, s) for s in ordered],
                               fontsize=10, fontweight="bold")
     ax_gantt.set_xlabel("Elapsed wall-clock time (s)", fontsize=9)
     ax_gantt.set_title(
-        "Campaign Stage Activity — Streaming Pipeline (wall-clock)\n"
+        "Campaign workflow Activity — Streaming Pipeline (wall-clock)\n"
         "(source: CM log  ·  bar height ∝ concurrent replicas / global peak)",
         fontweight="bold", fontsize=10)
     ax_gantt.invert_yaxis()
@@ -527,8 +534,8 @@ def plot(spans, group_meta, resource_timeline, signal_events,
     ax_gantt.set_xlim(left=0)
 
     legend_handles = (
-        [mpatches.Patch(color=STAGE_COLORS.get(s, DEFAULT_COLOR),
-                        label=STAGE_LABELS.get(s, s)) for s in ordered]
+        [mpatches.Patch(color=workflow_COLORS.get(s, DEFAULT_COLOR),
+                        label=workflow_LABELS.get(s, s)) for s in ordered]
         + [mpatches.Patch(fc="white", ec="red", lw=1.2, label="error")]
     )
     ax_gantt.legend(handles=legend_handles, loc="upper right",
@@ -555,7 +562,7 @@ def plot(spans, group_meta, resource_timeline, signal_events,
         ax_res.set_ylim(bottom=0)
 
         for t_sig, tgt, _ in signal_events:
-            ax_res.axvline(t_sig, color=STAGE_COLORS.get(tgt, "#888"),
+            ax_res.axvline(t_sig, color=workflow_COLORS.get(tgt, "#888"),
                            lw=0.8, alpha=0.4, ls=":")
 
         ax_cpu = ax_res.twinx()
@@ -578,7 +585,7 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                       framealpha=0.8)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 3a. SIMULATED MAKESPAN DISTRIBUTION (box plots per stage)
+    # 3a. SIMULATED MAKESPAN DISTRIBUTION (box plots per workflow)
     # ─────────────────────────────────────────────────────────────────────────
     if ax_mspan is not None and dreamer_stats:
         mspan_by: dict = {s: [] for s in ordered}
@@ -599,16 +606,16 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                 boxprops=dict(lw=1), whiskerprops=dict(lw=1),
                 capprops=dict(lw=1))
             for patch, s in zip(bp["boxes"], plot_stgs):
-                patch.set_facecolor(STAGE_COLORS.get(s, DEFAULT_COLOR))
+                patch.set_facecolor(workflow_COLORS.get(s, DEFAULT_COLOR))
                 patch.set_alpha(0.78)
 
-            # Jittered individual points (sample ≤ 300 per stage)
+            # Jittered individual points (sample ≤ 300 per workflow)
             rng = np.random.default_rng(42)
             for pi, (s, vals) in enumerate(zip(plot_stgs, box_data)):
                 sample = rng.choice(vals, size=min(300, len(vals)), replace=False)
                 jitter = rng.uniform(-0.18, 0.18, size=len(sample))
                 ax_mspan.scatter(pi + jitter, sample, s=4, alpha=0.30,
-                                 color=STAGE_COLORS.get(s, DEFAULT_COLOR), zorder=3)
+                                 color=workflow_COLORS.get(s, DEFAULT_COLOR), zorder=3)
 
             # n + median annotation beside each box
             for pi, (s, vals) in enumerate(zip(plot_stgs, box_data)):
@@ -619,15 +626,15 @@ def plot(spans, group_meta, resource_timeline, signal_events,
 
             ax_mspan.set_xticks(pos)
             ax_mspan.set_xticklabels(
-                [STAGE_LABELS.get(s, s) for s in plot_stgs], fontsize=8)
+                [workflow_LABELS.get(s, s) for s in plot_stgs], fontsize=8)
             ax_mspan.set_ylabel("Simulated makespan (dreamer time units)", fontsize=8)
-            ax_mspan.set_title("Makespan Distribution per Stage\n"
+            ax_mspan.set_title("Makespan Distribution per workflow\n"
                                "(all replicas; ops ÷ core-perf)",
                                fontweight="bold", fontsize=9)
             ax_mspan.grid(axis="y", ls="--", alpha=0.35)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 3b. TASK OPS DISTRIBUTION (box plots per stage)
+    # 3b. TASK OPS DISTRIBUTION (box plots per workflow)
     # ─────────────────────────────────────────────────────────────────────────
     if ax_ops is not None:
         ops_by: dict = {s: [] for s in ordered}
@@ -657,16 +664,16 @@ def plot(spans, group_meta, resource_timeline, signal_events,
                 boxprops=dict(lw=1), whiskerprops=dict(lw=1),
                 capprops=dict(lw=1))
             for patch, s in zip(bp["boxes"], plot_stgs):
-                patch.set_facecolor(STAGE_COLORS.get(s, DEFAULT_COLOR))
+                patch.set_facecolor(workflow_COLORS.get(s, DEFAULT_COLOR))
                 patch.set_alpha(0.78)
 
-            # Jittered points (sample ≤ 300 per stage)
+            # Jittered points (sample ≤ 300 per workflow)
             rng = np.random.default_rng(42)
             for pi, (s, ops) in enumerate(zip(plot_stgs, box_data)):
                 sample = rng.choice(ops, size=min(300, len(ops)), replace=False)
                 jitter = rng.uniform(-0.2, 0.2, size=len(sample))
                 ax_ops.scatter(pi + jitter, sample, s=3, alpha=0.30,
-                               color=STAGE_COLORS.get(s, DEFAULT_COLOR), zorder=3)
+                               color=workflow_COLORS.get(s, DEFAULT_COLOR), zorder=3)
 
             # Median annotation
             for pi, ops in enumerate(box_data):
@@ -676,16 +683,16 @@ def plot(spans, group_meta, resource_timeline, signal_events,
 
             ax_ops.set_yscale("log")
             ax_ops.set_xticks(pos)
-            ax_ops.set_xticklabels([STAGE_LABELS.get(s, s) for s in plot_stgs],
+            ax_ops.set_xticklabels([workflow_LABELS.get(s, s) for s in plot_stgs],
                                    fontsize=8)
             ax_ops.set_ylabel("Task ops (log scale, dreamer units)", fontsize=8)
-            ax_ops.set_title("Task Ops Distribution per Stage\n"
+            ax_ops.set_title("Task Ops Distribution per workflow\n"
                              "(all tasks × all replicas; log scale)",
                              fontweight="bold", fontsize=9)
             ax_ops.grid(axis="y", ls="--", alpha=0.35)
 
     # ─────────────────────────────────────────────────────────────────────────
-    fig.suptitle("Dreamer Campaign — 5-Stage Drug Discovery Cascade",
+    fig.suptitle("Dreamer Campaign — 5-workflow Drug Discovery Cascade",
                  fontsize=13, fontweight="bold")
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved → {out_path}")
@@ -721,10 +728,10 @@ def main():
     group_meta_cfg = parse_config(args.config) if args.config else {}
     group_meta = group_meta_cfg if group_meta_cfg else group_meta_log
     if args.config:
-        print(f"Stage config from: {args.config}")
+        print(f"workflow config from: {args.config}")
     profiles = load_profiles(args.profiles_dir)
 
-    print(f"Parsed: {len(spans)} replica spans | {len(group_meta)} stages | "
+    print(f"Parsed: {len(spans)} replica spans | {len(group_meta)} workflows | "
           f"{len(resource_timeline)} resource events | {len(signal_events)} triggers | "
           f"{len(dreamer_stats)} dreamer records | {len(profiles)} profile JSONs")
 

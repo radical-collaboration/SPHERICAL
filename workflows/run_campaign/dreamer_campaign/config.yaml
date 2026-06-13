@@ -8,7 +8,7 @@
 #     dreamer: — radical.dreamer emulation parameters (one block per stage)
 #
 # Prototype fields per stage (unchanged):
-#   id, upstream, downstream, threshold_top_fraction, budget_node_hours,
+#   id, upstream, downstream, budget_node_hours,
 #   pilot, concurrency_cap, surrogate, downstream_input_target, variant
 #
 # SPHERICAL-only additions per stage:
@@ -123,11 +123,10 @@ stages:
   - id:                     s1_ligand_filter
     upstream:               library
     downstream:             s2_ml_affinity
-    threshold_top_fraction: 1.0   # score_threshold in dreamer block gates s1→s2; CM filter disabled
     budget_node_hours:      7200
     pilot: { facility: perlmutter, partition: gpu, nodes: 300, walltime_h: 24 }
     concurrency_cap:        30
-    min_replicas:           4     # guaranteed floor so s1 isn't starved by downstream priorities
+    concurrency_floor:           4     # guaranteed floor so s1 isn't starved by downstream priorities
 
     dreamer:
       use_stub:           true
@@ -146,14 +145,24 @@ stages:
   - id:                     s2_ml_affinity
     upstream:               s1_ligand_filter
     downstream:             s3_docking
-    threshold_top_fraction: 0.14
     budget_node_hours:      20000
+    # Cascade target used by BudgetController.evaluate (denominator for
+    # progress) — only consulted when features.budget_control: true.
+    downstream_input_target: 100
     pilot: { facility: perlmutter, partition: gpu, nodes: 100, walltime_h: 48 }
     surrogate:
-      model_ref:           surrogate-s2-v1
-      uncertainty_cutoff:  0.20
-      cutoff_nudge_bounds: [0.10, 0.40]
-    threshold_top_fraction: 1.0   # CM filter disabled; dreamer score_threshold=0.35 gates s2→s3
+      model_ref:                       surrogate-s2-v1
+      # Legacy keys retained for back-compat with non-budget configs.
+      uncertainty_cutoff:              0.20
+      cutoff_nudge_bounds:             [0.10, 0.40]
+      # New keys: full Triage spec for features.budget_control: true.
+      score_cutoff:                    0.50
+      score_cutoff_nudge_bounds:       [0.30, 0.80]
+      uncertainty_cutoff_nudge_bounds: [0.15, 0.50]
+      # ADVANCE threshold — when a candidate's surrogate prediction is
+      # ≥ this AND uncertainty is below cutoff, skip this stage's compute.
+      # s2 is cheap (0.5s); skip only the very confident top tier.
+      advance_threshold:               0.88
     concurrency_cap: 16
     # All triggers dispatched — optimisations manage scheduling, not work reduction.
     # BP throttles queue depth to prevent runaway cascade; bandit allocates GPUs.
@@ -175,14 +184,18 @@ stages:
     upstream:               s2_ml_affinity
     downstream:             s4_md_refinement
     variant:                full
-    threshold_top_fraction: 0.50
     budget_node_hours:      30000
+    downstream_input_target: 30
     pilot: { facility: frontier, partition: gpu, nodes: 200, walltime_h: 72 }
     surrogate:
-      model_ref:           surrogate-s3-v1
-      uncertainty_cutoff:  0.25
-      cutoff_nudge_bounds: [0.15, 0.40]
-    threshold_top_fraction: 1.0   # CM filter disabled; dreamer score_threshold=0.40 gates s3→s4
+      model_ref:                       surrogate-s3-v1
+      uncertainty_cutoff:              0.25
+      cutoff_nudge_bounds:             [0.15, 0.40]
+      score_cutoff:                    0.55
+      score_cutoff_nudge_bounds:       [0.35, 0.85]
+      uncertainty_cutoff_nudge_bounds: [0.10, 0.45]
+      # s3 is 1s — more expensive; lower threshold so more candidates skip.
+      advance_threshold:               0.82
     concurrency_cap: 12
     sharding: { target_size: 20, min_size: 4, max_size: 40, stratify: soft, use_bandit: true, profile: diverse_top }
 
@@ -199,12 +212,19 @@ stages:
   - id:                     s4_md_refinement
     upstream:               s3_docking
     downstream:             s5_fep_ranking
-    threshold_top_fraction: 0.60
     budget_node_hours:      30000
+    downstream_input_target: 10
     pilot: { facility: frontier, partition: gpu, nodes: 400, walltime_h: 168 }
+    surrogate:
+      score_cutoff:                    0.60
+      score_cutoff_nudge_bounds:       [0.40, 0.90]
+      uncertainty_cutoff:              0.20
+      uncertainty_cutoff_nudge_bounds: [0.08, 0.40]
+      # s4 is 2s (MD refinement) — the most expensive non-terminal stage.
+      # Bigger wall-time savings; threshold loose enough to fire frequently.
+      advance_threshold:               0.75
     # DEBUG: changed mpi+gpu→gpu (1 GPU/replica instead of 2) so s4 can start when a
     # single GPU is freed — required_gpus=2 deadlocked the pipeline while s1 ran.
-    threshold_top_fraction: 1.0   # CM filter disabled; dreamer score_threshold=0.45 gates s4→s5
     concurrency_cap:        8
     sharding: { target_size: 12, min_size: 4, max_size: 24, stratify: soft, use_bandit: true }
 
@@ -221,11 +241,18 @@ stages:
   - id:                     s5_fep_ranking
     upstream:               s4_md_refinement
     downstream:             final_lead_set
-    threshold_top_fraction: 0.60
     budget_node_hours:      25000
     pilot: { facility: frontier, partition: largemem, nodes: 200, walltime_h: 240 }
-    threshold_top_fraction: 1.0   # CM filter disabled; all s4 pass (score_threshold=0.0 in dreamer)
-    downstream_input_target: 5    # stop when 5 s5 leads produced
+    downstream_input_target: 5    # BudgetController denominator T
+    campaign_target: 5            # early-stop: halt campaign when 5 s5 leads produced
+    surrogate:
+      score_cutoff:                    0.65
+      score_cutoff_nudge_bounds:       [0.45, 0.92]
+      uncertainty_cutoff:              0.18
+      uncertainty_cutoff_nudge_bounds: [0.07, 0.35]
+      # s5 (FEP, terminal) — only skip the very highest-confidence
+      # candidates since this is the final ranking step.
+      advance_threshold:               0.90
     concurrency_cap:         6
     sharding: { target_size: 6, min_size: 2, max_size: 12, stratify: soft, use_bandit: true }
 
@@ -320,8 +347,7 @@ debug:
     s1_ligand_filter: 10000  # 10000×0.5s÷24GPU=208s s1 phase; longer overlap for bandit convergence
 
   # Fraction of stage-N total that becomes stage-N+1 total.
-  # Values mirror threshold_top_fraction from the stage specs.
-  # Trigger fractions replaced by score-based gating in dreamer_workflow.
+  # Gating is done by dreamer.score_threshold inside each workflow replica.
   # Each stage triggers downstream only when output_score >= score_threshold.
   # Expected funnel: 200 s1 → ~130 s2 → ~78 s3 → ~43 s4 → ~24 s5 (stops at target=5)
 

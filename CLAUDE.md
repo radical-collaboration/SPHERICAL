@@ -65,7 +65,7 @@ SPHERICAL is an **async-native HPC workflow orchestrator** built on `radical.asy
 ```
 AsyncCampaignManager (campaign_manager.py)
 ├── SchedulerMixin (scheduler.py)
-│   └── Two-pass greedy scheduler: guarantee min_replicas, fill to max_replicas
+│   └── Two-pass greedy scheduler: guarantee concurrency_floor, fill to concurrency_cap
 ├── ExecutorMixin (executor.py)
 │   └── Replica lifecycle: launch, monitor, completion, GPU assignment
 ├── MonitorMixin (monitor_mixin.py)
@@ -90,7 +90,7 @@ Orchestrates workflow groups with dependencies and resource constraints:
 
 - **Groups**: Named pools of replicas of the same workflow class. Each group has:
   - `replicas`: total count (0 = dependent, wait for trigger)
-  - `min_replicas` / `max_replicas`: concurrent caps
+  - `concurrency_floor` / `concurrency_cap`: concurrent caps
   - `priority`: scheduling priority (higher = first)
   - `required_cpus` / `required_gpus`: per-replica resource reservation
   - `dependencies`: upstream groups that must signal before this group starts
@@ -100,8 +100,8 @@ Orchestrates workflow groups with dependencies and resource constraints:
   - `_trigger_dependent(name, replicas=N)`: explicit queue N replicas to a named group
 
 - **Scheduler**: Runs on every state change (replica finish, signal received). Two-pass greedy:
-  1. Pass 1: guarantee `min_replicas` for all eligible groups (highest priority first)
-  2. Pass 2: fill remaining capacity up to `max_replicas` (highest priority first)
+  1. Pass 1: guarantee `concurrency_floor` for all eligible groups (highest priority first)
+  2. Pass 2: fill remaining capacity up to `concurrency_cap` (highest priority first)
 
 A group is **eligible** when its dependencies are **ready**:
   - Workflow-driven: dependency called `_signal_done()` (sets `group.ready = True`)
@@ -163,8 +163,8 @@ resources:
 workflows:
   sim:
     replicas: 8              # independent: starts immediately
-    min_replicas: 2
-    max_replicas: 4
+    concurrency_floor: 2
+    concurrency_cap: 4
     priority: 10
     required_cpus: 4
     required_gpus: 1
@@ -172,8 +172,8 @@ workflows:
 
   analysis:
     priority: 8
-    min_replicas: 1
-    max_replicas: 4
+    concurrency_floor: 1
+    concurrency_cap: 4
     required_cpus: 4
     required_gpus: 1
     dependencies: [sim]      # dependent: starts at 0 replicas
@@ -271,6 +271,74 @@ Thompson-sampling multi-armed bandit for optimization. Two use cases:
 
 **Scheduling bandit**: arms = cross-stage priority; reward = downstream BP state quality
 
+### Triage + Surrogate (triage.py, surrogate.py)
+
+Per-candidate gate that runs **before** any compute is spent. A `Surrogate`
+model (`surrogate.py`: `NullSurrogate`, `RandomSurrogate`, `CorrelatedSurrogate`
+— `surrogate_pred ≈ score × 0.9 + noise`) cheaply predicts a candidate's
+downstream score. `Triage` (triage.py) then returns one of:
+
+- **RUN** — execute normally
+- **DISCARD** — drop candidates below the surrogate cutoffs before they consume resources
+- **ADVANCE** — fast-forward high-confidence leads (score ≥ `advance_threshold`), skipping expensive stages
+
+The DISCARD cutoffs live in the stage's `SurrogateSpec` (CM-adjustable); the
+ADVANCE bar is `Triage.advance_threshold` (default `inf` → ADVANCE off):
+
+```yaml
+# structured plan (plan/schema.py): per-stage surrogate + triage
+stages:
+  - id: s2_ml_affinity
+    advance_threshold: 0.88        # surrogate score above which a lead skips compute
+    surrogate:
+      score_cutoff: 0.40           # DISCARD: reject upstream score < this
+      uncertainty_cutoff: 0.30     # DISCARD: reject surrogate σ > this
+      score_cutoff_nudge_bounds: [0.0, 0.6]   # bounds BudgetController may nudge within
+```
+
+`RecallTracker` (in surrogate.py) monitors how often the surrogate's ADVANCE
+calls would have been correct, feeding the `surrogate_recall_floor` drift check.
+
+### BudgetController (budget_controller.py)
+
+Proportional feedback loop that keeps a stage's spend on plan by nudging its
+Triage **score cutoff**. Each finished replica updates `burn_ratio = actual /
+(budget × progress)`; if it drifts outside the band the controller raises or
+lowers the cutoff (bounded by plan-set `nudge_bounds`).
+
+```yaml
+cm:
+  # ...
+workflows:
+  s2_ml_affinity:
+    downstream_input_target: 200   # BudgetController denominator (planned throughput)
+    budget_kp: 0.002               # proportional gain
+    budget_warmup_min: 20          # min finished replicas before nudging starts
+```
+
+- `downstream_input_target` — the BudgetController denominator (planned input volume).
+- `campaign_target` — **separate** early-stop trigger; the campaign ends when a
+  stage reaches this many completions (0 = never early-stop on this stage).
+
+When the cutoff stays bound-locked for K cycles, the Monitor raises a
+`BUDGET_LOCKED` drift event → `ReplanningController` (see below).
+
+### Replanning (replanning.py)
+
+`ReplanningController` consumes `DriftEvent`s from the Monitor and decides
+whether to request a replan (re-deriving stage priorities, budgets, or
+concurrency from current state). Drives the reactive arm of the monitor loop.
+
+### Structured plan schema (plan/)
+
+Campaigns can be expressed either as the legacy flat `workflows:` dict or as a
+typed `CampaignPlan` (`plan/schema.py`: `StageSpec`, `EdgeSpec`,
+`SurrogateSpec`, `BackpressureEdge`, `RetryPolicy`, `PilotSpec`,
+`ReplanThresholds`). `load_plan()` (`plan/loader.py`) auto-detects the shape;
+`plan_to_workflows_dict()` flattens a structured plan to the registration form.
+The `bandit_warmstart` flag toggles depth-based warm-start priors
+(`Beta(depth+1, 1)`) vs. uniform priors.
+
 ---
 
 ## Key File Organization
@@ -279,7 +347,7 @@ Thompson-sampling multi-armed bandit for optimization. Two use cases:
 
 - **campaign_manager.py**: Main class; constructor, config loading, group registration
 - **base_workflow.py**: User-defined workflow base class
-- **types.py**: `_GroupInfo`, `ResourcePool`, `WorkflowStats` data structures
+- **types.py**: `_WorkflowInfo`, `ResourcePool`, `WorkflowStats`, `CampaignState` data structures
 - **scheduler.py**: SchedulerMixin — two-pass scheduling logic
 - **executor.py**: ExecutorMixin — replica launch/completion/GPU assignment
 - **monitor_mixin.py**: MonitorMixin — periodic health checks
@@ -290,11 +358,17 @@ Thompson-sampling multi-armed bandit for optimization. Two use cases:
 
 - **backpressure.py**: `BackpressureNegotiator` — hysteresis state machine
 - **sharder.py**: `Sharder` — buffering and batch dispatch with priority ranking
+- **bandit.py**: `Bandit`, `SchedulingBandit` — Thompson-sampling optimization
+- **triage.py**: `Triage`, `TriageDecision` — per-candidate RUN/DISCARD/ADVANCE gate
+- **surrogate.py**: `Surrogate` (`Null`/`Random`/`Correlated`), `RecallTracker` — cheap score predictor
+- **budget_controller.py**: `BudgetController` — burn-ratio feedback on Triage cutoffs
+- **replanning.py**: `ReplanningController` — drift-triggered replanning
 - **candidate_log.py**: `CandidateLog`, `CandidateHistory` — tracks upstream results
 - **monitor.py**: `Monitor`, `DriftEvent` — drift detection logic
-- **bandit.py**: `Bandit`, `SchedulingBandit` — Thompson-sampling optimization
 - **profiles.py**: `ProfileWeights`, `PROFILES` — candidate ranking profiles
 - **metrics.py**: `CampaignMetrics` — in-process event recording (timing, BP transitions, etc.)
+- **plan/schema.py**: `CampaignPlan`, `StageSpec`, `EdgeSpec`, `SurrogateSpec`, ... — typed plan
+- **plan/loader.py**: `load_plan()`, `plan_to_workflows_dict()` — structured + legacy config
 
 ### Utilities
 
@@ -431,8 +505,8 @@ cm = AsyncCampaignManager.from_config(config, WORKFLOW_REGISTRY)
 
 # Option 2: manual registration
 cm = AsyncCampaignManager(engine="concurrent", total_cpus=128, total_gpus=4)
-cm.register_group("wf1", Workflow1, replicas=4, ...)
-cm.register_group("wf2", Workflow2, dependencies=["wf1"], ...)
+cm.register_workflow("wf1", Workflow1, replicas=4, ...)
+cm.register_workflow("wf2", Workflow2, dependencies=["wf1"], ...)
 
 # Run
 await cm.start()
@@ -500,8 +574,8 @@ This allows purely dependent groups to remain inactive without stalling the camp
 
 ### Concurrency Caps
 
-- `max_replicas`: sliding-window concurrency cap per group
-- `min_replicas`: guaranteed concurrent slots (priority-ordered across groups in Pass 1)
+- `concurrency_cap`: sliding-window concurrency cap per group
+- `concurrency_floor`: guaranteed concurrent slots (priority-ordered across groups in Pass 1)
 - If a group has slots but cannot be satisfied by resources, a WARNING is logged
 
 ### Backpressure Tuning

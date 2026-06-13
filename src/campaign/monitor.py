@@ -19,9 +19,10 @@ from typing import Optional
 
 
 class DriftKind(Enum):
-    BUDGET_BURN    = "budget_burn"
-    PASS_THROUGH   = "pass_through"
-    SURROGATE_RECALL = "surrogate_recall"
+    BUDGET_BURN      = "budget_burn"           # spend > expected by Monitor's threshold
+    PASS_THROUGH     = "pass_through"          # observed pass-through ≠ planned fraction
+    SURROGATE_RECALL = "surrogate_recall"      # surrogate model accuracy degraded
+    BUDGET_LOCKED    = "budget_locked"         # BudgetController exhausted its nudge envelope
 
 
 @dataclass

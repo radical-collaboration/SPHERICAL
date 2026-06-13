@@ -2,6 +2,13 @@
 """
 Plot replica execution timeline from a campaign SLURM log.
 
+Generic (campaign-agnostic) timeline: Gantt chart of replica execution + a
+CPU/GPU resource-utilization row, for any AsyncCampaignManager run. For the
+Dreamer emulation campaign use ``dreamer_campaign/plot_dreamer_timeline.py``
+instead — it is a superset that adds a third row of simulation statistics
+(makespan, task-ops box plots, per-workflow stats) and hardcodes the s1–s5
+antigen stages.
+
 Usage:
     python plot_cm_timeline.py slurm-XXXXXX.out [--out timeline.png]
 """
@@ -661,8 +668,10 @@ def parse_config(path: str) -> dict:
         group_meta[name] = {
             "replicas": int(wf.get("replicas", default_replicas)),
             "priority": int(wf.get("priority", 0)),
-            "min": int(wf.get("min_replicas", 0)),
-            "max": int(wf.get("max_replicas", 0)),
+            # Accept both new (concurrency_floor / concurrency_cap) and legacy
+            # (min_replicas / max_replicas) keys so old benchmark configs render.
+            "min": int(wf.get("concurrency_floor", wf.get("min_replicas", 0))),
+            "max": int(wf.get("concurrency_cap",   wf.get("max_replicas", 0))),
             "deps": list(wf.get("dependencies", [])),
             "dep_threshold": int(wf.get("dependency_threshold", 1)),
             "cpus": int(wf.get("required_cpus", 0)),

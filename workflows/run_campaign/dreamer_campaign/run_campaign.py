@@ -34,7 +34,7 @@ Dreamer campaign runner — supports two config formats:
   The translator maps:
     stage.upstream / downstream  → dependencies / trigger_downstream
     stage.pilot.partition        → required_cpus / required_gpus
-    stage.concurrency_cap        → max_replicas  (× cm.concurrency_scale)
+    stage.concurrency_cap        → concurrency_cap  (× cm.concurrency_scale)
     edge.profile                 → schedule_strategy / early_binding
     edge.backpressure            → backpressure_high / backpressure_low (metadata)
     stage.dreamer.*              → dreamer emulation parameters
@@ -124,9 +124,10 @@ def _build_from_plan(config: dict) -> dict:
         # Only treat upstream as a CM dependency when it's a real stage
         deps = [upstream] if upstream in stage_ids else []
 
-        # concurrency_cap is used directly as max_replicas for local emulation
-        cap   = int(stage.get("concurrency_cap", 0))
-        max_r = int(stage.get("max_replicas", cap or 0))
+        # concurrency_cap drives the CM's concurrency_cap field directly for
+        # local emulation.  Accept the legacy max_replicas key for back-compat.
+        cap   = int(stage.get("concurrency_cap",
+                              stage.get("max_replicas", 0)))
 
         # pilot.partition → required_cpus / required_gpus
         pilot     = stage.get("pilot", {})
@@ -159,12 +160,12 @@ def _build_from_plan(config: dict) -> dict:
         wf_cfg: dict = {
             # ── CM scheduling (consumed by from_config, not forwarded) ───
             "replicas":             replicas,
-            "min_replicas":         int(stage.get("min_replicas", 0)),
-            "max_replicas":         max_r,
+            "concurrency_floor":    int(stage.get("concurrency_floor",
+                                                  stage.get("min_replicas", 0))),
+            "concurrency_cap":      cap,
             "priority":             int(stage.get("priority", 0)),
             "dependencies":         deps,
             "dependency_threshold": int(stage.get("dependency_threshold", 1)),
-            "concurrency_cap":      cap,
             **resources,   # required_cpus, required_gpus
 
             # ── Workflow config (forwarded to DreamerWorkflow.config) ────
@@ -173,6 +174,11 @@ def _build_from_plan(config: dict) -> dict:
             "threshold_top_fraction":   stage.get("threshold_top_fraction"),
             "budget_node_hours":        stage.get("budget_node_hours"),
             "downstream_input_target":  stage.get("downstream_input_target"),
+            # campaign_target: early-stop trigger read by executor._on_replica_finished.
+            # Must be forwarded into workflow_config (the executor does not see the
+            # typed plan StageSpec; budget_kp/burn_rate_band reach BudgetController
+            # via the plan path, but the early-stop check reads workflow_config).
+            "campaign_target":          stage.get("campaign_target"),
             "pilot":                    pilot or None,
             "surrogate":                stage.get("surrogate"),
             "profile":                  profile,

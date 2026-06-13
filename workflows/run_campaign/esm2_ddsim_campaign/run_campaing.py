@@ -20,11 +20,11 @@ Config file structure
     # ── Per-workflow sections ─────────────────────────────────────────────
     workflows:
       ddsim:
-        replicas:     8
-        min_replicas: 2
-        max_replicas: 4
-        dependencies: []
-        ddsim_config: "/path/to/ddmd_config.yaml"
+        replicas:          8
+        concurrency_floor: 2
+        concurrency_cap:   4
+        dependencies:      []
+        ddsim_config:      "/path/to/ddmd_config.yaml"
 
       inference:
         replicas:     1

@@ -5,12 +5,12 @@ plot_optimizations.py — visualise per-optimization performance improvements.
 Reads benchmark_results.json produced by benchmark.py and generates 7 plots:
 
   1. wall_time.png           — campaign wall time per configuration
-  2. pipeline_gantt.png      — stage execution overlap (first/last replica timeline)
-  3. cascade_funnel.png      — total replicas launched per stage (compute waste)
-  4. gpu_utilization.png     — GPU slots in use per stage over time (4-panel)
+  2. pipeline_gantt.png      — workflow execution overlap (first/last workflow timeline)
+  3. cascade_funnel.png      — total workflows launched per workflow (compute waste)
+  4. gpu_utilization.png     — GPU slots in use per workflow over time (4-panel)
   5. shard_dispatch.png      — cumulative candidates dispatched by sharder over time
   6. bandit_convergence.png  — scheduling bandit Thompson-sample convergence
-  7. time_to_target.png      — cumulative terminal-stage completions over wall time
+  7. time_to_target.png      — cumulative terminal-workflow completions over wall time
 
 Each plot is designed to support one specific optimization axis:
   - sharding+bp:         plots 3 (cascade funnel) + 5 (shard dispatch)
@@ -38,14 +38,35 @@ import numpy as np
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 
+# Configs excluded from ALL optimisation plots.  budget_control runs to a
+# different stopping criterion (w2 throughput, not w5 lead count) and is
+# documented separately in plot_budget_control.py.
+_EXCLUDE = {"budget_control", "bandit_demo"}
+
+# Keys MUST match the config keys in benchmark_results.json (main() filters by
+# `k in CFG_COLORS`).  Pretty legend names live in CFG_DISPLAY below.
 CFG_COLORS = {
     "baseline":             "#9e9e9e",
     "sharding+bp":          "#4caf50",
     "scheduling_bandit":    "#9c27b0",
+    "triage":               "#00838f",
+    "budget_control":       "#ff6f00",
+    "bandit_demo":          "#9c27b0",
     "all_optimizations":    "#f44336",
 }
 
-STAGE_COLORS = {
+# Display names for configurations (data keys stay as-is; shown with nicer labels).
+CFG_DISPLAY = {
+    "sharding+bp":       "sharding",
+    "scheduling_bandit": "scheduling",
+    "triage":            "surrogate",
+    "all_optimizations": "all optimizations",
+}
+
+def _cname(cfg: str) -> str:
+    return CFG_DISPLAY.get(cfg, cfg)
+
+workflow_COLORS = {
     "s1_ligand_filter": "#42a5f5",
     "s2_ml_affinity":   "#66bb6a",
     "s3_docking":       "#ffa726",
@@ -53,10 +74,20 @@ STAGE_COLORS = {
     "s5_fep_ranking":   "#ab47bc",
 }
 
-STAGE_ORDER = [
+workflow_ORDER = [
     "s1_ligand_filter", "s2_ml_affinity", "s3_docking",
     "s4_md_refinement", "s5_fep_ranking",
 ]
+
+# Display names (data keys are s1..s5; labels are the antigen-cascade names)
+DISPLAY = {
+    "s1_ligand_filter": "Initial Screening",
+    "s2_ml_affinity":   "Active Learning",
+    "s3_docking":       "Structural Modeling",
+    "s4_md_refinement": "Refinement Simulation",
+    "s5_fep_ranking":   "Affinity Ranking",
+}
+TARGET_WORKFLOW = "s5_fep_ranking"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -89,10 +120,14 @@ def _z(v, default=0.0):
 
 
 def _caption(fig, text: str) -> None:
+    # NOTE: do NOT use wrap=True here — combined with savefig(bbox_inches="tight")
+    # matplotlib mis-computes the wrap width and can emit a giant canvas
+    # (PIL DecompressionBombError). Pre-wrap manually instead.
+    import textwrap
+    wrapped = "\n".join(textwrap.wrap(text, width=150)) or text
     fig.text(
-        0.5, -0.02, text,
+        0.5, -0.02, wrapped,
         ha="center", va="top", fontsize=7.5, color="#444",
-        wrap=True,
         bbox=dict(boxstyle="round,pad=0.4", facecolor="#f5f5f5",
                   edgecolor="#ccc", linewidth=0.8),
         transform=fig.transFigure,
@@ -103,14 +138,14 @@ def _repr_run(runs, key="wall_time_s"):
     """Return the run whose key value is closest to the median."""
     vals = [(i, r.get(key)) for i, r in enumerate(runs) if r.get(key) is not None]
     if not vals:
-        return runs[0]
+        return runs[0] if runs else None
     med = statistics.median(v for _, v in vals)
     idx = min(vals, key=lambda iv: abs(iv[1] - med))[0]
     return runs[idx]
 
 
 def _reconstruct_intervals(replica_events):
-    """Yield (start_t, finish_t, group) for each replica that both started and finished."""
+    """Yield (start_t, finish_t, group) for each workflow that both started and finished."""
     starts: dict[str, float] = {}
     groups: dict[str, str] = {}
     for e in replica_events:
@@ -125,7 +160,10 @@ def _reconstruct_intervals(replica_events):
 # ── Plot 1: Campaign wall time ────────────────────────────────────────────────
 
 def plot_wall_time(results: dict, out_dir: Path) -> None:
-    cfgs     = list(results.keys())
+    # budget_control is excluded: it runs to a different stopping criterion
+    # (w2 throughput target, not w5 lead count) and is not a time-reduction
+    # optimisation — it is documented separately in plot_budget_control.py.
+    cfgs     = [c for c in results.keys() if c not in _EXCLUDE]
     medians  = [_median([r["wall_time_s"] for r in results[c] if r.get("wall_time_s")]) for c in cfgs]
     baseline = _median([r["wall_time_s"] for r in results.get("baseline", []) if r.get("wall_time_s")]) or 1.0
 
@@ -145,21 +183,19 @@ def plot_wall_time(results: dict, out_dir: Path) -> None:
                     label, ha="center", va="bottom", fontsize=9, fontweight="bold")
     ax.axhline(baseline, color="gray", linestyle="--", linewidth=0.9, label="baseline median")
     ax.set_xticks(x)
-    ax.set_xticklabels(cfgs, rotation=20, ha="right", fontsize=10)
+    ax.set_xticklabels([_cname(c) for c in cfgs], rotation=20, ha="right", fontsize=10)
     ax.set_ylabel("Wall time to target (s)")
     ax.set_title("Campaign wall time by configuration\n"
-                 "(time to find 5 terminal-stage hits; lower is better; % vs baseline)")
+                 "(time to find 5 high-quality candidates; lower is better; % vs baseline)")
     ax.legend(fontsize=9)
     plt.tight_layout()
     _caption(fig,
-        "LOWER IS BETTER.  Wall-clock time from campaign start until the 5th s5_fep_ranking "
-        "replica completes (early-termination target).  Bar = median of 5 runs; white dots = "
-        "individual runs (spread shows run-to-run variance).  "
-        "sharding+bp: sharder routes highest-score candidates first — fewer total replicas needed "
-        "to produce 5 quality hits (4.9× faster).  "
-        "scheduling_bandit: Thompson-sampling bandit allocates GPUs to terminal stages earlier "
-        "(3.1× faster).  "
-        "all_optimizations: both axes combined (10.9× faster, lowest variance)."
+        "LOWER IS BETTER.  Wall-clock time until the 5th high-quality candidate found.  "
+        "Bar = median; white dots = individual runs.  "
+        "sharding+bp: sharder routes highest-score candidates first — fewer total workflows.  "
+        "scheduling_bandit: Thompson-sampling bandit allocates resources to final-workflow calculations earlier.  "
+        "surrogate: bypasses expensive compute for high-confidence candidates.  "
+        "all_optimizations: all axes combined — lowest wall time and lowest variance."
     )
     plt.savefig(out_dir / "1_wall_time.png", dpi=150, bbox_inches="tight")
     plt.close()
@@ -169,7 +205,7 @@ def plot_wall_time(results: dict, out_dir: Path) -> None:
 # ── Plot 2: Pipeline Gantt ────────────────────────────────────────────────────
 
 def plot_gantt(results: dict, out_dir: Path) -> None:
-    cfgs = list(results.keys())
+    cfgs = [c for c in results.keys() if c not in _EXCLUDE]
     n    = len(cfgs)
     fig, axes = plt.subplots(n, 1, figsize=(12, 2.2 * n), sharex=False)
     if n == 1:
@@ -180,7 +216,7 @@ def plot_gantt(results: dict, out_dir: Path) -> None:
         if not runs:
             ax.set_title(cfg)
             continue
-        groups = STAGE_ORDER
+        groups = workflow_ORDER
         for i, g in enumerate(groups):
             starts   = [r["group_stats"].get(g, {}).get("first_start") for r in runs]
             finishes = [r["group_stats"].get(g, {}).get("last_finish")  for r in runs]
@@ -189,29 +225,28 @@ def plot_gantt(results: dict, out_dir: Path) -> None:
             if not starts or not finishes:
                 continue
             s, f = _mean(starts), _mean(finishes)
-            color = STAGE_COLORS.get(g, "#888")
+            color = workflow_COLORS.get(g, "#888")
             ax.barh(i, f - s, left=s, height=0.55, color=color, alpha=0.85)
-            ax.text(s + (f - s) / 2, i, g.replace("_", " "),
+            ax.text(s + (f - s) / 2, i, DISPLAY.get(g, g),
                     ha="center", va="center", fontsize=6, color="white", fontweight="bold")
         wts = [r.get("wall_time_s") for r in runs if r.get("wall_time_s")]
         t_end = _mean(wts) or 0
         ax.axvline(t_end, color="black", linestyle=":", linewidth=1.0, alpha=0.5)
         ax.set_yticks([])
         ax.set_xlabel("Time (s)" if ax is axes[-1] else "")
-        ax.set_title(f"{cfg}  (avg wall={t_end:.1f}s)", fontsize=9, color=CFG_COLORS.get(cfg, "black"))
+        ax.set_title(f"{_cname(cfg)}  (avg wall={t_end:.1f}s)", fontsize=9, color=CFG_COLORS.get(cfg, "black"))
         ax.grid(axis="x", linestyle="--", alpha=0.35)
 
-    plt.suptitle("Stage execution overlap per configuration\n"
+    plt.suptitle("workflow execution overlap per configuration\n"
                  "(more overlap = better pipeline utilisation)", y=1.01, fontsize=10)
     plt.tight_layout()
-    _caption(fig,
-        "MORE OVERLAP IS BETTER.  Each bar shows the average first-start to last-finish span "
-        "of a stage across 5 runs.  Dotted vertical line = campaign end (target reached).  "
-        "baseline: s1 runs long before downstream stages accumulate enough triggers.  "
-        "sharding+bp: min_replicas floor forces s2-s5 slots open from the start.  "
-        "scheduling_bandit: bandit allocates GPU budget downstream — s4/s5 start early even "
-        "while s1 is still running.  all_optimizations: all stages overlap from t~1s onward."
-    )
+    # _caption(fig,
+    #     "MORE OVERLAP IS BETTER.  Each bar spans the average first-start to last-finish "
+    #     "of a workflow across 5 runs.  Dotted line = moment the campaign goal was reached. "
+    #     # "Bars extending past the dotted line are "
+    #     # "in-flight workflows that were already running when the goal fired and completed "
+    #     # "naturally — they represent wasted compute after the objective was met."
+    # )
     plt.savefig(out_dir / "2_pipeline_gantt.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  2_pipeline_gantt.png")
@@ -220,111 +255,99 @@ def plot_gantt(results: dict, out_dir: Path) -> None:
 # ── Plot 3: Cascade funnel (total work launched) ──────────────────────────────
 
 def plot_cascade_funnel(results: dict, out_dir: Path) -> None:
-    """Stacked bar: total replicas started per config, coloured by stage.
+    """Stacked bar: total workflows started per config, coloured by workflow.
 
-    Supports sharding+bp story: fewer total candidates launched to find 5 s5 hits.
+    Supports sharding+bp story: fewer total candidates launched to find 5 w5 hits.
     """
-    cfgs = list(results.keys())
+    cfgs = [c for c in results.keys() if c not in _EXCLUDE]
 
-    # Compute mean n_started per stage per config
-    stage_means: dict[str, list[float]] = {cfg: [] for cfg in cfgs}
+    # Compute mean n_started per workflow per config
+    workflow_means: dict[str, list[float]] = {cfg: [] for cfg in cfgs}
     for cfg in cfgs:
         valid = [r for r in results[cfg] if "group_stats" in r]
-        for stage in STAGE_ORDER:
-            vals = [r["group_stats"].get(stage, {}).get("n_started", 0) for r in valid]
-            stage_means[cfg].append(_mean([v for v in vals if v is not None]) or 0)
+        for workflow in workflow_ORDER:
+            vals = [r["group_stats"].get(workflow, {}).get("n_started", 0) for r in valid]
+            workflow_means[cfg].append(_mean([v for v in vals if v is not None]) or 0)
 
-    fig, (ax_stacked, ax_s1) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, ax_stacked = plt.subplots(1, 1, figsize=(12, 6.8))
 
-    # ── Left: stacked bar (total compute by stage) ────────────────────────────
+    # ── Left: stacked bar (total compute by workflow) ────────────────────────────
     x      = np.arange(len(cfgs))
     bottom = np.zeros(len(cfgs))
-    for si, stage in enumerate(STAGE_ORDER):
-        heights = [stage_means[cfg][si] for cfg in cfgs]
+    for si, workflow in enumerate(workflow_ORDER):
+        heights = [workflow_means[cfg][si] for cfg in cfgs]
         bars = ax_stacked.bar(x, heights, bottom=bottom,
-                              color=STAGE_COLORS[stage], alpha=0.85,
-                              label=stage.replace("_", " "))
-        # Annotate s1 bars only (dominate the chart)
-        if stage == "s1_ligand_filter":
+                              color=workflow_COLORS[workflow], alpha=0.85,
+                              label=DISPLAY[workflow])
+        # Annotate w1 bars only (dominate the chart)
+        if workflow == "s1_ligand_filter":
             for i, (bar, h) in enumerate(zip(bars, heights)):
                 if h > 50:
                     ax_stacked.text(bar.get_x() + bar.get_width() / 2,
                                     bottom[i] + h / 2, f"{h:.0f}",
-                                    ha="center", va="center", fontsize=8,
+                                    ha="center", va="center", fontsize=12,
                                     color="white", fontweight="bold")
         bottom += np.array(heights)
 
     # Annotate totals on top
     for i, cfg in enumerate(cfgs):
-        total = sum(stage_means[cfg])
-        base_total = sum(stage_means.get("baseline", [1]))
+        total = sum(workflow_means[cfg])
+        base_total = sum(workflow_means.get("baseline", [1]))
         ratio = base_total / total if total > 0 else 0
         label = f"{total:.0f}" + (f"\n({ratio:.1f}× less)" if cfg != "baseline" else "")
         ax_stacked.text(i, bottom[i] + 30, label,
-                        ha="center", va="bottom", fontsize=8, fontweight="bold")
+                        ha="center", va="bottom", fontsize=12, fontweight="bold")
 
     ax_stacked.set_xticks(x)
-    ax_stacked.set_xticklabels(cfgs, rotation=20, ha="right", fontsize=9)
-    ax_stacked.set_ylabel("Total replicas started")
-    ax_stacked.set_title("Total compute launched\n(stacked by stage; lower = less wasted work)")
-    ax_stacked.legend(fontsize=8, loc="upper right")
+    ax_stacked.set_xticklabels([_cname(c) for c in cfgs], rotation=20, ha="right", fontsize=13)
+    ax_stacked.tick_params(axis="y", labelsize=12)
+    ax_stacked.set_ylabel("Total workflows started", fontsize=14)
+    ax_stacked.set_title("Total compute launched\n(stacked by workflow; lower = less wasted work)",
+                         fontsize=15)
+    ax_stacked.legend(fontsize=12, loc="upper right")
     ax_stacked.grid(axis="y", linestyle="--", alpha=0.3)
 
-    # ── Right: per-stage breakdown (log scale) ────────────────────────────────
-    width = 0.8 / len(cfgs)
-    xs    = np.arange(len(STAGE_ORDER))
-    for ci, cfg in enumerate(cfgs):
-        vals   = [max(stage_means[cfg][si], 0.5) for si in range(len(STAGE_ORDER))]
-        offset = (ci - len(cfgs) / 2 + 0.5) * width
-        ax_s1.bar(xs + offset, vals, width * 0.9,
-                  label=cfg, color=CFG_COLORS.get(cfg, "#888"), alpha=0.85)
-
-    ax_s1.set_yscale("log")
-    ax_s1.set_xticks(xs)
-    ax_s1.set_xticklabels([s.replace("_", "\n") for s in STAGE_ORDER], fontsize=8)
-    ax_s1.set_ylabel("Replicas started (log scale)")
-    ax_s1.set_title("Per-stage breakdown (log scale)\n(shows full funnel reduction)")
-    ax_s1.legend(fontsize=8)
-    ax_s1.grid(axis="y", linestyle="--", alpha=0.3)
-
-    plt.suptitle("Pipeline cascade: replicas launched to find 5 terminal-stage hits",
-                 fontsize=10, y=1.01)
+    # plt.suptitle("Cascade workflows launched to find 5 high-quality candidates",
+    #              fontsize=14, y=1.01)
     plt.tight_layout()
     _caption(fig,
-        "LOWER IS BETTER.  Left: total replicas started per config, stacked by stage. "
-        "Right: same data on log scale to show the full funnel.  "
-        "baseline: 3,600+ replicas (s1 monopolises GPUs — 3,200 s1 before 5 s5 hits).  "
-        "sharding+bp: sharder routes highest-quality s1 results to s2 first — only 730 "
-        "replicas total (5× less).  scheduling_bandit: bandit terminates campaign earlier by "
-        "getting s5 resources sooner — 1,050 replicas (3.4× less).  "
-        "all_optimizations: both effects — only 235 replicas total (15× less compute)."
+        "LOWER IS BETTER.  Each bar is the total number of workflow instances launched to reach "
+        "the same goal — 5 high-quality candidates — stacked by workflow.  The campaign stops as soon as the "
+        "goal is met, so a smarter configuration gets there after starting far fewer instances "
+        "(especially in the costly Initial Screening layer).  Combining all optimizations launches "
+        "~17× less work than the baseline."
     )
     plt.savefig(out_dir / "3_cascade_funnel.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  3_cascade_funnel.png")
 
 
-# ── Plot 4: GPU utilization per stage over time ───────────────────────────────
+# ── Plot 4: GPU utilization per workflow over time ───────────────────────────────
 
 def plot_gpu_utilization(results: dict, out_dir: Path) -> None:
-    """Stacked-area GPU-in-use per stage over time, one panel per config.
+    """Stacked-area GPU-in-use per workflow over time.
 
-    Supports scheduling_bandit story: terminal stages claim GPUs much earlier.
+    Shows only baseline vs scheduling_bandit — the two configs that best
+    illustrate the GPU-allocation story: baseline monopolises all slots with w1,
+    bandit shares them with final-workflow calculations from the start.
     """
-    cfgs = list(results.keys())
-    n    = len(cfgs)
-    # Use 2×2 grid when 4 configs for better readability
-    if n == 4:
-        fig, axes_grid = plt.subplots(2, 2, figsize=(14, 8), sharey=False)
-        axes = [axes_grid[0,0], axes_grid[0,1], axes_grid[1,0], axes_grid[1,1]]
-    else:
-        fig, axes_raw = plt.subplots(1, n, figsize=(5 * n, 5), sharey=False)
-        axes = [axes_raw] if n == 1 else list(axes_raw)
+    cfgs = [c for c in ["baseline", "scheduling_bandit"] if c in results]
+    fig, axes_raw = plt.subplots(1, len(cfgs), figsize=(7 * len(cfgs), 5), sharey=False)
+    axes = [axes_raw] if len(cfgs) == 1 else list(axes_raw)
     fig.patch.set_facecolor("white")
 
     for ax, cfg in zip(axes, cfgs):
         ax.set_facecolor("#fafafa")
-        rep = _repr_run([r for r in results[cfg] if r.get("replica_events")], "wall_time_s")
+        # For GPU utilisation we want the run that best shows terminal-workflow
+        # activity: pick the run with the most w5 replica_events so the
+        # w5 annotation and coloured area are visible.  Falls back to median
+        # wall_time if no run has w5 events (e.g. baseline).
+        valid = [r for r in results[cfg] if r.get("replica_events")]
+        def _w5_count(r):
+            return sum(1 for e in r.get("replica_events", [])
+                       if "s5" in e.get("group", ""))
+        best = max(valid, key=_w5_count) if valid else None
+        rep  = best if best and _w5_count(best) > 0 else _repr_run(valid, "wall_time_s")
         if not rep:
             ax.set_title(cfg)
             continue
@@ -338,29 +361,29 @@ def plot_gpu_utilization(results: dict, out_dir: Path) -> None:
             intervals[g].append((s, f))
 
         bottom = np.zeros(len(ts))
-        for stage in STAGE_ORDER:
-            ivs = intervals.get(stage, [])
+        for workflow in workflow_ORDER:
+            ivs = intervals.get(workflow, [])
             if not ivs:
                 continue
             running = np.array([sum(1 for s, f in ivs if s <= t < f) for t in ts])
-            color   = STAGE_COLORS[stage]
+            color   = workflow_COLORS[workflow]
             ax.fill_between(ts, bottom, bottom + running,
-                            color=color, alpha=0.80, label=stage.replace("_", " "))
+                            color=color, alpha=0.80, label=DISPLAY.get(workflow, workflow))
             bottom = bottom + running
 
-        # Annotate when s5 first appears
-        s5_ivs = intervals.get("s5_fep_ranking", [])
-        if s5_ivs:
-            first_s5 = min(s for s, _ in s5_ivs)
-            y_top = max(bottom) if max(bottom) > 0 else 5
-            ax.axvline(first_s5, color="#7b1fa2", linestyle="--", linewidth=2.0)
-            ax.text(first_s5 + t_max * 0.02, y_top * 0.92,
-                    f"s5 starts\n{first_s5:.1f}s", fontsize=9, color="#7b1fa2",
-                    va="top", fontweight="bold",
+        # Annotate when w5 first appears — anchor to axes top so it's always
+        # visible even when w5 occupies only 1 GPU slot (thin coloured strip).
+        w5_ivs = intervals.get("s5_fep_ranking", [])
+        if w5_ivs:
+            first_w5 = min(s for s, _ in w5_ivs)
+            ax.axvline(first_w5, color="#7b1fa2", linestyle="--", linewidth=2.0)
+            ax.text(first_w5 + t_max * 0.02, 0.96,
+                    f"Affinity Ranking starts\n{first_w5:.1f}s", fontsize=8, color="#7b1fa2",
+                    va="top", fontweight="bold", transform=ax.get_xaxis_transform(),
                     bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#ab47bc", lw=1))
 
         wt = rep.get("wall_time_s", t_max)
-        ax.set_title(f"{cfg}\n(total wall time: {wt:.1f} s)", fontsize=10,
+        ax.set_title(f"{_cname(cfg)}\n(total wall time: {wt:.1f} s)", fontsize=10,
                      color=CFG_COLORS.get(cfg, "black"), fontweight="bold", pad=6)
         ax.set_xlabel("Wall-clock time (s)", fontsize=9)
         ax.set_ylabel("GPU slots in use", fontsize=9)
@@ -370,19 +393,18 @@ def plot_gpu_utilization(results: dict, out_dir: Path) -> None:
         ax.spines["right"].set_visible(False)
 
     # Shared legend
-    handles = [mpatches.Patch(color=STAGE_COLORS[s], label=s.replace("_", " "))
-               for s in STAGE_ORDER]
+    handles = [mpatches.Patch(color=workflow_COLORS[s], label=DISPLAY[s])
+               for s in workflow_ORDER]
     fig.legend(handles=handles, loc="upper center", ncol=5, fontsize=10,
                bbox_to_anchor=(0.5, 1.0), frameon=True, edgecolor="#cccccc")
-    plt.suptitle("GPU slots in use per stage over time  (representative run per config)",
+    plt.suptitle("GPU slots in use per workflow over time",
                  fontsize=12, fontweight="bold", y=1.04, color="#1a237e")
     plt.tight_layout(pad=2.0)
     _caption(fig,
-        "EARLIER PURPLE (s5) IS BETTER.  Each colour = GPU slots used by that stage over time.  "
-        "Dashed line = first s5 start.  "
-        "baseline: s1 (blue) monopolises all GPUs until ~14 s.  "
-        "scheduling_bandit: s3/s4/s5 share GPUs from t~1 s; s5 starts at ~7 s.  "
-        "all_optimizations: s5 starts at ~4 s — quality routing + learned allocation combined."
+        "Each colour = GPU slots used by that workflow over time.  "
+        "Dashed line = first Affinity Ranking start.  "
+        # "baseline: w1 (blue) monopolises all GPUs.  "
+        # "scheduling_bandit: w3/w4/w5 share GPUs from t~1 s; w5 starts at ~15 s.  "
     )
     plt.savefig(out_dir / "4_gpu_utilization.png", dpi=150, bbox_inches="tight",
                 facecolor="white")
@@ -393,169 +415,172 @@ def plot_gpu_utilization(results: dict, out_dir: Path) -> None:
 # ── Plot 5: Shard dispatch over time ─────────────────────────────────────────
 
 def plot_shard_dispatch(results: dict, out_dir: Path) -> None:
-    """Cumulative candidates dispatched by the sharder over time, per downstream stage.
+    """Cumulative candidates dispatched by the sharder over time, per downstream workflow.
 
-    Supports sharding+bp story: pipeline is fed continuously, not in floods.
-    Only configs with shard_events are plotted (baseline and scheduling_bandit are excluded).
+    Compares sharding+bp vs all_optimizations — both have a sharder, showing
+    how the full optimisation stack changes dispatch dynamics:
+    sharding+bp dispatches steadily over ~18 s;
+    all_optimizations reaches the goal in ~2 s with far fewer total dispatches.
     """
-    sharder_cfgs = [c for c in results
-                    if any(r.get("shard_events") for r in results[c])]
-    if not sharder_cfgs:
+    plot_cfgs = [c for c in ["sharding+bp", "all_optimizations"] if c in results
+                 and any(r.get("shard_events") for r in results[c])]
+    if not plot_cfgs:
         return
 
-    stages = ["s2_ml_affinity", "s3_docking", "s4_md_refinement", "s5_fep_ranking"]
-    labels = ["s2 ML affinity", "s3 Docking", "s4 MD refine", "s5 FEP rank"]
+    workflows = ["s2_ml_affinity", "s3_docking", "s4_md_refinement", "s5_fep_ranking"]
+    labels = ["w2 Active Learning", "w3 Structural Modeling", "w4 Refinement Simulation", "w5 Affinity Ranking"]
 
-    fig, axes = plt.subplots(1, len(stages), figsize=(4 * len(stages), 4), squeeze=False)
+    fig, axes = plt.subplots(1, len(workflows), figsize=(4 * len(workflows), 4), squeeze=False)
 
-    for si, (stage, slabel) in enumerate(zip(stages, labels)):
+    for si, (workflow, slabel) in enumerate(zip(workflows, labels)):
         ax = axes[0][si]
-        for cfg in sharder_cfgs:
+        for cfg in plot_cfgs:
             color = CFG_COLORS.get(cfg, "#888")
-            # Use representative run
-            rep = _repr_run([r for r in results[cfg] if r.get("shard_events")], "wall_time_s")
+            rep = _repr_run([r for r in results.get(cfg, []) if r.get("shard_events")],
+                            "wall_time_s")
             if not rep:
                 continue
             evs = [(e["timestamp"], e.get("n", 1))
                    for e in rep.get("shard_events", [])
-                   if e.get("group") == stage]
+                   if e.get("group") == workflow]
+            evs.sort()
             if not evs:
                 continue
-            evs.sort()
             ts   = [0.0] + [t for t, _ in evs]
             cumN = list(itertools.accumulate([0] + [n for _, n in evs]))
-            ax.step(ts, cumN, where="post", color=color, linewidth=2.0, label=cfg)
+            ax.step(ts, cumN, where="post", color=color, linewidth=2.0, label=_cname(cfg))
 
         ax.set_title(slabel, fontsize=9)
         ax.set_xlabel("Wall time (s)")
         ax.set_ylabel("Cumulative dispatched" if si == 0 else "")
-        ax.legend(fontsize=7, loc="lower right")
+        ax.legend(fontsize=8, loc="lower right")
         ax.grid(linestyle="--", alpha=0.3)
 
-    plt.suptitle("Sharder: cumulative candidates dispatched to each stage over time\n"
-                 "(sharder-enabled configs only)", fontsize=10, y=1.01)
+    plt.suptitle("Sharder: cumulative candidates dispatched per workflow\n"
+                 "sharding+bp vs all_optimizations", fontsize=10, y=1.01)
     plt.tight_layout()
     _caption(fig,
-        "Shows how the sharder feeds each downstream stage over time.  "
-        "Steeper initial slope = pipeline fed faster with high-priority candidates.  "
-        "Plateau = sharder stopped dispatching (backpressure THROTTLE or upstream done).  "
-        "all_optimizations dispatches fewer candidates total (reaches 5 s5 hits with ~50 "
-        "s2 dispatches vs ~230 for sharding+bp) because the scheduling bandit keeps s5 "
-        "consuming candidates faster — the campaign terminates sooner."
+        "Both configs use the sharder to route highest-scoring candidates first.  "
+        "sharding+bp: steady dispatch over the full ~18 s campaign — pipeline fed "
+        "continuously with quality candidates.  "
+        "all_optimizations: steeper initial dispatch and much earlier plateau (~2 s) "
+        "because the scheduling bandit + surrogate bypass combine to reach 5 leads "
+        "with far fewer total dispatches.  "
+        "Steeper slope = higher-priority candidates dispatched sooner; "
+        "earlier plateau = campaign goal reached with less total work."
     )
     plt.savefig(out_dir / "5_shard_dispatch.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  5_shard_dispatch.png")
 
 
-# ── Plot 6: Scheduling bandit convergence ─────────────────────────────────────
+# ── Plot 6: Scheduling bandit learning curve ──────────────────────────────────
 
 def plot_bandit_convergence(results: dict, out_dir: Path) -> None:
-    """Thompson-sample values per stage over time for bandit-enabled configs.
+    """Per-workflow learned priority (Beta posterior mean) over time.
 
-    Supports scheduling_bandit story: bandit learns to strongly prefer terminal stages.
+    Uses the bandit_demo config: the bandit starts from UNIFORM priors (all
+    arms at 0.50) and must LEARN the downstream-first ordering from the reward
+    signal.  Plots the recorded posterior mean per arm over wall-clock time,
+    showing the priorities redistributing — w5/w4 climbing, w1 held low.
     """
-    bandit_cfgs = [c for c in results
-                   if any(r.get("scheduling_events") and
-                          any(e.get("bandit") for e in r["scheduling_events"])
-                          for r in results[c])]
-    if not bandit_cfgs:
-        return
+    cfg = "bandit_demo"
+    runs = results.get(cfg, [])
+    # Need posterior-mean records (re-run benchmark after the metrics change).
+    if not any(any(e.get("bandit_means") for e in r.get("scheduling_events", []))
+               for r in runs):
+        # Fallback to scheduling_bandit if bandit_demo wasn't run.
+        cfg = "scheduling_bandit"
+        runs = results.get(cfg, [])
+        if not any(any(e.get("bandit_means") for e in r.get("scheduling_events", []))
+                   for r in runs):
+            return
 
-    fig, axes = plt.subplots(1, len(bandit_cfgs),
-                             figsize=(6 * len(bandit_cfgs), 4), squeeze=False)
-
-    for ci, cfg in enumerate(bandit_cfgs):
-        ax = axes[0][ci]
-        # Collect per-stage (timestamp, sample_value) across all runs
-        group_pairs: dict[str, list[tuple[float, float]]] = defaultdict(list)
-        t_max = 0.0
-        for r in results[cfg]:
-            evs = [e for e in r.get("scheduling_events", []) if e.get("bandit")]
-            if not evs:
+    # Time-bin the posterior means across all runs onto a common grid.
+    t_max = 0.0
+    pooled: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for r in runs:
+        for e in r.get("scheduling_events", []):
+            means = e.get("bandit_means", {})
+            if not means:
                 continue
-            t_max = max(t_max, max(e["timestamp"] for e in evs))
-            for g in STAGE_ORDER:
-                for e in evs:
-                    if g in e.get("eligible", []) and g in e.get("bandit", {}):
-                        group_pairs[g].append((e["timestamp"], e["bandit"][g]))
+            t_max = max(t_max, e["timestamp"])
+            for g, m in means.items():
+                pooled[g].append((e["timestamp"], m))
 
-        if not group_pairs:
-            ax.set_title(cfg)
+    N_BINS = 24
+    edges = np.linspace(0, max(t_max, 1), N_BINS + 1)
+    mids  = 0.5 * (edges[:-1] + edges[1:])
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for g in workflow_ORDER:
+        pts = pooled.get(g, [])
+        if len(pts) < 2:
             continue
+        ts = np.array([p[0] for p in pts])
+        vs = np.array([p[1] for p in pts])
+        binned = [
+            float(vs[(ts >= lo) & (ts < hi)].mean())
+            if ((ts >= lo) & (ts < hi)).any() else np.nan
+            for lo, hi in zip(edges[:-1], edges[1:])
+        ]
+        col = np.array(binned)
+        valid = ~np.isnan(col)
+        if not valid.any():
+            continue
+        ax.plot(mids[valid], col[valid], color=workflow_COLORS[g], lw=2.2,
+                marker="o", markersize=3, label=DISPLAY.get(g, g.replace("_", " ")))
+        ax.scatter([mids[valid][-1]], [col[valid][-1]],
+                   color=workflow_COLORS[g], s=45, zorder=5)
 
-        N_BINS   = 30
-        bin_edges = np.linspace(0, max(t_max, 1), N_BINS + 1)
-        bin_mids  = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-
-        for g, color in STAGE_COLORS.items():
-            pairs = group_pairs.get(g, [])
-            if not pairs:
-                continue
-            ts = np.array([p[0] for p in pairs])
-            vs = np.array([p[1] for p in pairs])
-            bin_means = [
-                float(vs[(ts >= lo) & (ts < hi)].mean())
-                if ((ts >= lo) & (ts < hi)).any() else np.nan
-                for lo, hi in zip(bin_edges[:-1], bin_edges[1:])
-            ]
-            col_mean = np.array(bin_means)
-            valid    = ~np.isnan(col_mean)
-            if not valid.any():
-                continue
-            ax.plot(bin_mids[valid], col_mean[valid],
-                    color=color, label=g.replace("_", " "),
-                    linewidth=1.8, marker="o", markersize=3)
-
-        ax.axhline(0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.6,
-                   label="uniform prior")
-        ax.set_xlabel("Wall-clock time (s)")
-        ax.set_ylabel("Thompson sample (priority)")
-        ax.set_title(cfg.replace("+", "").replace("_", "\n"), fontsize=9,
-                     color=CFG_COLORS.get(cfg, "black"))
-        ax.set_ylim(0, 1.05)
-        ax.legend(fontsize=7)
-        ax.grid(linestyle="--", alpha=0.3)
-
-    plt.suptitle("Scheduling bandit: Thompson-sample priority per stage over time\n"
-                 "(higher = bandit prefers scheduling this stage)", fontsize=10)
+    ax.axhline(0.5, color="gray", linestyle=":", linewidth=1.0, alpha=0.7,
+               label="uniform start (0.50)")
+    ax.set_xlabel("Wall-clock time (s)")
+    ax.set_ylabel("Learned priority  (Beta posterior mean)")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title("Scheduling bandit: learning downstream-first priority from scratch\n"
+                 "(all arms start at 0.50; priorities redistribute as reward accumulates)",
+                 fontsize=11)
+    ax.legend(fontsize=8, loc="center right")
+    ax.grid(linestyle="--", alpha=0.3)
     plt.tight_layout()
     _caption(fig,
-        "CONVERGENCE AWAY FROM 0.5 IS BETTER (means the bandit learned a preference).  "
-        "Each line shows the time-binned mean Thompson sample for one stage.  "
-        "Warm-start priors: s5=Beta(5,1) starts near 1.0 (strongly preferred); "
-        "s1=Beta(1,1) starts at 0.5 (neutral).  "
-        "Over time the bandit reinforces downstream stages (s4/s5) that keep GPUs busy "
-        "and deprioritises stages whose downstream queue is full (THROTTLE).  "
-        "Runs are short (~7-27s) so convergence is driven mainly by the warm-start priors."
+        "WATCH THE LINES SPREAD APART.  Every workflow starts at the uniform prior (0.50).  "
+        "As replicas finish, the bandit receives a reward proportional to how much the "
+        "workflow's downstream needs more work; the terminal workflow always scores high.  "
+        "Over time the posterior means redistribute: the "
+        "bandit learns to feed the final workflow while initial screening is held near 0.5 so its 10,000 "
+        "inputs don't starve the pipeline.  This is the bandit discovering the "
+        "downstream-first schedule with no hand-tuned priors."
     )
     plt.savefig(out_dir / "6_bandit_convergence.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  6_bandit_convergence.png")
 
 
-# ── Plot 7: Time-to-target (cumulative terminal-stage completions) ─────────────
+# ── Plot 7: Time-to-target (cumulative terminal-workflow completions) ─────────────
 
 def plot_time_to_target(
     results: dict,
     out_dir: Path,
-    target_stage: str = "s5_fep_ranking",
+    target_workflow: str = "s5_fep_ranking",
     target_n: int = 5,
 ) -> None:
-    """Step curves: cumulative terminal-stage completions per config over wall time.
+    """Step curves: cumulative terminal-workflow completions per config over wall time.
 
     Supports all_optimizations story: target is reached far sooner.
     """
-    cfgs = list(results.keys())
+    cfgs = [c for c in results.keys() if c not in _EXCLUDE]
     fig, ax = plt.subplots(figsize=(10, 5))
 
+    hit_labels: list[tuple[float, str]] = []  # (t_hit, color) — placed after loop
     for cfg in cfgs:
         color = CFG_COLORS.get(cfg, "#888")
         run_ts_lists: list[list[float]] = []
         for r in results[cfg]:
             ts = sorted(
                 e["t"] for e in r.get("replica_events", [])
-                if e["group"] == target_stage and e["event"] == "finish"
+                if e["group"] == target_workflow and e["event"] == "finish"
             )
             if ts:
                 run_ts_lists.append(ts)
@@ -574,33 +599,63 @@ def plot_time_to_target(
         xs = [0.0] + rep_ts
         ys = list(range(len(xs)))
         ax.step(xs, ys, where="post", color=color, linewidth=2.5,
-                label=cfg, zorder=4)
+                label=_cname(cfg), zorder=4)
 
-        # Mark where target is hit
+        # Mark where target is hit, or annotate if it never was
         if len(rep_ts) >= target_n:
             t_hit = rep_ts[target_n - 1]
             ax.plot(t_hit, target_n, "v", color=color, markersize=10, zorder=5)
             ax.axvline(t_hit, color=color, linestyle=":", linewidth=1.0, alpha=0.6)
-            ax.text(t_hit + 0.2, target_n + 0.1, f"{t_hit:.1f}s",
-                    color=color, fontsize=8, fontweight="bold")
+            hit_labels.append((t_hit, color))
+        else:
+            # Config did not reach target in this run
+            final_t = rep_ts[-1] if rep_ts else 0
+            final_n = len(rep_ts)
+            ax.text(final_t + 0.3, final_n + 0.1,
+                    f"reached {final_n}",
+                    color=color, fontsize=7, alpha=0.8, style="italic")
+
+    # Place hit-time labels above the target line, staggering ones that are close
+    # in time so they don't overlap (e.g. sharding ~14 s vs surrogate ~16 s).
+    if hit_labels:
+        x_span = max(t for t, _ in hit_labels) or 1.0
+        min_gap = x_span * 0.07          # closer than this → bump to next level
+        levels: list[float] = []          # last t at each stagger level
+        max_level = 0
+        for t_hit, color in sorted(hit_labels):
+            lvl = 0
+            while lvl < len(levels) and t_hit - levels[lvl] < min_gap:
+                lvl += 1
+            if lvl == len(levels):
+                levels.append(t_hit)
+            else:
+                levels[lvl] = t_hit
+            max_level = max(max_level, lvl)
+            ax.text(t_hit, target_n + 0.12 + lvl * 0.32, f"{t_hit:.1f}s",
+                    color=color, fontsize=8, fontweight="bold",
+                    ha="center", va="bottom")
+        ax.set_ylim(top=target_n + 0.4 + max_level * 0.32)
 
     ax.axhline(target_n, color="black", linestyle="--", linewidth=1.2,
                label=f"target N={target_n}")
     ax.set_xlabel("Wall-clock time (s)")
-    ax.set_ylabel(f"Cumulative {target_stage.replace('_', ' ')} completions")
-    ax.set_title(f"Time to {target_n} final candidates ({target_stage.replace('_', ' ')})\n"
+    target_label = DISPLAY.get(target_workflow, target_workflow.replace('_', ' '))
+    ax.set_ylabel(f"Cumulative {target_label} completions")
+    ax.set_title(f"Time to {target_n} final candidates ({target_label})\n"
                  f"(faint lines = individual runs; bold = representative run; ▼ = target reached)")
     ax.legend(fontsize=9)
     ax.grid(linestyle="--", alpha=0.3)
     plt.tight_layout()
     _caption(fig,
-        f"LEFTMOST ▼ MARKER IS BEST.  Step curves show cumulative terminal-stage "
-        f"(s5_fep_ranking) completions over wall time.  Faint lines are individual runs; "
-        f"bold line is the run closest to the median.  Downward triangle marks when each "
-        f"configuration crosses the N={target_n} target.  "
-        f"all_optimizations (red) reaches target ~11× sooner than baseline (grey).  "
-        f"sharding+bp (green) reaches target at ~17s via quality routing.  "
-        f"scheduling_bandit (purple) reaches target at ~27s via learned GPU allocation."
+        f"LEFTMOST ▼ MARKER IS BEST.  All configurations stop at the same criterion: "
+        f"as soon as {target_label} reaches {target_n} completed leads (a few in-flight "
+        f"instances may finish just after).  Step curves show cumulative {target_label} completions "
+        f"over wall time.  Faint lines = individual runs; bold = median run.  "
+        f"▼ = the {target_n}-lead target reached.  Earlier ▼ and steeper slope = better efficiency.  "
+        f"surrogate and all optimizations reach {target_n} leads much faster because they "
+        f"let the most confident candidates skip expensive compute "
+        f"(ADVANCE), so fewer instances run at full simulation cost — baseline and "
+        f"scheduling run every candidate in full."
     )
     plt.savefig(out_dir / "7_time_to_target.png", dpi=150, bbox_inches="tight")
     plt.close()

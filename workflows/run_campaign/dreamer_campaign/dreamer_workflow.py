@@ -65,7 +65,17 @@ try:
     from radical.dreamer.managers.ext.schedule import Schedule
     from radical.dreamer.managers.resource import ResourceManager
     _DREAMER_AVAILABLE = True
-except ImportError:
+except Exception as _dreamer_exc:
+    # Broad catch: radical.dreamer's package import can raise FileNotFoundError
+    # when its VERSION file is missing (broken editable install), or other
+    # non-ImportError exceptions during module init.  config.yaml's stub
+    # path doesn't need the real package, so swallow and continue.
+    import warnings as _warnings
+    _warnings.warn(
+        f"radical.dreamer unavailable ({type(_dreamer_exc).__name__}: "
+        f"{_dreamer_exc}); falling back to use_stub mode.  "
+        f"Real-task emulation will not run."
+    )
     _DREAMER_AVAILABLE = False
 
 
@@ -78,6 +88,16 @@ class DreamerWorkflow(BaseWorkflow):
 
     async def run(self, replica_id: str) -> None:
         cfg = self.config or {}
+        # Triage ADVANCE short-circuit: when the surrogate is confident the
+        # candidate's score will clear the next stage's bar, skip the actual
+        # simulation entirely.  The output_score / surrogate_pred logic in
+        # on_replica_done still runs and triggers downstream — but the
+        # wall-time cost of *this* stage's compute is saved.
+        if cfg.get("candidate_triage_advance"):
+            # Minimal yield so the event loop sees the replica completing
+            # rather than blocking it; no sleep, no simulation.
+            await asyncio.sleep(0)
+            return
         await asyncio.to_thread(self._run_simulation, replica_id, cfg)
 
     # ── Simulation (runs in a thread pool worker) ─────────────────────────────

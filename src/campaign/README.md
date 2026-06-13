@@ -12,9 +12,33 @@ dependency signalling.
 
 ```
 src/campaign/
-├── campaign_manager.py   # AsyncCampaignManager, CampaignManager, BaseWorkflow,
-│                         # ResourcePool, WorkflowStats — all in one file
-└── __init__.py           # re-exports all five public names
+├── campaign_manager.py   # AsyncCampaignManager — constructor, config loading,
+│                         #   group registration, feature wiring
+├── base_workflow.py      # BaseWorkflow — user workflow base class
+├── types.py              # _WorkflowInfo, ResourcePool, WorkflowStats, CampaignState
+├── scheduler.py          # SchedulerMixin — two-pass greedy scheduling
+├── executor.py           # ExecutorMixin — replica launch/completion/GPU assignment
+├── monitor_mixin.py      # MonitorMixin — periodic health checks
+├── gpu.py                # detect_gpus(), find_gpus(), make_policies()
+├── sync_wrapper.py       # CampaignManager — synchronous wrapper
+│
+│   # ── Optional features (enabled via cm.features flags) ──
+├── backpressure.py       # BackpressureNegotiator — hysteresis flow control
+├── sharder.py            # Sharder, ShardingSpec — batched, ranked dispatch
+├── bandit.py             # Bandit, SchedulingBandit — Thompson-sampling
+├── triage.py             # Triage — RUN / DISCARD / ADVANCE per-candidate gate
+├── surrogate.py          # Surrogate models (Null/Random/Correlated) + RecallTracker
+├── budget_controller.py  # BudgetController — burn-ratio feedback on score cutoffs
+├── replanning.py         # ReplanningController — drift-triggered replanning
+├── candidate_log.py      # CandidateLog, CandidateHistory — upstream result tracking
+├── monitor.py            # Monitor, DriftEvent — drift detection
+├── profiles.py           # ProfileWeights — candidate ranking profiles
+├── metrics.py            # CampaignMetrics — in-process event recording
+│
+├── plan/                 # Structured campaign-plan schema + loader
+│   ├── schema.py         #   CampaignPlan, StageSpec, EdgeSpec, SurrogateSpec, ...
+│   └── loader.py         #   load_plan() — structured + legacy config support
+└── __init__.py           # re-exports the public API
 ```
 
 ---
@@ -58,7 +82,7 @@ When GPUs are assigned, the CM also injects two extra keys into `config`:
 ### Workflow entry point
 
 Define **either** `run()` or `start()` — not both.  The CM detects which one
-is overridden at `register_group` time and raises `ValueError` if both or
+is overridden at `register_workflow` time and raises `ValueError` if both or
 neither are defined.
 
 ### Workflow groups
@@ -69,8 +93,8 @@ has:
 | Field | Meaning |
 |-------|---------|
 | `replicas` | total replicas to complete (omit / set to 0 for dependent groups) |
-| `max_replicas` | sliding-window concurrency cap (defaults to `replicas` if 0) |
-| `min_replicas` | minimum guaranteed concurrent slots (Pass 1 of scheduler) |
+| `concurrency_cap` | sliding-window concurrency cap (defaults to `replicas` if 0) |
+| `concurrency_floor` | minimum guaranteed concurrent slots (Pass 1 of scheduler) |
 | `priority` | higher → scheduled first |
 | `required_cpus` | CPU cores reserved from the pool while a replica runs |
 | `required_gpus` | GPU slots reserved from the pool while a replica runs |
@@ -181,13 +205,13 @@ independent groups are done.
 The CM runs a **two-pass greedy scheduler** on every state change (replica
 start, replica finish, `signal_done`, `trigger_dependent`):
 
-1. **Pass 1** — guarantee `min_replicas` concurrent slots for all eligible
+1. **Pass 1** — guarantee `concurrency_floor` concurrent slots for all eligible
    groups, highest priority first.
-2. **Pass 2** — fill remaining capacity up to `max_replicas`, highest priority
+2. **Pass 2** — fill remaining capacity up to `concurrency_cap`, highest priority
    first.
 
 Each pass also gates on `ResourcePool.can_fit()`: a group that has slots under
-`max_replicas` but cannot be satisfied by the current resource pool is skipped
+`concurrency_cap` but cannot be satisfied by the current resource pool is skipped
 and a WARNING is emitted.
 
 A group is **eligible** when every dependency group is **ready**:
@@ -333,8 +357,8 @@ engine: dragon    # "dragon" or "concurrent" (falls back to concurrent if Dragon
 workflows:
   md:
     replicas:      2          # independent: starts immediately
-    min_replicas:  1
-    max_replicas:  2
+    concurrency_floor:  1
+    concurrency_cap:  2
     priority:      10
     required_cpus: 4
     required_gpus: 1
@@ -342,8 +366,8 @@ workflows:
 
   miniapps:
     priority:      8
-    min_replicas:  1
-    max_replicas:  2
+    concurrency_floor:  1
+    concurrency_cap:  2
     required_cpus: 4
     required_gpus: 1
     dependencies:  [md]       # dependent: no replicas key → starts at 0
@@ -351,8 +375,8 @@ workflows:
 
   inference:
     replicas:      8          # independent
-    min_replicas:  1
-    max_replicas:  4
+    concurrency_floor:  1
+    concurrency_cap:  4
     priority:      6
     required_cpus: 4
     required_gpus: 1
@@ -360,8 +384,8 @@ workflows:
 
   dummy:
     priority:      5
-    min_replicas:  2
-    max_replicas:  4
+    concurrency_floor:  2
+    concurrency_cap:  4
     required_cpus: 4
     required_gpus: 0
     dependencies:  [inference] # dependent: inference triggers via _trigger_dependent
@@ -371,7 +395,7 @@ Config keys consumed by the CM and stripped before forwarding to `workflow.confi
 
 ```
 replicas  dependencies  dependency_threshold  priority
-min_replicas  max_replicas  required_cpus  required_gpus
+concurrency_floor  concurrency_cap  required_cpus  required_gpus
 ```
 
 ---
@@ -383,7 +407,7 @@ min_replicas  max_replicas  required_cpus  required_gpus
 | Method | Description |
 |--------|-------------|
 | `from_config(config, registry, asyncflow=None, engine_dragon=None)` | Build from YAML config dict + `{name: cls}` registry |
-| `register_group(name, cls, ...)` | Register a workflow group |
+| `register_workflow(name, cls, ...)` | Register a workflow group |
 | `start()` | Schedule all groups with `replicas > 0`; creates the shared asyncflow engine if not pre-built |
 | `wait(timeout=None)` | Async-block until all triggered groups complete; returns `True` on success |
 | `close()` | Release CM resources (does NOT shut down asyncflow) |
@@ -393,13 +417,13 @@ min_replicas  max_replicas  required_cpus  required_gpus
 | `status()` | Snapshot dict of all group states + `"resources"` key |
 | `stats()` | Per-group `WorkflowStats(replicas_started, replicas_finished)` |
 
-`register_group` key parameters:
+`register_workflow` key parameters:
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
 | `replicas` | `1` | Total replicas (0 for dependent groups) |
-| `min_replicas` | `0` | Guaranteed concurrent minimum |
-| `max_replicas` | `0` | Sliding-window cap (0 → equals `replicas`) |
+| `concurrency_floor` | `0` | Guaranteed concurrent minimum |
+| `concurrency_cap` | `0` | Sliding-window cap (0 → equals `replicas`) |
 | `priority` | `0` | Scheduling priority (higher = first) |
 | `required_cpus` | `0` | CPU cores reserved per running replica |
 | `required_gpus` | `0` | GPU slots reserved per running replica |
@@ -409,7 +433,7 @@ min_replicas  max_replicas  required_cpus  required_gpus
 
 Thin synchronous wrapper around `AsyncCampaignManager`.  Runs a dedicated
 event loop in a background thread so callers without an async context can use
-plain blocking calls.  Same `from_config` / `register_group` / `start` /
+plain blocking calls.  Same `from_config` / `register_workflow` / `start` /
 `wait` / `close` / `status` / `stats` API.
 
 ### `BaseWorkflow`
@@ -426,3 +450,36 @@ plain blocking calls.  Same `from_config` / `register_group` / `start` /
 | `_signal_done()` | broadcast signal to CM; adds +1 replica to all downstream groups; no-op without a CM |
 | `_trigger_dependent(name, replicas)` | explicitly queue N replicas of a named group; no-op without a CM |
 | `on_replica_done(replica_id, cm, state)` | post-replica hook; override as needed |
+
+### Optional feature components
+
+These are enabled per-campaign via `cm.features` flags (see CLAUDE.md and the
+Configuration section) and wired into the scheduler/executor by the CM.
+
+| Component | File | Role |
+|-----------|------|------|
+| `Sharder` / `ShardingSpec` | `sharder.py` | Buffer upstream triggers and batch-dispatch downstream, ranked by priority score (stratify `off`/`soft`/`strict`). |
+| `BackpressureNegotiator` | `backpressure.py` | Per-edge hysteresis state machine (HOLD → THROTTLE → WIDEN) that throttles dispatch when a downstream queue floods. |
+| `Bandit` / `SchedulingBandit` | `bandit.py` | Thompson-sampling. Shard bandit picks a batch-size multiplier; scheduling bandit picks which stage gets the next freed resource (one Beta arm per stage). |
+| `Surrogate` | `surrogate.py` | Cheap predictor of a candidate's downstream score (`Null`/`Random`/`Correlated`), plus `RecallTracker`. Used by Triage. |
+| `Triage` | `triage.py` | Per-candidate gate: `RUN`, `DISCARD` (low score), or `ADVANCE` (skip compute on confident leads), using the surrogate prediction. |
+| `BudgetController` | `budget_controller.py` | Proportional feedback loop on `burn_ratio` vs the plan budget; nudges Triage score cutoffs within plan-set bounds to keep spend on plan. |
+| `ReplanningController` | `replanning.py` | Reacts to drift events (e.g. `BUDGET_LOCKED`) emitted by the Monitor and requests a replan. |
+| `Monitor` / `DriftEvent` | `monitor.py` | Periodic health checks + drift detection (budget burn, pass-through ratio, surrogate recall). |
+| `CandidateLog` / `CandidateHistory` | `candidate_log.py` | Tracks upstream results so the Sharder can rank candidates. |
+| `ProfileWeights` | `profiles.py` | Named ranking profiles (score, uncertainty, age, diversity weights). |
+| `CampaignMetrics` | `metrics.py` | In-process event recording (timing, BP transitions, scheduling/budget events). |
+
+### Structured plan schema (`plan/`)
+
+The CM accepts two config shapes, resolved by `load_plan()` in `plan/loader.py`:
+
+- **Legacy flat** — the `workflows:` dict documented in the Configuration section.
+- **Structured** — a typed `CampaignPlan` of `StageSpec` + `EdgeSpec` objects
+  (`plan/schema.py`), with `SurrogateSpec`, `BackpressureEdge`, `RetryPolicy`,
+  `PilotSpec`, and `ReplanThresholds`. Per-stage fields include
+  `campaign_target` (early-stop trigger), `downstream_input_target`
+  (BudgetController denominator), `budget_kp`, and `budget_warmup_min`.
+
+`load_plan(source)` auto-detects the shape; `plan_to_workflows_dict(plan)`
+flattens a structured plan back to the registration form the CM consumes.

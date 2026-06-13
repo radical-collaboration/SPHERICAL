@@ -39,8 +39,12 @@ class MonitorMixin:
         """Periodic health check — runs until all campaign groups are done."""
         while not self._all_done.is_set():
             try:
+                # No asyncio.shield here — we want the Event.wait() cancelled
+                # when the timeout fires.  shield() would leave an orphaned Task
+                # pending on _all_done for every tick, producing hundreds of
+                # "Task was destroyed but it is pending!" warnings at shutdown.
                 await asyncio.wait_for(
-                    asyncio.shield(self._all_done.wait()),
+                    self._all_done.wait(),
                     timeout=self._monitor_interval_s,
                 )
                 break  # campaign finished while we were waiting
@@ -60,7 +64,7 @@ class MonitorMixin:
                     + " ".join(f"{n}:{v:.2f}" for n, v in bsum.items())
                 )
             self._log.info(f"── Monitor tick ───{bandit_info}")
-            for name, g in self._groups.items():
+            for name, g in self._workflows.items():
                 if g.replicas == 0:
                     continue  # not yet activated
                 if g.replicas > 0 and g.finished_replicas >= g.replicas and g.running_count == 0:
@@ -89,29 +93,29 @@ class MonitorMixin:
                 if not self._monitor or g.finished_replicas == 0:
                     continue
 
-                grp_cfg = g.group_config or {}
+                grp_cfg = g.workflow_config or {}
 
                 # ── Pass-through: include shard buffer in downstream count ─────
                 # Skip until enough upstream completions for a stable ratio.
+                # Uses the shared helper on ExecutorMixin so the periodic path
+                # agrees with the reactive path in executor.py.
                 _MIN_PASSTHROUGH_SAMPLE = 10
                 trigger_name  = grp_cfg.get("trigger_downstream")
                 expected_frac = float(grp_cfg.get("trigger_fraction", 1.0))
-                if (trigger_name and trigger_name in self._groups and expected_frac < 1.0
+                if (trigger_name and trigger_name in self._workflows and expected_frac < 1.0
                         and g.finished_replicas >= _MIN_PASSTHROUGH_SAMPLE):
-                    ds       = self._groups[trigger_name]
-                    sharder  = self._sharders.get(trigger_name)
-                    buffered = sharder.buffered if sharder else 0
-                    observed_frac = (ds.replicas + buffered) / g.finished_replicas
-                    ev = self._monitor.check_passthrough(
-                        name, observed_frac, expected_frac
-                    )
-                    if ev:
-                        tag = " [ESCALATING]" if self._monitor.is_escalating(ev) else ""
-                        self._log.warning(
-                            f"  Monitor [{name}] pass_through drift{tag}: "
-                            f"observed={observed_frac:.3f}  expected={expected_frac:.3f}"
-                            f"  dev={ev.deviation_pct:.1f}%  breach={ev.breach_count}"
+                    observed_frac = self._compute_passthrough(name, trigger_name)
+                    if observed_frac is not None:
+                        ev = self._monitor.check_passthrough(
+                            name, observed_frac, expected_frac
                         )
+                        if ev:
+                            tag = " [ESCALATING]" if self._monitor.is_escalating(ev) else ""
+                            self._log.warning(
+                                f"  Monitor [{name}] pass_through drift{tag}: "
+                                f"observed={observed_frac:.3f}  expected={expected_frac:.3f}"
+                                f"  dev={ev.deviation_pct:.1f}%  breach={ev.breach_count}"
+                            )
 
                 # ── Budget burn ───────────────────────────────────────────────
                 budget = float(grp_cfg.get("budget_node_hours") or 0)
@@ -131,6 +135,6 @@ class MonitorMixin:
 
             # Fallback: if everything is done but _all_done was never set
             # (status-propagation chain stalled), detect it here.
-            if _campaign_complete(self._groups, self._sharders):
+            if _campaign_complete(self._workflows, self._sharders):
                 self._all_done.set()
                 self._log.info("Monitor tick: all groups done — signalling campaign complete")

@@ -3,6 +3,16 @@ CampaignManager — synchronous shim around AsyncCampaignManager.
 
 Runs a dedicated event loop in a background thread so callers without an
 async context can orchestrate workflows with plain blocking calls.
+
+Notes
+-----
+- The sync wrapper stubs out AsyncCampaignManager._setup_resources because
+  the background-loop startup path can't run the async resource discovery
+  used by the production flow.  GPU auto-detection and Dragon pool
+  discovery therefore do not happen via this wrapper; pass total_cpus /
+  total_gpus explicitly.
+- ``from_config`` delegates to AsyncCampaignManager.from_config so all
+  feature flags (backpressure, sharder, monitor, bandit) are wired through.
 """
 
 import asyncio
@@ -27,24 +37,32 @@ class CampaignManager:
         asyncflow=None,
         engine_dragon=None,
         features: Optional[dict] = None,
+        _acm: Optional[AsyncCampaignManager] = None,
     ) -> None:
         import threading
 
-        self._acm = AsyncCampaignManager(
-            max_workers=max_workers,
-            engine=engine,
-            total_cpus=total_cpus,
-            total_gpus=total_gpus,
-            num_workers=num_workers,
-            debug=debug,
-            asyncflow=asyncflow,
-            engine_dragon=engine_dragon,
-            features=features,
-        )
+        # Allow callers (notably from_config) to supply a pre-built async CM
+        # so feature wiring done by AsyncCampaignManager.from_config isn't lost.
+        if _acm is None:
+            self._acm = AsyncCampaignManager(
+                max_workers=max_workers,
+                engine=engine,
+                total_cpus=total_cpus,
+                total_gpus=total_gpus,
+                num_workers=num_workers,
+                debug=debug,
+                asyncflow=asyncflow,
+                engine_dragon=engine_dragon,
+                features=features,
+            )
+        else:
+            self._acm = _acm
 
         async def _noop_init() -> None:
             pass
 
+        # Sync wrapper has no usable async startup path for resource discovery
+        # — stub it out.  See module docstring.
         self._acm._setup_resources = _noop_init
 
         self._loop = asyncio.new_event_loop()
@@ -53,8 +71,11 @@ class CampaignManager:
         )
         self._thread.start()
 
-    def register_group(self, *args, **kwargs) -> None:
-        self._acm.register_group(*args, **kwargs)
+    def register_workflow(self, *args, **kwargs) -> None:
+        self._acm.register_workflow(*args, **kwargs)
+
+    # Deprecated alias — prefer register_workflow.
+    register_group = register_workflow
 
     def start(self) -> None:
         future = asyncio.run_coroutine_threadsafe(self._acm.start(), self._loop)
@@ -90,44 +111,15 @@ class CampaignManager:
         workflow_registry: dict[str, type[BaseWorkflow]],
         **kwargs,
     ) -> "CampaignManager":
-        res_cfg = config.get("resources", {})
-        num_workers = config.get("num_workers")
-        cm = cls(
-            max_workers=config.get("max_workers"),
-            engine=config.get("engine", "concurrent"),
-            total_cpus=int(res_cfg.get("total_cpus", 0)),
-            total_gpus=int(res_cfg.get("total_gpus", 0)),
-            num_workers=int(num_workers) if num_workers is not None else None,
-            debug=bool(config.get("debug", False)),
-            **kwargs,
+        """Build a sync CampaignManager from a config dict.
+
+        Delegates to AsyncCampaignManager.from_config so every feature
+        (backpressure, sharder, monitor, scheduling bandit, candidate log)
+        is wired up identically to the async path.  Without this delegation,
+        the sync wrapper silently dropped all features keyed under
+        ``features:`` in the config.
+        """
+        async_cm = AsyncCampaignManager.from_config(
+            config, workflow_registry, **kwargs
         )
-
-        _cm_keys = {
-            "replicas", "dependencies", "dependency_threshold", "priority",
-            "min_replicas", "max_replicas", "required_cpus", "required_gpus",
-            "concurrency_cap",
-        }
-
-        for name, wf_cfg in config.get("workflows", {}).items():
-            wf_class = workflow_registry.get(name)
-            if wf_class is None:
-                continue
-            has_deps = bool(wf_cfg.get("dependencies", []))
-            default_replicas = 0 if has_deps else 1
-            max_replicas = int(wf_cfg.get("max_replicas") or
-                               wf_cfg.get("concurrency_cap") or 0)
-            cm.register_group(
-                name=name,
-                workflow_class=wf_class,
-                replicas=int(wf_cfg.get("replicas", default_replicas)),
-                dependencies=list(wf_cfg.get("dependencies", [])),
-                dep_threshold=int(wf_cfg.get("dependency_threshold", 1)),
-                priority=int(wf_cfg.get("priority", 0)),
-                min_replicas=int(wf_cfg.get("min_replicas", 0)),
-                max_replicas=max_replicas,
-                required_cpus=int(wf_cfg.get("required_cpus", 0)),
-                required_gpus=int(wf_cfg.get("required_gpus", 0)),
-                config={k: v for k, v in wf_cfg.items() if k not in _cm_keys} or None,
-            )
-
-        return cm
+        return cls(_acm=async_cm)

@@ -44,12 +44,19 @@ def make_policies(gpu_pool: list[tuple[str, int]], gpu_ids: list[int]) -> list:
     Returns a list with exactly one Policy whose gpu_affinity lists every
     assigned GPU.  Returns an empty list when gpu_ids is empty or Dragon is
     not available.
+
+    Logs at WARNING when Dragon is importable but Policy construction fails
+    so misconfigurations (wrong arg names after a Dragon API change, etc.)
+    are diagnosable instead of silent.
     """
     if not gpu_ids or not gpu_pool:
         return []
     try:
         from dragon.infrastructure.policy import Policy
-
+    except ImportError:
+        # Concurrent backend or no Dragon installed — silent.
+        return []
+    try:
         hostname = gpu_pool[0][0]
         return [
             Policy(
@@ -58,5 +65,11 @@ def make_policies(gpu_pool: list[tuple[str, int]], gpu_ids: list[int]) -> list:
                 gpu_affinity=list(gpu_ids),
             )
         ]
-    except Exception:
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "make_policies failed for gpu_ids=%s host=%s: %s: %s",
+            gpu_ids, gpu_pool[0][0] if gpu_pool else "?",
+            type(exc).__name__, exc,
+        )
         return []

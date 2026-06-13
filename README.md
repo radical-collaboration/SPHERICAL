@@ -5,6 +5,8 @@ HPC workflow orchestration framework for multi-GPU protein inference and enginee
 ## Features
 
 - **AsyncCampaignManager** — async-native orchestrator for concurrent multi-workflow campaigns with priority scheduling, resource pools, and dependency signalling
+- **Adaptive Optimization Layers** — opt-in, config-driven: quality routing (Sharder), flow control (Backpressure), Thompson-sampling Bandits, surrogate-gated Triage (RUN/DISCARD/ADVANCE), and a BudgetController that keeps spend on plan; drift-driven Replanning
+- **Structured Campaign Plans** — typed `CampaignPlan`/`StageSpec` schema (`src/campaign/plan/`) alongside the legacy flat config, resolved by a single `load_plan()`
 - **Multi-GPU Inference** — worker pool per GPU with automatic load balancing; aiohttp HTTP server/client
 - **ESM2 Inference Workflow** — standalone or campaign-embedded ESM2-650M embedding service
 - **SGDES Workflow** — Structure-Guided Deep Evolution Solver for iterative protein sequence optimisation
@@ -21,7 +23,11 @@ HPC workflow orchestration framework for multi-GPU protein inference and enginee
 spherical/
 ├── src/
 │   ├── campaign/                    # AsyncCampaignManager + BaseWorkflow + ResourcePool
-│   │   └── campaign_manager.py
+│   │   ├── campaign_manager.py      # core: scheduler/executor/monitor mixins
+│   │   ├── sharder.py · backpressure.py · bandit.py     # quality routing, flow control, learning
+│   │   ├── triage.py · surrogate.py · budget_controller.py  # surrogate-gated selective execution
+│   │   ├── replanning.py · monitor.py · candidate_log.py    # drift handling + tracking
+│   │   └── plan/                    # CampaignPlan/StageSpec schema + load_plan()
 │   ├── inference/                   # InferenceService base, orchestrator, server
 │   │   ├── esm2_service/            # ESM2InferenceService + ESM2Client
 │   │   ├── inference_client.py
@@ -40,7 +46,7 @@ spherical/
 │   │   ├── run_campaing.py
 │   │   ├── inference_workflow.py
 │   │   ├── ddmd_workflow.py
-│   │   ├── plot_cm_timeline.py.py         # Gantt timeline + resource chart from SLURM log
+│   │   ├── plot_cm_timeline.py         # Gantt timeline + resource chart from SLURM log
 │   │   └── config.yaml
 │   └── sgdes/                       # SGDES protein engineering
 │       ├── run_workflow.py
@@ -121,16 +127,16 @@ resources:
 workflows:
   ddsim:
     replicas:      8
-    min_replicas:  2
-    max_replicas:  4
+    concurrency_floor:  2
+    concurrency_cap:  4
     priority:      5
     required_cpus: 20
     dependencies:  []
 
   inference:
     replicas:      16
-    min_replicas:  1
-    max_replicas:  4
+    concurrency_floor:  1
+    concurrency_cap:  4
     priority:      10
     required_cpus: 32
     required_gpus: 1
@@ -250,12 +256,12 @@ bash workflows/plot_telemetry.sh \
 
 ### Campaign Manager replica timeline
 
-`workflows/run_campaign/plot_cm_timeline.py.py` parses a SLURM output log and
+`workflows/run_campaign/plot_cm_timeline.py` parses a SLURM output log and
 produces a Gantt chart of replica execution spans with a resource utilization
 panel (GPU/CPU in use over time) and a campaign config summary table.
 
 ```bash
-python workflows/run_campaign/plot_cm_timeline.py.py slurm-<jobid>.out \
+python workflows/run_campaign/plot_cm_timeline.py slurm-<jobid>.out \
     [--config workflows/run_campaign/config.yaml] \
     [--out timeline.png]
 ```
@@ -272,9 +278,61 @@ from the log lines.
 
 **Example**:
 ```bash
-python workflows/run_campaign/plot_cm_timeline.py.py \
+python workflows/run_campaign/plot_cm_timeline.py \
     workflows/run_campaign/slurm-17715157.out \
     --out replica_timeline.png
+```
+
+### Dreamer campaign timeline (with simulation stats)
+
+`workflows/run_campaign/dreamer_campaign/plot_dreamer_timeline.py` is a
+Dreamer-specific superset of the timeline above: it produces the same Gantt +
+resource-utilization rows **plus** a third row of emulation metrics (simulated
+makespan per replica, task-ops box plots from the `dreamer-profiles/*.json`,
+and a per-workflow stats table).
+
+```bash
+python workflows/run_campaign/dreamer_campaign/plot_dreamer_timeline.py <log> \
+    [--profiles-dir dreamer-profiles/] \
+    [--config workflows/run_campaign/dreamer_campaign/config.yaml] \
+    [--out dreamer_timeline.png]
+```
+
+The profiles directory is auto-detected next to the log when `--profiles-dir`
+is omitted. Use `plot_cm_timeline.py` for non-Dreamer campaigns.
+
+### Benchmark optimization plots
+
+`workflows/run_campaign/dreamer_campaign/plot_optimizations.py` reads the
+`benchmark_results.json` produced by `benchmark.py` and writes 7 comparison
+plots (wall time, pipeline Gantt, cascade funnel, GPU utilization, shard
+dispatch, bandit convergence, time-to-target) — one per optimization axis.
+
+```bash
+# 1. produce the results (N runs per configuration)
+python workflows/run_campaign/dreamer_campaign/benchmark.py \
+    --config workflows/run_campaign/dreamer_campaign/config.yaml \
+    --runs 5 --out benchmark_results.json
+
+# 2. render the plots
+python workflows/run_campaign/dreamer_campaign/plot_optimizations.py \
+    [--results benchmark_results.json] \
+    [--out-dir plots/optimizations]
+```
+
+Config display names are mapped via `CFG_DISPLAY` and workflow stage labels via
+`DISPLAY` at the top of the script; both default to the antigen-cascade names.
+
+### Budget-control illustration
+
+`workflows/run_campaign/dreamer_campaign/plot_budget_control.py` renders the
+score-cutoff adaptation and burn-ratio convergence for the `budget_control`
+benchmark case (a 2-panel figure) from the same `benchmark_results.json`.
+
+```bash
+python workflows/run_campaign/dreamer_campaign/plot_budget_control.py \
+    [--results benchmark_results.json] \
+    [--out plots/diagrams/budget_control_illustration.png]
 ```
 
 ---

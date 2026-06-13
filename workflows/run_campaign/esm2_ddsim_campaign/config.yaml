@@ -48,8 +48,8 @@ workflow_registry:
 # Field reference
 # ---------------
 #   replicas             : total replicas for independent groups; omit for dependent
-#   min_replicas         : guaranteed concurrent slots (scheduler pass 1)
-#   max_replicas         : sliding-window concurrency cap (scheduler pass 2)
+#   concurrency_floor         : guaranteed concurrent slots (scheduler pass 1)
+#   concurrency_cap         : sliding-window concurrency cap (scheduler pass 2)
 #   priority             : higher → scheduled first when resources are contested
 #   dependencies         : upstream groups this workflow depends on; also used by
 #                          the CM to route _signal_done() — when group X signals
@@ -68,8 +68,8 @@ workflows:
   inference:
     priority:             6
     replicas:             8
-    min_replicas:         1
-    max_replicas:         4
+    concurrency_floor:         1
+    concurrency_cap:         4
     required_cpus:        4
     required_gpus:        1
     config_file:          "${INF_DIR}/config.yaml"
@@ -80,8 +80,8 @@ workflows:
   # To run independently: add 'replicas: N' and remove 'dependencies'.
   dummy:
     priority:             5
-    min_replicas:         2
-    max_replicas:         4
+    concurrency_floor:         2
+    concurrency_cap:         4
     required_cpus:        4
     required_gpus:        0
     dependencies:         [inference]
@@ -93,8 +93,8 @@ workflows:
   md:
     priority:      10
     replicas:      2
-    min_replicas:  1
-    max_replicas:  1
+    concurrency_floor:  1
+    concurrency_cap:  1
     required_cpus: 4
     required_gpus: 1
     config_file:   "${MD_HOME}/config.yaml"
@@ -105,8 +105,8 @@ workflows:
   # To run independently: add 'replicas: N' and remove 'dependencies'.
   miniapps:
     priority:      8
-    min_replicas:  1
-    max_replicas:  1
+    concurrency_floor:  1
+    concurrency_cap:  1
     required_cpus: 4
     required_gpus: 1
     dependencies:  [md]
