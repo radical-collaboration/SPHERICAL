@@ -25,7 +25,7 @@ src/campaign/
 │   # ── Optional features (enabled via cm.features flags) ──
 ├── backpressure.py       # BackpressureNegotiator — hysteresis flow control
 ├── sharder.py            # Sharder, ShardingSpec — batched, ranked dispatch
-├── bandit.py             # Bandit, SchedulingBandit — Thompson-sampling
+├── bandit.py             # SchedulingBandit — Thompson-sampling (used by ADR, not the scheduler)
 ├── triage.py             # Triage — RUN / DISCARD / ADVANCE per-candidate gate
 ├── surrogate.py          # Surrogate models (Null/Random/Correlated) + RecallTracker
 ├── budget_controller.py  # BudgetController — burn-ratio feedback on score cutoffs
@@ -460,7 +460,7 @@ Configuration section) and wired into the scheduler/executor by the CM.
 |-----------|------|------|
 | `Sharder` / `ShardingSpec` | `sharder.py` | Buffer upstream triggers and batch-dispatch downstream, ranked by priority score (stratify `off`/`soft`/`strict`). |
 | `BackpressureNegotiator` | `backpressure.py` | Per-edge hysteresis state machine (HOLD → THROTTLE → WIDEN) that throttles dispatch when a downstream queue floods. |
-| `Bandit` / `SchedulingBandit` | `bandit.py` | Thompson-sampling. Shard bandit picks a batch-size multiplier; scheduling bandit picks which stage gets the next freed resource (one Beta arm per stage). |
+| `SchedulingBandit` | `bandit.py` | Thompson-sampling (one Beta arm per stage). **Not wired into the CM scheduler** — consumed by the ADR `BanditSchedulingPolicy` (`adr/policies.py`); the scheduler orders eligible groups by `group.priority`. |
 | `Surrogate` | `surrogate.py` | Cheap predictor of a candidate's downstream score (`Null`/`Random`/`Correlated`), plus `RecallTracker`. Used by Triage. |
 | `Triage` | `triage.py` | Per-candidate gate: `RUN`, `DISCARD` (low score), or `ADVANCE` (skip compute on confident leads), using the surrogate prediction. |
 | `BudgetController` | `budget_controller.py` | Proportional feedback loop on `burn_ratio` vs the plan budget; nudges Triage score cutoffs within plan-set bounds to keep spend on plan. |

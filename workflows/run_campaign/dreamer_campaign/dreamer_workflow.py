@@ -84,6 +84,14 @@ class DreamerWorkflow(BaseWorkflow):
 
     workflow_id = "dreamer"
 
+    # Per-group replica counter (group_name -> replicas started). Used to drive
+    # count-based ``duration_phases`` (a shifting bottleneck). Keyed on *work
+    # done* rather than wall-clock so the phase boundary is reproducible and
+    # policy-fair (the same Nth replica triggers the shift regardless of which
+    # scheduling policy is driving).  Reset between benchmark runs.
+    _group_state:  ClassVar[dict] = {}
+    _trigger_lock: ClassVar = None
+
     # ── Workflow entry point ──────────────────────────────────────────────────
 
     async def run(self, replica_id: str) -> None:
@@ -98,7 +106,38 @@ class DreamerWorkflow(BaseWorkflow):
             # rather than blocking it; no sleep, no simulation.
             await asyncio.sleep(0)
             return
+        # Shifting-bottleneck hook: resolve the effective duration from the
+        # stage's count-based phase schedule (no-op when duration_phases unset).
+        cfg = self._apply_duration_phase(cfg)
         await asyncio.to_thread(self._run_simulation, replica_id, cfg)
+
+    def _apply_duration_phase(self, cfg: dict) -> dict:
+        """Resolve simulated_duration from a count-based phase schedule.
+
+        config (per stage's ``dreamer`` block)::
+
+            simulated_duration: 12.0          # phase 0 (before any threshold)
+            duration_phases:
+              - { after: 40, duration: 3.0 }  # once 40 replicas of THIS stage
+                                              # have started, drop to 3.0s
+
+        Phases are applied in ascending ``after`` order; the last threshold the
+        running count has crossed wins.  Returns cfg unchanged (same object) when
+        no schedule is set, else a shallow copy with simulated_duration patched.
+        """
+        phases = cfg.get("duration_phases")
+        if not phases:
+            return cfg
+        g = self._group_name or "?"
+        n = DreamerWorkflow._group_state.get(g, 0) + 1
+        DreamerWorkflow._group_state[g] = n
+        dur = float(cfg.get("simulated_duration", 1.0))
+        for ph in sorted(phases, key=lambda p: int(p.get("after", 0))):
+            if n >= int(ph.get("after", 0)):
+                dur = float(ph.get("duration", dur))
+        patched = dict(cfg)
+        patched["simulated_duration"] = dur
+        return patched
 
     # ── Simulation (runs in a thread pool worker) ─────────────────────────────
 

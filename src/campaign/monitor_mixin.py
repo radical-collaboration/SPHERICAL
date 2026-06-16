@@ -55,15 +55,7 @@ class MonitorMixin:
     async def _tick_monitor(self) -> None:
         """Snapshot all groups and run health checks. Acquires the lock."""
         async with self._lock:
-            bandit_info = ""
-            if self._scheduling_bandit is not None:
-                bsum = self._scheduling_bandit.summary()
-                best = self._scheduling_bandit.best()
-                bandit_info = (
-                    f"  sched_bandit best={best!r}  "
-                    + " ".join(f"{n}:{v:.2f}" for n, v in bsum.items())
-                )
-            self._log.info(f"── Monitor tick ───{bandit_info}")
+            self._log.info("── Monitor tick ───")
             for name, g in self._workflows.items():
                 if g.replicas == 0:
                     continue  # not yet activated
@@ -77,14 +69,6 @@ class MonitorMixin:
                 extra = ""
                 if sharder and sharder.buffered:
                     extra += f"  buffered={sharder.buffered}"
-                if sharder:
-                    bsum = sharder.bandit_summary()
-                    if bsum is not None:
-                        best = max(bsum, key=bsum.get)
-                        extra += (
-                            f"  shard_bandit_best={best:.2f}×"
-                            f"  [{' '.join(f'{k:.2f}:{v:.2f}' for k, v in bsum.items())}]"
-                        )
                 self._log.info(
                     f"  {name}: {g.finished_replicas}/{g.replicas} done "
                     f"({completion_pct:.0f}%)  running={g.running_count}{extra}"

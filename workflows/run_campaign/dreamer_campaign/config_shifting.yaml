@@ -43,7 +43,7 @@
 #
 #   (Batch size follows a fixed backpressure → multiplier mapping:
 #    0.5× THROTTLE / 1.0× HOLD / 1.5× WIDEN.  Adaptive batch sizing is now an
-#    ADR-layer concern via the set_batch_size lever, not an in-sharder bandit.)
+#    ADL-layer concern via the set_batch_size lever, not an in-sharder bandit.)
 #
 # ── edges / backpressure block ────────────────────────────────────────────────
 # Each edge can carry a backpressure stanza that controls the downstream stage's
@@ -77,7 +77,7 @@
 #   sharder       Adaptive batch dispatch from the trigger buffer.
 #                 Disabling means every trigger_dependent() goes directly into
 #                 the runnable queue (no buffering, no BP gate).
-# (Cross-stage scheduling priority is driven by the ADR layer — see cm.adr —
+# (Cross-stage scheduling priority is driven by the ADL layer — see cm.adl —
 #  not an in-CM bandit; the scheduler orders eligible groups by group.priority.)
 #
 # ── dreamer / perf_dist and ops_dist ─────────────────────────────────────────
@@ -117,13 +117,17 @@ stages:
     upstream:               library
     downstream:             s2_ml_affinity
     budget_node_hours:      7200
-    pilot: { facility: perlmutter, partition: gpu, nodes: 300, walltime_h: 24 }
+    # CPU-bound screen (realistic: a cheap property filter). Keeping s1 OFF the
+    # GPUs is what makes the downstream bottleneck visible — s1 floods s2 fast
+    # (~10/s) while s2–s5 contend for the 24 GPUs, so the slow GPU stage actually
+    # accumulates a large `pending` backlog the scheduler must arbitrate.
+    pilot: { facility: perlmutter, partition: cpu, nodes: 300, walltime_h: 24 }
     concurrency_cap:        30
     concurrency_floor:           4     # guaranteed floor so s1 isn't starved by downstream priorities
 
     dreamer:
       use_stub:           true
-      simulated_duration: 0.5    # DEBUG: 500×0.5s÷24GPU=10.4s s1 phase; pipeline latency=6s
+      simulated_duration: 3.0    # LONG-STAGE: s1 ~3s each (was 0.5) — LLM latency amortized
       simulated_jitter:   0.05
       # Score cascade: s1 generates initial random score in [0,1].
       # Only candidates with score ≥ 0.60 (top 40%) enter the s2 sharder.
@@ -163,7 +167,13 @@ stages:
 
     dreamer:
       use_stub:           true
-      simulated_duration: 0.5    # DEBUG: was 5.0s
+      # SHIFTING BOTTLENECK — phase 1: s2 is the SLOW, heavy chokepoint (12s).
+      # Because s2 is shallow, the static rule policy ranks it near the bottom
+      # and starves it → its queue explodes → upstream THROTTLEs → pipeline
+      # stalls.  The LLM, seeing s2's deep queue + THROTTLE, boosts it.
+      simulated_duration: 8.0    # phase 1: slow (bottleneck is here)
+      duration_phases:
+        - { after: 30, duration: 3.0 }   # phase 2: after 30 s2 replicas, s2 speeds up
       simulated_jitter:   0.05
       score_noise:        0.05   # small noise: high-scored candidates stay high across stages
       score_threshold:    0.65   # ~75% of s2 inputs pass → more cascade material
@@ -194,7 +204,7 @@ stages:
 
     dreamer:
       use_stub:           true
-      simulated_duration: 1.0    # DEBUG: was 15.0s
+      simulated_duration: 6.0    # LONG-STAGE (was 1.0)
       simulated_jitter:   0.1
       score_noise:        0.05
       score_threshold:    0.70   # ~85% of s3 inputs pass
@@ -223,7 +233,14 @@ stages:
 
     dreamer:
       use_stub:           true
-      simulated_duration: 2.0    # DEBUG: was 30.0s
+      # SHIFTING BOTTLENECK — phase 2: s4 starts FAST (2s) but slows to the heavy
+      # chokepoint (12s) once the campaign matures.  Now the bottleneck is DEEP,
+      # where the static rule already ranks it high — so rule and LLM converge in
+      # this phase.  Net: the LLM's win comes from phase 1 (shallow bottleneck);
+      # the shift demonstrates it *tracks* the bottleneck instead of assuming it.
+      simulated_duration: 2.0    # phase 1: fast (not the bottleneck yet)
+      duration_phases:
+        - { after: 10, duration: 10.0 }  # phase 2: after 10 s4 replicas, s4 becomes the chokepoint
       simulated_jitter:   0.2
       score_noise:        0.05
       score_threshold:    0.75   # ~80% of s4 inputs pass
@@ -237,7 +254,9 @@ stages:
     budget_node_hours:      25000
     pilot: { facility: frontier, partition: largemem, nodes: 200, walltime_h: 240 }
     downstream_input_target: 5    # BudgetController denominator T
-    campaign_target: 5            # early-stop: halt campaign when 5 s5 leads produced
+    campaign_target: 5            # early-stop at 5 leads (aligned with benchmark_adl TARGET_N).
+                                  # Phase 1 (s2 slow) bites before the 5th lead; the shift to
+                                  # s4-slow lands mid-run, so the LLM's phase-1 advantage shows.
     surrogate:
       score_cutoff:                    0.65
       score_cutoff_nudge_bounds:       [0.45, 0.92]
@@ -251,7 +270,7 @@ stages:
 
     dreamer:
       use_stub:           true
-      simulated_duration: 2.0    # DEBUG: was 22.0s
+      simulated_duration: 12.0   # LONG-STAGE (was 2.0)
       simulated_jitter:   0.4
       score_noise:        0.05
       score_threshold:    0.80   # terminal gate; ~3% of s1 candidates expected to reach here
@@ -351,31 +370,33 @@ cm:
     monitor:      true   # pass-through + budget drift detection alerts
     sharder:      true   # adaptive batch dispatch from trigger buffer
     # NOTE: cross-stage scheduling priority is no longer an in-CM bandit; it is
-    # driven by the ADR layer (cm.adr below). The scheduler orders eligible
+    # driven by the ADL layer (cm.adl below). The scheduler orders eligible
     # groups purely by group.priority.
 
   # Periodic monitor tick interval (seconds).
   # Set short for local emulation so ticks appear during the ~90s campaign run.
   monitor_interval_s: 8
 
-  # ── ADR supervision (radical.adr agent layer) ─────────────────────────────
-  # Drives scheduling priority from a swappable radical.adr Policy. Choose the
+  # ── ADL supervision (radical.adl agent layer) ─────────────────────────────
+  # Drives scheduling priority from a swappable radical.adl Policy. Choose the
   # rule / bandit / LLM strategy and compare on equal footing.  Requires
-  # `pip install -e ".[adr]"` (llm also needs ".[llm]").  Override at runtime
+  # `pip install -e ".[adl]"` (llm also needs ".[llm]").  Override at runtime
   # with `--policy {none|rule|bandit|llm}`.
-  adr:
+  adl:
     # Compare strategies by running each and recording (see plot_policy_comparison.py).
-    # 'bandit' wraps the same Thompson-sampling SchedulingBandit as an ADR agent.
-    policy:    none        # none = no ADR (static priorities); rule | bandit | llm
+    # 'bandit' wraps the same Thompson-sampling SchedulingBandit as an ADL agent.
+    policy:    none        # none = no ADL (static priorities); rule | bandit | llm
     tick_s:    1.0         # operator decision cadence (seconds)
     warmstart: true        # bandit policy: depth-based Beta(depth+1,1) priors
     seed:      0           # bandit policy RNG seed
 
     # ── LLM policy (kind=llm) ──────────────────────────────────────────────
-    # OpenRouter + GPT-4o-mini: fast (~0.5s), cheap (~$0.15/M tokens), reliable
-    # structured output → LLM actually decides every cycle instead of falling back.
+    # OpenRouter + GPT-4o-mini: fast (~0.5s), cheap, reliable structured output.
+    # Long-stage durations (3/3/6/12/12s) let downstream queues build up between
+    # ticks, so the LLM sees real queue_depth + backpressure transitions and can
+    # deviate from the static downstream-first ladder (chase the live bottleneck).
     #   export OPENROUTER_API_KEY=sk-or-v1-...
-    #   python run_campaign.py --policy llm --record
+    #   python run_campaign.py --config config_longstage.yaml --policy llm --record
     base_url:        https://openrouter.ai/api/v1
     model:           openai/gpt-4o-mini
     llm_api_key_env: OPENROUTER_API_KEY
@@ -383,7 +404,7 @@ cm:
     # to change HOW it schedules (no code change). Inline `system_prompt: |` also
     # works and overrides the file; omit both → built-in DEFAULT_SCHEDULING_PROMPT.
     system_prompt_file: prompts/scheduling_system_prompt.txt
-    llm_tick_s:      2.0     # cadence for LLM cycles (GPT-4o-mini is ~0.5s so 2s is safe)
+    llm_tick_s:      3.0     # one decision per ~stage; long stages amortize LLM latency
     llm_timeout_s:   10.0    # per-call timeout; on timeout → rule fallback for that cycle
     llm_max_retries: 1       # instructor schema-validation retries (fast model → 1 is fine)
     #
@@ -396,15 +417,11 @@ cm:
     #   Free OpenRouter models (rate-limited, cold-start → may fall back):
     #     model: meta-llama/llama-3.3-70b-instruct:free
     #     llm_tick_s: 4.0
-    #   HuggingFace router:
-    #     base_url: https://router.huggingface.co/v1
-    #     model: meta-llama/Llama-3.3-70B-Instruct
-    #     llm_api_key_env: HF_TOKEN
     #   Claude (best quality, ~cents/run): switch LLMSchedulingPolicy to
     #     the Anthropic SDK and use model: claude-haiku-4-5 / claude-sonnet-4-6.
 
     record:    false       # true/auto → log per-cycle decisions to
-                           #   adr-decisions-<policy>.jsonl (for plot_policy_comparison.py)
+                           #   adl-decisions-<policy>.jsonl (for plot_policy_comparison.py)
 
   resources:
     total_cpus: 1024  # 30×16(s1)+16×4(s2)+12×4(s3)+8×16(s4)+6×8(s5)=768 → 1024 with headroom

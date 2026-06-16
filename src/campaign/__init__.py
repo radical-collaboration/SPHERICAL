@@ -21,7 +21,7 @@ from .surrogate import (
 )
 from .sharder import Sharder, ShardingSpec
 from .triage import Triage, TriageDecision
-from .bandit import Bandit, BanditArm, shard_bandit, resource_bandit, SchedulingBandit, scheduling_bandit
+from .bandit import BanditArm, SchedulingBandit
 
 __all__ = [
     "AsyncCampaignManager",
@@ -68,10 +68,6 @@ __all__ = [
     "build_default_surrogate",
     "Triage",
     "TriageDecision",
-    "Bandit",
     "BanditArm",
-    "shard_bandit",
-    "resource_bandit",
     "SchedulingBandit",
-    "scheduling_bandit",
 ]

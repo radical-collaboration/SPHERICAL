@@ -5,7 +5,7 @@
 # ── Cluster Resources ─────────────────────────────────────────────────────────
 resources:
   total_cpus: 64   # CPU cores on the allocated node(s)
-  total_gpus: 4     # GPUs on the allocated node(s)
+  total_gpus: 8     # GPUs on the allocated node(s) — matches gpu_sbatch.sh --gpus=8
 
 # ── Engine ────────────────────────────────────────────────────────────────────
 engine:      dragon       # concurrent | dragon 
@@ -15,6 +15,26 @@ debug:       false         # set true to enable rhapsody DEBUG logging
 telemetry:
   collect_telemetry: true
   telemetry_dir: "telemetry-results"
+  resource_poll_interval: 0.5   # seconds between ResourceUpdate events
+
+# ── Campaign Manager / ADR supervision ───────────────────────────────────────
+# The CM scheduler orders eligible groups by group.priority.  An optional ADR
+# policy drives those priorities each tick via set_priority() — the "agent
+# layer" that replaces the old in-loop bandit.  On HPC runs with telemetry
+# enabled the policy also sees live GPU/CPU/mem utilisation in its observation.
+cm:
+  adr:
+    policy:  rule      # none | rule | bandit | llm  (override with --policy)
+    tick_s:  2.0       # operator decision cadence (seconds)
+    record:  false     # true → write adr-decisions-<policy>.jsonl each run
+
+    # LLM policy settings (only used when policy=llm or --policy llm):
+    llm_tick_s:       10.0              # slower cadence for LLM calls
+    llm_timeout_s:    20.0              # per-call timeout before falling back to rule
+    llm_max_retries:  0                 # instructor structured-output retries
+    model:            openai/gpt-4o-mini
+    llm_api_key_env:  OPENROUTER_API_KEY  # env var that holds the key
+    # base_url: http://localhost:11434/v1  # uncomment for local Ollama
 
 # ── Workflow Registry ────────────────────────────────────────────────────────
 # Maps config workflow names to "module.ClassName" strings.
@@ -97,7 +117,7 @@ workflows:
     concurrency_cap:  1
     required_cpus: 4
     required_gpus: 1
-    config_file:   "${MD_HOME}/config.yaml"
+    config_file:   "${MD_DIR}/config.yaml"   # MD_DIR exported by gpu_sbatch.sh
 
   # ── MiniApps ───────────────────────────────────────────────────────────────
   # Dependent on md: stays at replicas=0 until DDMdWrapperWorkflow calls

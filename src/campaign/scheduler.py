@@ -164,8 +164,9 @@ class SchedulerMixin:
         """
         to_start: list[tuple[_WorkflowInfo, int]] = []
 
-        # Stop scheduling immediately after early termination or natural completion.
-        if self._all_done.is_set():
+        # Stop scheduling after early termination, natural completion, or once
+        # close() has begun (so shutdown cancellation can't race in new replicas).
+        if self._all_done.is_set() or getattr(self, "_closing", False):
             return to_start
 
         # ReplanningController gate: while the controller is DRAINING /
@@ -223,12 +224,12 @@ class SchedulerMixin:
                 g.status = "running"
                 self._log.info(f"Group {g.name!r} is now eligible — status → running")
 
-        if self._scheduling_bandit is not None:
-            eligible = self._scheduling_bandit.rank(eligible)
-        else:
-            # Sort by group priority (higher = scheduled first).
-            # stable sort: equal-priority groups keep registration order (FIFO).
-            eligible = sorted(eligible, key=lambda g: -g.priority)
+        # Sort by group priority (higher = scheduled first).
+        # stable sort: equal-priority groups keep registration order (FIFO).
+        # Adaptive priority is driven externally by the ADR layer
+        # (src/campaign/adr) via the group.priority lever — there is no
+        # in-loop scheduling bandit.
+        eligible = sorted(eligible, key=lambda g: -g.priority)
 
         # Pass 1: guarantee concurrency_floor.
         for g in eligible:
@@ -273,27 +274,9 @@ class SchedulerMixin:
                 g._consecutive_stalls = 0
 
         if to_start:
-            bandit_scores: dict = {}
-            bandit_means:  dict = {}
-            if self._scheduling_bandit is not None:
-                bandit_scores = {
-                    g.name: self._scheduling_bandit._arms[g.name].sample(
-                        self._scheduling_bandit._rng
-                    )
-                    for g in eligible if g.name in self._scheduling_bandit._arms
-                }
-                # Posterior mean per arm — the bandit's *learned* priority,
-                # recorded for the bandit-convergence plot.  Captured for ALL
-                # arms (not just eligible) so the learning curve is continuous.
-                bandit_means = {
-                    name: arm.mean
-                    for name, arm in self._scheduling_bandit._arms.items()
-                }
             self._metrics.record_scheduling(
                 chosen_groups=[g.name for g, _ in to_start],
                 eligible_groups=[g.name for g in eligible],
-                bandit_scores=bandit_scores,
-                bandit_means=bandit_means,
             )
 
             def _gpu_tag(g, idx):
@@ -323,19 +306,10 @@ class SchedulerMixin:
                 for g in self._workflows.values()
             )
             res_line = f"  {self._resources.usage_str()}"
-            bandit_line = ""
-            if self._scheduling_bandit is not None:
-                bsum = self._scheduling_bandit.summary()
-                best = self._scheduling_bandit.best()
-                bandit_line = (
-                    "\n  sched_bandit_best=" + repr(best) + "  "
-                    + " ".join(f"{n}:{v:.2f}" for n, v in bsum.items())
-                )
             self._log.info(
                 f"Scheduling: [{summary}]  viz=[{viz}]\n"
                 + group_lines + "\n"
                 + res_line
-                + bandit_line
             )
 
         return to_start

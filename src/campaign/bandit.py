@@ -1,19 +1,14 @@
 """
-Thompson-sampling multi-armed bandit for campaign optimization.
+Thompson-sampling scheduling bandit.
 
-Two planned use cases (integration wired later via feature flag):
+`SchedulingBandit` (one `BanditArm` per pipeline stage) ranks eligible stages
+by a Beta-posterior sample so the most-promising stage is scheduled first.
 
-  Shard optimizer
-    Arms:    multiplier factors applied to ShardingSpec.target_size
-             e.g. [0.50, 0.75, 1.00, 1.25, 1.50]
-    Reward:  throughput — replicas dispatched per second after the shard;
-             normalized to [0, 1] relative to a rolling max
-
-  Resource optimizer
-    Arms:    per-stage budget reallocation factors
-             e.g. {"s1": 0.9, "s2": 1.1, ...} encoded as discrete options
-    Reward:  pass-through efficiency — observed / expected trigger fraction;
-             clamped to [0, 1]
+It is **not** wired into the CM scheduler — the scheduler orders eligible
+groups by ``group.priority``.  The bandit is consumed by the ADR layer's
+``BanditSchedulingPolicy`` (``src/campaign/adr/policies.py``), which drives
+that priority lever.  This module therefore only provides the learning
+primitive; the in-loop shard / resource / scheduling bandits were removed.
 
 Algorithm
 ---------
@@ -22,26 +17,7 @@ Beta-Bernoulli Thompson sampling with continuous reward:
   Prior:  Beta(α=1, β=1)  — uniform, no preference
   Update: α += reward      (reward ∈ [0, 1])
           β += 1 - reward
-  Select: sample each arm from Beta(α, β);
-          choose arm with the highest sample
-
-The continuous update degrades gracefully: reward=1.0 is a pure success,
-reward=0.0 is a pure failure, values in between are fractional credit.
-
-Usage
------
-    # Create a bandit with discrete multiplier arms
-    b = Bandit(arms=[0.5, 0.75, 1.0, 1.25, 1.5], seed=42)
-
-    # At each decision point, select an arm
-    factor = b.select()
-
-    # After observing the outcome, update with a normalized reward
-    b.update(factor, reward=0.8)
-
-    # Inspect current estimates
-    print(b.summary())   # {0.5: 0.52, 0.75: 0.61, 1.0: 0.78, ...}
-    print(b.best())      # 1.0  (arm with highest mean so far)
+  Select: sample each arm from Beta(α, β); choose the highest sample
 """
 
 import random
@@ -88,92 +64,6 @@ class BanditArm:
             f"mean={self.mean:.3f}  pulls={self.pulls}  "
             f"α={self.alpha:.2f}  β={self.beta:.2f})"
         )
-
-
-class Bandit:
-    """Multi-armed bandit with Thompson sampling over a fixed discrete action set.
-
-    Parameters
-    ----------
-    arms:
-        Iterable of labels (any hashable value) representing the discrete actions.
-    seed:
-        Optional RNG seed for reproducibility.
-    """
-
-    def __init__(self, arms: list[Any], seed: Optional[int] = None) -> None:
-        if not arms:
-            raise ValueError("Bandit requires at least one arm")
-        self._rng  = random.Random(seed)
-        self._arms: dict[Any, BanditArm] = {
-            label: BanditArm(label=label) for label in arms
-        }
-
-    # ── Decision ──────────────────────────────────────────────────────────────
-
-    def select(self) -> Any:
-        """Thompson sampling: return the label of the arm with the highest sample."""
-        return max(self._arms.values(), key=lambda a: a.sample(self._rng)).label
-
-    # ── Learning ──────────────────────────────────────────────────────────────
-
-    def update(self, arm_label: Any, reward: float) -> None:
-        """Update *arm_label* with *reward* ∈ [0, 1].
-
-        Unknown labels are silently ignored so callers don't need to guard.
-        """
-        arm = self._arms.get(arm_label)
-        if arm is not None:
-            arm.update(reward)
-
-    def reset(self, arm_label: Optional[Any] = None) -> None:
-        """Reset one arm (or all arms if *arm_label* is None) to the uniform prior."""
-        targets = [self._arms[arm_label]] if arm_label is not None else self._arms.values()
-        for arm in targets:
-            arm.reset()
-
-    # ── Inspection ────────────────────────────────────────────────────────────
-
-    def best(self) -> Any:
-        """Return the label of the arm with the highest posterior mean."""
-        return max(self._arms.values(), key=lambda a: a.mean).label
-
-    def summary(self) -> dict[Any, float]:
-        """Posterior mean estimate for each arm — useful for logging."""
-        return {label: arm.mean for label, arm in self._arms.items()}
-
-    def arms(self) -> list[BanditArm]:
-        """All arms, sorted by label (for deterministic logging)."""
-        try:
-            return sorted(self._arms.values(), key=lambda a: a.label)
-        except TypeError:
-            return list(self._arms.values())
-
-    def __repr__(self) -> str:
-        arm_str = "  ".join(repr(a) for a in self.arms())
-        return f"Bandit(best={self.best()!r}  [{arm_str}])"
-
-
-# ── Preconfigured factory functions ───────────────────────────────────────────
-
-def shard_bandit(seed: Optional[int] = None) -> Bandit:
-    """Bandit for shard-size multiplier selection.
-
-    Arms represent scale factors applied to ShardingSpec.target_size.
-    Replaces the hardcoded 0.5× / 1.5× multipliers in Sharder._adaptive_size().
-    """
-    return Bandit(arms=[0.50, 0.75, 1.00, 1.25, 1.50], seed=seed)
-
-
-def resource_bandit(stage_ids: list[str], seed: Optional[int] = None) -> Bandit:
-    """Bandit for per-stage budget reallocation.
-
-    Each arm is a tuple of (stage_id, factor) pairs encoded as a frozenset,
-    representing a candidate budget allocation across stages.
-    In practice the caller constructs the arms based on the plan's
-    per_stage_band_pct constraints.
-    """
-    return Bandit(arms=stage_ids, seed=seed)
 
 
 class SchedulingBandit:
@@ -247,12 +137,3 @@ class SchedulingBandit:
             f"{n}:{arm.mean:.3f}" for n, arm in self._arms.items()
         )
         return f"SchedulingBandit(best={self.best()!r}  [{arms_str}])"
-
-
-def scheduling_bandit(
-    stage_names: list[str],
-    seed: Optional[int] = None,
-    stage_priors: Optional[dict[str, tuple[float, float]]] = None,
-) -> SchedulingBandit:
-    """Factory for the cross-stage scheduling bandit."""
-    return SchedulingBandit(stage_names=stage_names, seed=seed, stage_priors=stage_priors)

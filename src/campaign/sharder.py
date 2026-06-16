@@ -29,14 +29,9 @@ at that stage are accepted into the buffer.  Gating is handled by the CM
 re-check the threshold.
 
 Backpressure and stratify semantics are unchanged from the integer-buffer version.
-
-Bandit mode (use_bandit: true)
--------------------------------
-Thompson-sampling bandit selects the BP multiplier from
-[0.50, 0.75, 1.00, 1.25, 1.50].  Feedback is the BP state of the PREVIOUS
-dispatch cycle.  In strict mode the selected factor is clamped to ≥ 1.0 so
-the bandit's reward is consistent with what the sharder actually dispatched
-(strict mode never sends fewer than target_size).
+Batch size follows a fixed backpressure → multiplier mapping
+(THROTTLE 0.5× / HOLD 1.0× / WIDEN 1.5×); adaptive batch sizing is now an
+ADR-layer concern (the set_batch_size lever), not an in-sharder bandit.
 """
 
 import time
@@ -48,7 +43,6 @@ import numpy as np
 from .backpressure import BackpressureNegotiator, BPState
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .bandit import Bandit
     from .profiles import ProfileWeights
 
 
@@ -96,8 +90,6 @@ class ShardingSpec:
     stratify:     str            = "soft"   # off | soft | strict
     top_fraction: float          = 1.0      # threshold_top_fraction gate (1.0 = no gate)
     profile:      str            = "diverse_top"
-    use_bandit:   bool           = False
-    bandit_seed:  Optional[int]  = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "ShardingSpec":
@@ -108,8 +100,6 @@ class ShardingSpec:
             stratify     = str(d.get("stratify",    "soft")),
             top_fraction = float(d.get("top_fraction", 1.0)),
             profile      = str(d.get("profile", "diverse_top")),
-            use_bandit   = bool(d.get("use_bandit",  False)),
-            bandit_seed  = d.get("bandit_seed"),
         )
 
 
@@ -123,10 +113,7 @@ class Sharder:
 
     _buf:            list                                            = field(default_factory=list, init=False)
     _upstream_done:  bool                                            = field(default=False,        init=False)
-    _last_factor:    Optional[float]                                 = field(default=None,         init=False)
-    _last_occupancy: float                                           = field(default=0.0,          init=False)
     _shard_seq:      int                                             = field(default=0,            init=False)
-    _bandit:         Optional["Bandit"]                              = field(default=None,         init=False)
     _profile:        Optional["ProfileWeights"]                      = field(default=None,         init=False)
     _log_fn:         Optional[Callable[[str], None]]                 = field(default=None,         init=False)
     _metrics_fn:     Optional[Callable[[int, int, list, list], None]] = field(default=None,        init=False)
@@ -137,9 +124,6 @@ class Sharder:
             self._log_fn(msg)
 
     def __post_init__(self) -> None:
-        if self.spec.use_bandit:
-            from .bandit import shard_bandit
-            self._bandit = shard_bandit(seed=self.spec.bandit_seed)
         from .profiles import get_profile
         self._profile = get_profile(self.spec.profile)
 
@@ -250,80 +234,21 @@ class Sharder:
             for i in range(len(entries))
         ]
 
-    # ── Bandit helpers ─────────────────────────────────────────────────────────
-
-    def _update_bandit(self, bp_state: Optional[BPState]) -> None:
-        """Feed reward for the previous dispatch factor.
-
-        Reward formula:
-          THROTTLE → 0.1 + 0.3 × occupancy
-            (previous factor flooded the queue; partial credit for high
-             occupancy so we don't converge to the smallest factor just
-             to avoid any THROTTLE.)
-          HOLD     → 0.8  (queue depth healthy, flat — no occupancy signal)
-          WIDEN    → 0.2 + 0.7 × occupancy
-            (high occupancy means the previous dispatch kept the stage
-             well-fed despite the queue draining → good factor choice;
-             low occupancy means the stage was starved.)
-
-        Using occupancy rather than raw WIDEN/HOLD lets the bandit converge
-        even when BP stays WIDEN permanently (queue drains between dispatches),
-        which happens when makespan < dispatch interval.
-        """
-        if self._bandit is None or self._last_factor is None:
-            return
-        if bp_state == BPState.THROTTLE:
-            reward = 0.1 + 0.3 * self._last_occupancy
-        elif bp_state == BPState.HOLD:
-            reward = 0.8
-        else:  # WIDEN or no BP
-            reward = 0.2 + 0.7 * self._last_occupancy
-        prev_factor = self._last_factor
-        self._bandit.update(prev_factor, reward)
-        self._last_factor = None
-        # Defer string formatting until we know logging is wired up — large
-        # bandit summaries are expensive to stringify in hot dispatch loops.
-        if self._log_fn is not None:
-            bsum = self._bandit.summary()
-            best = max(bsum, key=bsum.get)
-            reward_src = (
-                f"throttle+occ={self._last_occupancy:.2f}→{reward:.2f}" if bp_state == BPState.THROTTLE
-                else f"hold→0.80"   if bp_state == BPState.HOLD
-                else f"occ={self._last_occupancy:.2f}→{reward:.2f}"
-            )
-            self._log(
-                f"  Sharder [{self.name}] shard_bandit update: "
-                f"factor={prev_factor:.2f}  reward={reward_src}  "
-                f"best={best:.2f}×  [{' '.join(f'{k:.2f}:{v:.2f}' for k, v in bsum.items())}]"
-            )
+    # ── Dispatch sizing ─────────────────────────────────────────────────────────
 
     def _bp_factor(self, bp_state: Optional[BPState]) -> float:
-        """Select dispatch multiplier from bandit or fixed BP→factor mapping.
+        """Fixed backpressure → dispatch-multiplier mapping.
 
-        In strict mode the factor is floored at 1.0 so the bandit's selected
-        arm matches what dispatch() actually emits (strict mode never sends
-        fewer than target_size).  Without this clamp, bandit selections of
-        0.5 or 0.75 would be silently promoted to 1.0 by the strict-mode
-        floor in dispatch(), and the bandit's posterior would inflate the
-        value of small arms that had no real effect.
+        (The adaptive shard bandit was removed; batch-size adaptation is now an
+        ADR-layer concern via the set_batch_size lever.)  In strict mode the
+        THROTTLE factor is floored at 1.0 since strict never sends fewer than
+        target_size.
         """
-        if self._bandit is not None:
-            factor = self._bandit.select()
-            if self.spec.stratify == "strict":
-                factor = max(factor, 1.0)
-            self._last_factor = factor
-            return factor
-        # Fixed mapping
         if bp_state == BPState.THROTTLE:
             return 1.0 if self.spec.stratify == "strict" else 0.5
         if bp_state == BPState.WIDEN:
             return 1.5
         return 1.0
-
-    def bandit_summary(self) -> Optional[dict]:
-        if self._bandit is None:
-            return None
-        return self._bandit.summary()
 
     # ── Consumer side ──────────────────────────────────────────────────────────
 
@@ -332,23 +257,15 @@ class Sharder:
         bp:        "BackpressureNegotiator | None",
         occupancy: float,
     ) -> int:
-        """Compute dispatch batch size for this scheduling cycle.
-
-        Note: this method has a side effect when use_bandit=True — it consumes
-        one bandit arm selection via _bp_factor.  Call it only from dispatch()
-        or from tests that intend to advance the bandit.
-        """
+        """Compute dispatch batch size for this scheduling cycle."""
         sh       = self.spec
         bp_state = bp.state if bp is not None else None
         buf_len  = len(self._buf)
 
         factor    = self._bp_factor(bp_state)
         size_bp   = max(sh.min_size, min(sh.max_size, int(sh.target_size * factor)))
-        if self._bandit is not None:
-            bp_tag = f"×{factor:.2f}(bandit) target={sh.target_size}→{size_bp}"
-        else:
-            bp_tag = (f"bp={bp_state.value if bp_state else 'none'} "
-                      f"×{factor:.2f}(fixed) target={sh.target_size}→{size_bp}")
+        bp_tag = (f"bp={bp_state.value if bp_state else 'none'} "
+                  f"×{factor:.2f}(fixed) target={sh.target_size}→{size_bp}")
 
         if occupancy > 0.85:
             size_occ = max(sh.min_size, int(size_bp * 0.75))
@@ -401,10 +318,6 @@ class Sharder:
             return []
 
         bp_state = bp.state if bp is not None else None
-        # Store occupancy so _update_bandit can use it as the reward signal
-        # for the *previous* factor (occupancy at this dispatch = outcome of prev dispatch).
-        self._last_occupancy = occupancy
-        self._update_bandit(bp_state)
 
         # ── Upstream-done fast-path (strict only) ──────────────────────────────
         # STRICT mode: flush ALL remaining candidates in priority order so we
@@ -437,9 +350,8 @@ class Sharder:
         else:
             n = self.adaptive_size(bp, occupancy)
             # In strict mode floor at target_size so dispatch never sends
-            # fewer than a full batch.  _bp_factor already clamps the bandit's
-            # selection to ≥ 1.0 in strict mode; this is defense-in-depth for
-            # the fixed-mapping path and any future factor changes.
+            # fewer than a full batch.  _bp_factor already floors the THROTTLE
+            # multiplier at 1.0 in strict mode; this is defense-in-depth.
             if self.spec.stratify == "strict":
                 n = max(n, self.spec.target_size)
             n = min(n, len(self._buf))

@@ -48,21 +48,23 @@ sed -i "s|\${WORK_DIR}|$WORK_DIR|g" $INPUT_DIR/new_lassen-keras-dbscan.yaml
 cp  $WORK_DIR/template_config.yaml $WORK_DIR/config.yaml
 sed -i "s|\${PROJECT}|$PROJECT|g" $WORK_DIR/config.yaml
 
-cp  template_config.yaml config.yaml
-sed -i "s|\${MD_DIR}|$MD_DIR|g" config.yaml
-sed -i "s|\${MINAPPS_DIR}|$MINAPPS_DIR|g" config.yaml
-sed -i "s|\${INF_DIR}|$INF_DIR|g" config.yaml
-sed -i "s|\${DUMMY_DIR}|$DUMMY_DIR|g" config.yaml
+# NOTE: the campaign config (esm2_ddsim_campaign/config.yaml) is committed and
+# self-templating — its ${MD_DIR}/${MINAPPS_DIR}/${INF_DIR}/${DUMMY_DIR} refs are
+# expanded at load time by _expand_env(), so no cp/sed step is needed here.
+# (The per-workflow configs below ARE generated, because the campaign config
+# points at them and the workflows read them directly.)
 
 cp  $MINAPPS_DIR/template_config.yaml $MINAPPS_DIR/config.yaml
 sed -i "s|\${PROJECT}|$PROJECT|g" $MINAPPS_DIR/config.yaml
 cp  $DUMMY_DIR/template_config.yaml $DUMMY_DIR/config.yaml
 sed -i "s|\${PROJECT}|$PROJECT|g" $DUMMY_DIR/config.yaml
 
-cd $BASE_DIR/htp/SPHERICAL/workflows/run_campaign
-rm -rf data/telemetry-results
-rm -rf data/nvml-telemetry
+# Run from the campaign directory where run_campaing.py + config.yaml live, so
+# the workflow_registry modules import and the relative telemetry_dir resolves here.
+cd $BASE_DIR/htp/SPHERICAL/workflows/run_campaign/esm2_ddsim_campaign
 
-dragon -s run_campaing.py
-#python run_campaing.py
-#python -m run_workflow -c $INPUT_DIR/new_lassen-keras-dbscan.yaml
+# Clear telemetry from a previous run (telemetry_dir is relative to this dir).
+rm -rf telemetry-results nvml-telemetry
+
+dragon run_campaing.py --config config.yaml
+# Local (no Dragon):  python run_campaing.py --config config.yaml --engine concurrent

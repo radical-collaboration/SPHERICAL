@@ -214,53 +214,6 @@ class ExecutorMixin:
                     changed = True
         return newly_done
 
-    def _compute_scheduling_reward(self, group: _WorkflowInfo) -> float:
-        """Continuous reward in [0.1, 1.0] for scheduling this workflow.
-
-        Combines downstream queue pressure (cost of feeding more if downstream
-        is saturated) and downstream hunger (benefit of feeding more if
-        downstream is idle).  Terminal workflows get a high but bounded
-        reward so non-terminal workflows with idle downstreams can still
-        compete.
-
-        The function is smooth across BP state boundaries — no discontinuous
-        jumps that the bandit posterior has to absorb.
-
-        Components:
-          hunger        ∈ [0,1]: 1 when downstream idle, 0 when fully busy
-          queue_pressure∈ [0,1]: 0 when queue empty, 1 at BP high-water
-          reward = 0.1 + 0.8 × hunger × (1 - queue_pressure)
-                   clipped to [0.1, 1.0]
-        """
-        downstream_name = (group.workflow_config or {}).get("trigger_downstream")
-        if downstream_name is None:
-            # Terminal workflow — capped just below 1.0 so non-terminal
-            # workflows with idle downstreams can still tie.
-            return 0.95
-
-        downstream = self._workflows.get(downstream_name)
-        if downstream is None:
-            return 0.5
-
-        # Queue pressure: 0 when empty, 1 at BP high-water (or 2×cap fallback).
-        queue_depth = max(0, downstream.replicas - downstream.started_count)
-        bp_ctrl = self._bp.get(downstream_name)
-        if bp_ctrl is not None:
-            high_water = max(1, bp_ctrl.high_water)
-            queue_pressure = min(1.0, queue_depth / high_water)
-        else:
-            cap_proxy = downstream.concurrency_cap if downstream.concurrency_cap > 0 else 1
-            queue_pressure = min(1.0, queue_depth / (cap_proxy * 2))
-
-        # Hunger: 1 when downstream is idle, 0 when at full concurrency.
-        if downstream.concurrency_cap > 0:
-            hunger = 1.0 - min(1.0, downstream.running_count / downstream.concurrency_cap)
-        else:
-            hunger = 0.5
-
-        reward = 0.1 + 0.8 * hunger * (1.0 - queue_pressure)
-        return max(0.1, min(1.0, reward))
-
     def _compute_passthrough(
         self,
         upstream_name: str,
@@ -317,13 +270,9 @@ class ExecutorMixin:
                 if total_running == 0:
                     self._replanning.drained()
 
-            # Update scheduling bandit with a smooth reward in [0.1, 1.0].
-            # The previous formula had step discontinuities at BP state
-            # boundaries — the Beta posterior absorbed those as widened
-            # uncertainty, which can cause oscillation near thresholds.
-            if self._scheduling_bandit is not None:
-                sched_reward = self._compute_scheduling_reward(group)
-                self._scheduling_bandit.update(group.name, sched_reward)
+            # (The in-loop scheduling bandit was removed; adaptive priority is
+            # now driven by the ADR layer's BanditSchedulingPolicy, which feeds
+            # its own reward from the observation each cycle.)
 
             freed_gpu_ids = self._replica_gpu_assignments.pop(replica_id, [])
             self._free_gpu_ids.extend(freed_gpu_ids)

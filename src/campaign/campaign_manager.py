@@ -30,7 +30,8 @@ from ..utils.logger import Logger
 from .backpressure import BackpressureNegotiator, BPState  # noqa: F401 (re-exported)
 from .budget_controller import BudgetController, BudgetEvent  # noqa: F401
 from .metrics import CampaignMetrics
-from .bandit import Bandit, BanditArm, shard_bandit, resource_bandit, SchedulingBandit, scheduling_bandit  # noqa: F401
+# (No bandit import: cross-stage scheduling priority is driven by the ADR
+# layer's BanditSchedulingPolicy, not an in-CM bandit.)
 from .base_workflow import BaseWorkflow
 from .candidate_log import CandidateLog, CandidateHistory, StageResult  # noqa: F401
 from .executor import ExecutorMixin
@@ -89,6 +90,10 @@ class AsyncCampaignManager(SchedulerMixin, ExecutorMixin, MonitorMixin):
         # asyncflow backend is torn down.  Without this, pending tasks trigger
         # "Task was destroyed but it is pending!" warnings at shutdown.
         self._replica_tasks: set[asyncio.Task] = set()
+        # Set by close(); the scheduler stops launching new replicas once true,
+        # so cancelling in-flight replicas during shutdown can't race the
+        # scheduler into spawning fresh (uncancelled) ones.
+        self._closing: bool = False
 
         self._features: dict[str, bool] = features or {}
         self._bp: dict[str, BackpressureNegotiator] = {}
@@ -96,7 +101,6 @@ class AsyncCampaignManager(SchedulerMixin, ExecutorMixin, MonitorMixin):
         self._monitor: Optional[Monitor] = None
         self._monitor_interval_s: float = 30.0   # overwritten by from_config
         self._monitor_task: Optional[asyncio.Task] = None
-        self._scheduling_bandit: Optional[SchedulingBandit] = None
         self._candidate_log: Optional[CandidateLog] = None
         self._cand_seq: itertools.count = itertools.count()
         self._replica_candidate_assignments: dict[str, str] = {}
@@ -281,66 +285,11 @@ class AsyncCampaignManager(SchedulerMixin, ExecutorMixin, MonitorMixin):
                 f"interval={cm._monitor_interval_s}s"
             )
 
-        # ── Feature: Scheduling bandit ────────────────────────────────────────
-        stage_names = list(config.get("workflows", {}).keys())
-        if features.get("bandit") and len(stage_names) > 1:
-            bandit_seed = config.get("bandit", {}).get("seeds", {}).get("bandit")
-            # Warm-start: downstream stages get higher initial priority so the bandit
-            # minimises time-to-target (first N terminal-stage completions).
-            # Without this, the default FIFO order (insertion = upstream-first) runs
-            # s1 at full capacity before feeding s4/s5, delaying the first leads.
-            #
-            # Priority by pipeline depth (deepest = highest priority):
-            #   depth-0 (source)   → Beta(1, 1)  mean≈0.50  (lowest — runs last when competing)
-            #   depth-1            → Beta(2, 1)  mean≈0.67
-            #   depth-2            → Beta(3, 1)  mean≈0.75
-            #   depth-3            → Beta(4, 1)  mean≈0.80
-            #   depth-4+ (terminal)→ Beta(5, 1)  mean≈0.83  (highest — reaches target fastest)
-            # Priors are weak (~1-5 effective observations) and quickly overridden by
-            # the utilisation-based reward signal (see executor.py).
-            def _dep_depth(name: str, visited: frozenset = frozenset()) -> int:
-                if name in visited:
-                    return 0
-                deps = [d for d in cm._workflows[name].dependencies if d in cm._workflows]
-                return 0 if not deps else 1 + max(
-                    _dep_depth(d, visited | {name}) for d in deps
-                )
-
-            depths = {n: _dep_depth(n) for n in stage_names if n in cm._workflows}
-            # Scale the warm-start prior to the actual cascade depth so 3-
-            # or 10-stage pipelines get sensible terminal priors (not the
-            # 5-stage-specific Beta(5,1)≈0.83 that the previous hardcode
-            # baked in).  Floor at 2 so a single-stage campaign still gets
-            # a non-uniform terminal prior (otherwise Beta(1,1) = uniform
-            # gives no warm-start lift at all).
-            max_alpha = max(2, max(depths.values(), default=0) + 1)
-
-            stage_priors: dict[str, tuple[float, float]] = {}
-            for name in stage_names:
-                if name not in cm._workflows:
-                    continue
-                d = depths.get(name, 0)
-                alpha = float(min(max_alpha, d + 1))   # deeper = higher priority
-                stage_priors[name] = (alpha, 1.0)
-
-            # bandit_warmstart=False starts every arm at the uniform Beta(1,1)
-            # prior, so the depth ordering must be LEARNED from the reward signal
-            # rather than handed to the bandit up-front.  Used by the bandit_demo
-            # benchmark config to visualise priority redistribution over time.
-            if not features.get("bandit_warmstart", True):
-                stage_priors = {}
-
-            cm._scheduling_bandit = scheduling_bandit(
-                stage_names, seed=bandit_seed, stage_priors=stage_priors or None
-            )
-            warm_str = "  ".join(
-                f"{n}=Beta({a:.0f},1)" for n, (a, _) in stage_priors.items()
-            )
-            cm._log.info(
-                f"SchedulingBandit enabled: {len(stage_names)} stages  "
-                f"[{' '.join(stage_names)}]"
-                + (f"  warm-start: {warm_str}" if warm_str else "")
-            )
+        # NOTE: the in-loop scheduling bandit was removed. Adaptive cross-stage
+        # scheduling priority is now driven by the ADR layer (src/campaign/adr)
+        # via the group.priority lever — wrap the SchedulingBandit as an ADR
+        # BanditSchedulingPolicy to get the same behaviour. The scheduler orders
+        # eligible groups purely by group.priority.
 
         # Store the parsed plan regardless of features so external callers
         # can inspect it via cm.state.plan.
@@ -349,7 +298,7 @@ class AsyncCampaignManager(SchedulerMixin, ExecutorMixin, MonitorMixin):
 
         # ── Triage + BudgetController per stage ──────────────────────────────
         # Gated by features.budget_control so other benchmark configurations
-        # (sharding+bp, scheduling_bandit, all_optimizations) stay unaffected
+        # (sharding+bp, all_optimizations) stay unaffected
         # even if the plan defines surrogate specs.  When the flag is off, no
         # surrogates, no triages, no controllers, no replanning controller —
         # the CM behaves like the legacy flat-config path.
@@ -637,19 +586,28 @@ class AsyncCampaignManager(SchedulerMixin, ExecutorMixin, MonitorMixin):
 
     async def close(self) -> None:
         """Release CM resources (asyncflow shutdown left to caller)."""
+        # Stop the scheduler first so cancelling in-flight replicas (below) can't
+        # free resources and race the scheduler into launching fresh, uncancelled
+        # ones — that race is what leaks "Task was destroyed but it is pending!".
+        self._closing = True
+
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
             try:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
+
         # Cancel any replica tasks still in flight (early-termination target hit
         # or wait() timeout) so the asyncflow backend isn't torn down underneath
-        # them — otherwise asyncio logs "Task was destroyed but it is pending!".
-        pending = [t for t in self._replica_tasks if not t.done()]
-        for t in pending:
-            t.cancel()
-        if pending:
+        # them.  Loop until quiescent: a cancelled replica's done-callbacks run
+        # during the gather and may enqueue more work before _closing takes hold.
+        for _ in range(5):
+            pending = [t for t in self._replica_tasks if not t.done()]
+            if not pending:
+                break
+            for t in pending:
+                t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         self._replica_tasks.clear()
         self._asyncflow = None
@@ -997,10 +955,6 @@ class AsyncCampaignManager(SchedulerMixin, ExecutorMixin, MonitorMixin):
             "budget_controllers": {
                 sid: bc.state() for sid, bc in self._budget_controllers.items()
             },
-            "bandit_summary": (
-                self._scheduling_bandit.summary()
-                if self._scheduling_bandit is not None else None
-            ),
         }
 
     async def _apply_new_plan_for_resume(self, new_plan: CampaignPlan) -> None:
@@ -1055,7 +1009,6 @@ class AsyncCampaignManager(SchedulerMixin, ExecutorMixin, MonitorMixin):
             bp=self._bp,
             candidate_log=self._candidate_log,
             monitor=self._monitor,
-            scheduling_bandit=self._scheduling_bandit,
             running_candidates=self._running_candidates,
             replica_candidate_assignments=self._replica_candidate_assignments,
             replica_gpu_assignments=self._replica_gpu_assignments,

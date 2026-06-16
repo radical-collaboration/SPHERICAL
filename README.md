@@ -5,7 +5,7 @@ HPC workflow orchestration framework for multi-GPU protein inference and enginee
 ## Features
 
 - **AsyncCampaignManager** — async-native orchestrator for concurrent multi-workflow campaigns with priority scheduling, resource pools, and dependency signalling
-- **Adaptive Optimization Layers** — opt-in, config-driven: quality routing (Sharder), flow control (Backpressure), Thompson-sampling Bandits, surrogate-gated Triage (RUN/DISCARD/ADVANCE), and a BudgetController that keeps spend on plan; drift-driven Replanning
+- **Adaptive Optimization Layers** — opt-in, config-driven: quality routing (Sharder), flow control (Backpressure), surrogate-gated Triage (RUN/DISCARD/ADVANCE), and a BudgetController that keeps spend on plan; drift-driven Replanning. Cross-stage scheduling priority is driven by the **ADR agent layer** (rule / bandit / LLM policies), not an in-CM bandit
 - **Structured Campaign Plans** — typed `CampaignPlan`/`StageSpec` schema (`src/campaign/plan/`) alongside the legacy flat config, resolved by a single `load_plan()`
 - **Multi-GPU Inference** — worker pool per GPU with automatic load balancing; aiohttp HTTP server/client
 - **ESM2 Inference Workflow** — standalone or campaign-embedded ESM2-650M embedding service
@@ -334,6 +334,45 @@ python workflows/run_campaign/dreamer_campaign/plot_budget_control.py \
     [--results benchmark_results.json] \
     [--out plots/diagrams/budget_control_illustration.png]
 ```
+
+### ADR scheduling-policy comparison
+
+The dreamer runner can drive scheduling from a swappable `radical.adr` policy
+(`--policy {none|rule|bandit|llm}`) and record each decision cycle to JSONL with
+`--record`. `plot_policy_comparison.py` then plots the policies side by side —
+assigned priority per workflow over cycles, plus the bandit's posterior learning
+curve.
+
+```bash
+cd workflows/run_campaign/dreamer_campaign
+
+# run the same campaign under each policy, recording decisions
+python run_campaign.py --policy rule   --record
+python run_campaign.py --policy bandit --record
+python run_campaign.py --policy llm    --record    # needs OPENROUTER_API_KEY
+
+# plot them together
+python plot_policy_comparison.py \
+    adr-decisions-rule.jsonl adr-decisions-bandit.jsonl adr-decisions-llm.jsonl \
+    --out plots/policy_comparison.png
+```
+
+Requires `pip install -e ".[adr]"` (the LLM policy also needs `".[llm]"`). The
+policy and recording can also be set in `config.yaml` under `cm.adr`.
+
+**Batch benchmark (all policies in one job).** `benchmark_adr.py` runs every
+policy N times (same metrics shape as `benchmark.py`), writing one results JSON
+plus per-cycle decision logs under `adr-logs/`:
+
+```bash
+python workflows/run_campaign/dreamer_campaign/benchmark_adr.py \
+    --runs 5 --out benchmark_adr_results.json
+    # or restrict: --policies none rule bandit
+```
+
+Cross-stage scheduling priority is owned entirely by the ADR policy (the CM has
+no in-loop scheduling bandit); `--policy bandit` runs the same Thompson-sampling
+bandit wrapped as an ADR agent.
 
 ---
 

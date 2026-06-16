@@ -78,9 +78,11 @@ AsyncCampaignManager (campaign_manager.py)
     ├── BackpressureNegotiator (backpressure.py) — per-edge queue depth controller
     ├── Sharder (sharder.py) — batches upstream triggers before downstream dispatch
     ├── Monitor (monitor.py) — detects pass-through & budget burn drift
-    ├── Bandit (bandit.py) — Thompson-sampling arm selection for scheduling & sharding
     └── CandidateLog (candidate_log.py) — tracks upstream results for sharder ranking
 ```
+
+Adaptive cross-stage scheduling priority is driven by the ADR layer
+(src/campaign/adr), not an in-CM bandit — see "ADR bridge" below.
 
 ### Core Concepts
 
@@ -190,7 +192,8 @@ cm:
     backpressure: true   # hysteresis queue depth controller per edge
     sharder: true        # adaptive batch dispatch from trigger buffer
     monitor: true        # periodic health checks + drift alerts
-    bandit: true         # Thompson-sampling cross-stage optimization
+  # Cross-stage scheduling priority is driven by the ADR layer (cm.adr), not an
+  # in-CM bandit; the scheduler orders eligible groups by group.priority.
   monitor_interval_s: 30   # tick interval for monitor
   telemetry:
     collect_telemetry: true
@@ -232,7 +235,6 @@ workflows:
       min_size: 10
       max_size: 200
       stratify: soft           # soft | strict | off
-      use_bandit: true         # Thompson-sampling BP multiplier selection
       dispatch_cap: 500        # max replicas to dispatch (drop low-priority candidates)
 ```
 
@@ -265,11 +267,15 @@ Two monitoring paths:
 
 ### Bandit (bandit.py)
 
-Thompson-sampling multi-armed bandit for optimization. Two use cases:
+Thompson-sampling multi-armed bandit. `SchedulingBandit` (one Beta arm per
+stage; reward = downstream BP state quality) is **no longer wired into the CM
+scheduler** — it now runs in the ADR layer as `BanditSchedulingPolicy` (see the
+ADR bridge section). The scheduler orders eligible groups purely by
+`group.priority`, which the ADR policy drives.
 
-**Shard optimizer**: arms = multiplier factors [0.5, 0.75, 1.0, 1.25, 1.5]; reward = throughput
-
-**Scheduling bandit**: arms = cross-stage priority; reward = downstream BP state quality
+`bandit.py` is retained because the ADR policy imports `SchedulingBandit` /
+`BanditArm`; the legacy `shard_bandit` / `resource_bandit` factories are no
+longer used by the core (the sharder uses a fixed BP→multiplier mapping).
 
 ### Triage + Surrogate (triage.py, surrogate.py)
 
@@ -336,8 +342,33 @@ typed `CampaignPlan` (`plan/schema.py`: `StageSpec`, `EdgeSpec`,
 `SurrogateSpec`, `BackpressureEdge`, `RetryPolicy`, `PilotSpec`,
 `ReplanThresholds`). `load_plan()` (`plan/loader.py`) auto-detects the shape;
 `plan_to_workflows_dict()` flattens a structured plan to the registration form.
-The `bandit_warmstart` flag toggles depth-based warm-start priors
-(`Beta(depth+1, 1)`) vs. uniform priors.
+(Depth-based warm-start priors `Beta(depth+1, 1)` now live in the ADR
+`BanditSchedulingPolicy`'s `warmstart` option, not an in-CM flag.)
+
+### ADR bridge (adr/) — agent-layer scheduling
+
+`src/campaign/adr/` lets a `radical.adr` **Policy** make the campaign's adaptive
+scheduling decisions instead of the in-CM bandits. The CM keeps owning
+scheduling, execution lifecycle, and resources; a `CampaignOperator` runs the
+ADR Run→Observe→Decide→Act loop *alongside* a live CM and only nudges its
+levers (priority, batch size, dependent triggers) — the ADR "sacred boundary".
+
+- **adr/view.py**: `CampaignView` — the only CM-coupled code; turns `cm.state`
+  into an observation dict and exposes `set_priority` / `set_batch_size` /
+  `trigger` levers. Policies/operator depend on `CampaignViewProtocol`, so they
+  unit-test against a fake view (no live CM, no engine, no LLM key).
+- **adr/operator.py**: `CampaignOperator` (`@observe`/`@act`/`@goals`) +
+  `run_supervised(cm, op)` to drive it alongside `cm.wait()`.
+- **adr/policies.py**: three interchangeable policies for A/B comparison —
+  `DownstreamFirstPolicy` (deterministic rule the bandit had to learn),
+  `BanditSchedulingPolicy` (the in-CM `SchedulingBandit` wrapped as a Policy,
+  same Thompson-sampling + BP-reward signal), and `LLMSchedulingPolicy`
+  (OpenAI-compatible via `instructor`, deps imported lazily). Select with
+  `make_scheduling_policy(op, kind="rule"|"bandit"|"llm", …)`; `kind="llm"`
+  composes `Policy(primary=LLM, fallback=rule)`.
+
+Install: `pip install -e ".[adr]"` (LLM policy also needs `".[llm]"`). Design
+rationale and migration path: `docs/adr_adaptive_decisions.md`.
 
 ---
 
@@ -358,7 +389,7 @@ The `bandit_warmstart` flag toggles depth-based warm-start priors
 
 - **backpressure.py**: `BackpressureNegotiator` — hysteresis state machine
 - **sharder.py**: `Sharder` — buffering and batch dispatch with priority ranking
-- **bandit.py**: `Bandit`, `SchedulingBandit` — Thompson-sampling optimization
+- **bandit.py**: `Bandit`, `SchedulingBandit` — Thompson-sampling (now consumed by the ADR `BanditSchedulingPolicy`, not the CM scheduler)
 - **triage.py**: `Triage`, `TriageDecision` — per-candidate RUN/DISCARD/ADVANCE gate
 - **surrogate.py**: `Surrogate` (`Null`/`Random`/`Correlated`), `RecallTracker` — cheap score predictor
 - **budget_controller.py**: `BudgetController` — burn-ratio feedback on Triage cutoffs

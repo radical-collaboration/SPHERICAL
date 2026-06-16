@@ -27,9 +27,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # ── Benchmark configurations ──────────────────────────────────────────────────
 
-# Per-run wall-time cap.  Non-ADVANCE configs (baseline, scheduling_bandit) can
-# take 500 s+ to reach s5=5 via the full cascade; cap each run so the benchmark
-# completes in ~20 min.  Optimised configs finish in <30 s.
+# Per-run wall-time cap.  Non-ADVANCE configs (e.g. baseline) can take 500 s+ to
+# reach s5=5 via the full cascade; cap each run so the benchmark completes in
+# ~20 min.  Optimised configs finish in <30 s.
 RUN_TIMEOUT_S = 120
 
 CONFIGURATIONS: dict[str, dict] = {
@@ -40,7 +40,7 @@ CONFIGURATIONS: dict[str, dict] = {
     # Sharder OFF → FIFO arrival order (random quality).  No priorities → s1
     # monopolises all GPUs.  Underutilises resources at every stage transition.
     "baseline": {
-        "features": {"backpressure": False, "monitor": False, "sharder": False, "bandit": False},
+        "features": {"backpressure": False, "monitor": False, "sharder": False},
        # "dep_threshold_override": 9999999,
         "stage_replicas_overrides": {
             "s2_ml_affinity":   {"concurrency_floor": 2},
@@ -58,8 +58,8 @@ CONFIGURATIONS: dict[str, dict] = {
     # This forces PARTIAL overlap between stages without requiring the bandit
     # to learn it.  Combines quality filtering with basic pipeline configuration.
     "sharding+bp": {
-        "features": {"backpressure": True, "monitor": False, "sharder": True, "bandit": False},
-        "sharding_overrides": {"stratify": "soft", "use_bandit": True,
+        "features": {"backpressure": True, "monitor": False, "sharder": True},
+        "sharding_overrides": {"stratify": "soft",
                                "min_size": 1, "target_size": 8, "max_size": 32},
         # concurrency_floor guarantees Pass-1 concurrency floor for downstream
         # stages: scheduler always reserves this many GPU slots even while s1 runs.
@@ -71,45 +71,6 @@ CONFIGURATIONS: dict[str, dict] = {
         },
     },
 
-    # ─── Scheduling bandit axis ───────────────────────────────────────────────
-    # Demonstrates the GPU-ALLOCATION benefit in isolation.
-    # No sharding: FIFO dispatch (sharder=False), random quality order.
-    # Cross-stage Thompson-sampling bandit LEARNS downstream-first GPU allocation.
-    # No static priorities (bandit must learn them).  No BP.
-    "scheduling_bandit": {
-        "features": {"backpressure": False, "monitor": False, "sharder": False, "bandit": True},
-    },
-
-    # ─── Bandit learning demo (for plot 6 only) ───────────────────────────────
-    # Same as scheduling_bandit but starts the bandit from UNIFORM priors
-    # (bandit_warmstart=False) so the downstream-first ordering must be LEARNED
-    # from the reward signal rather than handed over up-front.  Runs longer
-    # (campaign_target=40 on s5) so the bandit accumulates enough reward to show
-    # its priority curves climbing apart over time.  Excluded from all other
-    # plots (see _EXCLUDE in plot_optimizations.py) — its longer run and uniform
-    # start make its wall time non-comparable to the optimisation configs.
-    "bandit_demo": {
-        "features": {"backpressure": True, "monitor": False, "sharder": False,
-                     "bandit": True, "bandit_warmstart": False},
-        "stage_replicas_overrides": {
-            "s2_ml_affinity":   {"concurrency_floor": 2},
-            "s3_docking":       {"concurrency_floor": 1},
-            "s4_md_refinement": {"concurrency_floor": 1},
-            # Run until 15 leads (vs the usual 5) so the bandit gets many reward
-            # updates and its priority curves develop — but well below the ~35
-            # s5 hits that 10,000 s1 ligands can produce, so the target is
-            # reachable and the run finishes in ~40 s (inside RUN_TIMEOUT_S).
-            "s5_fep_ranking":   {"concurrency_floor": 1, "campaign_target": 15},
-        },
-    },
-
-    # ─── Combined ─────────────────────────────────────────────────────────────
-    # Both axes together: adaptive soft sharding (stratify=soft + shard_bandit +
-    # BP) AND cross-stage scheduling bandit.
-    # NO static priorities — the cross-stage bandit learns optimal GPU allocation
-    # via Thompson sampling with depth-based warm-start priors (s5=Beta(5,1),
-    # s1=Beta(1,1)).  Static priorities would pre-answer what the bandit is
-    # supposed to discover, hiding whether it adds value beyond the static ordering.
     # ─── Optimisation 3: Triage (skip expensive compute on confident leads) ──
     # Triage uses the surrogate to gate candidates and ADVANCE high-confidence
     # ones, letting the workflow skip its expensive simulation entirely.
@@ -126,7 +87,7 @@ CONFIGURATIONS: dict[str, dict] = {
     # time difference vs sharding+bp isolates the ADVANCE-skip effect.
     "triage": {
         "features": {"backpressure": False, "monitor": False, "sharder": True,
-                     "bandit": False, "budget_control": True},
+                     "budget_control": True},
         # target_size=1 with min_size=1 makes the sharder dispatch every
         # received candidate immediately — eliminates batching wait and
         # cuts the per-trigger _schedule_locked work.
@@ -304,7 +265,7 @@ CONFIGURATIONS: dict[str, dict] = {
     # develops visibly across the progress axis rather than snapping in 3 ticks.
     "budget_control": {
         "features": {"backpressure": False, "monitor": False, "sharder": True,
-                     "bandit": False, "budget_control": True},
+                     "budget_control": True},
         "sharding_overrides": {"stratify": "soft",
                                "min_size": 1, "target_size": 1, "max_size": 4},
         # advance_threshold is calibrated PER STAGE so each stage starts with
@@ -429,14 +390,15 @@ CONFIGURATIONS: dict[str, dict] = {
         },
     },
 
-    # ─── Combined: all three optimisations together ──────────────────────────
-    # 1+2+3 stacked: sharder+bp+sharding bandit, scheduling bandit, AND
-    # Triage with BudgetController.  Expected to be the fastest configuration
-    # — quality routing + adaptive scheduling + skip-when-confident.
+    # ─── Combined: optimisations together ────────────────────────────────────
+    # sharder + BP (quality routing) AND Triage with BudgetController
+    # (skip-when-confident).  Expected to be the fastest configuration.
+    # (Cross-stage scheduling priority, if desired, is supplied by the ADR
+    # layer — see benchmark_adr.py — not an in-CM bandit.)
     "all_optimizations": {
         "features": {"backpressure": True, "monitor": True, "sharder": True,
-                     "bandit": True, "budget_control": True},
-        "sharding_overrides": {"stratify": "soft", "use_bandit": True,
+                     "budget_control": True},
+        "sharding_overrides": {"stratify": "soft",
                                "min_size": 1, "target_size": 8, "max_size": 32},
         # Same surrogate + budget overrides as the triage config — the
         # combined run stacks sharder + bp + bandits on top of Triage's

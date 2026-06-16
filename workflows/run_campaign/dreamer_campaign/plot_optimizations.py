@@ -89,6 +89,30 @@ DISPLAY = {
 }
 TARGET_WORKFLOW = "s5_fep_ranking"
 
+# Reference config for the wall-time % annotation and cascade-funnel "Nx less"
+# ratio. Defaults to the feature-flag study's "baseline"; the ADR plotter
+# overrides it (e.g. "rule" or "none"). Set to None to suppress the comparison.
+BASELINE_KEY = "baseline"
+
+# Plot captions — overridable so a different study (e.g. ADR policies) can swap
+# the feature-flag explanations for its own. None → no caption box.
+WALL_CAPTION = (
+    "LOWER IS BETTER.  Wall-clock time until the 5th high-quality candidate found.  "
+    "Bar = median; white dots = individual runs.  "
+    "sharding+bp: sharder routes highest-score candidates first — fewer total workflows.  "
+    "scheduling_bandit: Thompson-sampling bandit allocates resources to final-workflow calculations earlier.  "
+    "surrogate: bypasses expensive compute for high-confidence candidates.  "
+    "all_optimizations: all axes combined — lowest wall time and lowest variance."
+)
+FUNNEL_CAPTION = (
+    "LOWER IS BETTER.  Each bar is the total number of workflow instances launched to reach "
+    "the same goal — 5 high-quality candidates — stacked by workflow.  The campaign stops as soon as the "
+    "goal is met, so a smarter configuration gets there after starting far fewer instances "
+    "(especially in the costly Initial Screening layer).  Combining all optimizations launches "
+    "~17× less work than the baseline."
+)
+TTT_CAPTION = None   # None → use the function's built-in (study-specific) caption
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -165,7 +189,9 @@ def plot_wall_time(results: dict, out_dir: Path) -> None:
     # optimisation — it is documented separately in plot_budget_control.py.
     cfgs     = [c for c in results.keys() if c not in _EXCLUDE]
     medians  = [_median([r["wall_time_s"] for r in results[c] if r.get("wall_time_s")]) for c in cfgs]
-    baseline = _median([r["wall_time_s"] for r in results.get("baseline", []) if r.get("wall_time_s")]) or 1.0
+    base_runs = results.get(BASELINE_KEY, []) if BASELINE_KEY else []
+    baseline  = _median([r["wall_time_s"] for r in base_runs if r.get("wall_time_s")])
+    have_base = baseline is not None and baseline > 0
 
     fig, ax = plt.subplots(figsize=(10, 5))
     x    = np.arange(len(cfgs))
@@ -177,26 +203,24 @@ def plot_wall_time(results: dict, out_dir: Path) -> None:
                    zorder=3, s=22, linewidths=0.8)
     for bar, m, cfg in zip(bars, medians, cfgs):
         if m is not None:
-            pct   = (m - baseline) / baseline * 100
-            label = f"{m:.0f}s" + (f"\n({pct:+.0f}%)" if cfg != "baseline" else "")
+            label = f"{m:.0f}s"
+            if have_base and cfg != BASELINE_KEY:
+                label += f"\n({(m - baseline) / baseline * 100:+.0f}%)"
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
                     label, ha="center", va="bottom", fontsize=9, fontweight="bold")
-    ax.axhline(baseline, color="gray", linestyle="--", linewidth=0.9, label="baseline median")
+    if have_base:
+        ax.axhline(baseline, color="gray", linestyle="--", linewidth=0.9,
+                   label=f"{_cname(BASELINE_KEY)} median")
+        ax.legend(fontsize=9)
     ax.set_xticks(x)
     ax.set_xticklabels([_cname(c) for c in cfgs], rotation=20, ha="right", fontsize=10)
     ax.set_ylabel("Wall time to target (s)")
+    base_note = f"; % vs {_cname(BASELINE_KEY)}" if have_base else ""
     ax.set_title("Campaign wall time by configuration\n"
-                 "(time to find 5 high-quality candidates; lower is better; % vs baseline)")
-    ax.legend(fontsize=9)
+                 f"(time to find 5 high-quality candidates; lower is better{base_note})")
     plt.tight_layout()
-    _caption(fig,
-        "LOWER IS BETTER.  Wall-clock time until the 5th high-quality candidate found.  "
-        "Bar = median; white dots = individual runs.  "
-        "sharding+bp: sharder routes highest-score candidates first — fewer total workflows.  "
-        "scheduling_bandit: Thompson-sampling bandit allocates resources to final-workflow calculations earlier.  "
-        "surrogate: bypasses expensive compute for high-confidence candidates.  "
-        "all_optimizations: all axes combined — lowest wall time and lowest variance."
-    )
+    if WALL_CAPTION:
+        _caption(fig, WALL_CAPTION)
     plt.savefig(out_dir / "1_wall_time.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  1_wall_time.png")
@@ -289,12 +313,17 @@ def plot_cascade_funnel(results: dict, out_dir: Path) -> None:
                                     color="white", fontweight="bold")
         bottom += np.array(heights)
 
-    # Annotate totals on top
+    # Annotate totals on top (ratio vs BASELINE_KEY when present)
+    base_total = sum(workflow_means[BASELINE_KEY]) if BASELINE_KEY in workflow_means else 0
     for i, cfg in enumerate(cfgs):
         total = sum(workflow_means[cfg])
-        base_total = sum(workflow_means.get("baseline", [1]))
-        ratio = base_total / total if total > 0 else 0
-        label = f"{total:.0f}" + (f"\n({ratio:.1f}× less)" if cfg != "baseline" else "")
+        label = f"{total:.0f}"
+        if base_total > 0 and cfg != BASELINE_KEY and total > 0:
+            # Word the ratio by direction: fewer instances = "less", more = "more".
+            if total <= base_total:
+                label += f"\n({base_total / total:.1f}× less)"
+            else:
+                label += f"\n({total / base_total:.1f}× more)"
         ax_stacked.text(i, bottom[i] + 30, label,
                         ha="center", va="bottom", fontsize=12, fontweight="bold")
 
@@ -310,13 +339,8 @@ def plot_cascade_funnel(results: dict, out_dir: Path) -> None:
     # plt.suptitle("Cascade workflows launched to find 5 high-quality candidates",
     #              fontsize=14, y=1.01)
     plt.tight_layout()
-    _caption(fig,
-        "LOWER IS BETTER.  Each bar is the total number of workflow instances launched to reach "
-        "the same goal — 5 high-quality candidates — stacked by workflow.  The campaign stops as soon as the "
-        "goal is met, so a smarter configuration gets there after starting far fewer instances "
-        "(especially in the costly Initial Screening layer).  Combining all optimizations launches "
-        "~17× less work than the baseline."
-    )
+    if FUNNEL_CAPTION:
+        _caption(fig, FUNNEL_CAPTION)
     plt.savefig(out_dir / "3_cascade_funnel.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  3_cascade_funnel.png")
@@ -646,7 +670,7 @@ def plot_time_to_target(
     ax.legend(fontsize=9)
     ax.grid(linestyle="--", alpha=0.3)
     plt.tight_layout()
-    _caption(fig,
+    _caption(fig, TTT_CAPTION if TTT_CAPTION else (
         f"LEFTMOST ▼ MARKER IS BEST.  All configurations stop at the same criterion: "
         f"as soon as {target_label} reaches {target_n} completed leads (a few in-flight "
         f"instances may finish just after).  Step curves show cumulative {target_label} completions "
@@ -656,7 +680,7 @@ def plot_time_to_target(
         f"let the most confident candidates skip expensive compute "
         f"(ADVANCE), so fewer instances run at full simulation cost — baseline and "
         f"scheduling run every candidate in full."
-    )
+    ))
     plt.savefig(out_dir / "7_time_to_target.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  7_time_to_target.png")

@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     import asyncio
     from .backpressure import BackpressureNegotiator
-    from .bandit import SchedulingBandit
     from .base_workflow import BaseWorkflow
     from .budget_controller import BudgetController
     from .candidate_log import CandidateLog
@@ -213,7 +212,6 @@ class CampaignState:
     bp: dict[str, "BackpressureNegotiator"]
     candidate_log: Optional["CandidateLog"]
     monitor: Optional["Monitor"]
-    scheduling_bandit: Optional["SchedulingBandit"]
     running_candidates: dict[str, str]
     replica_candidate_assignments: dict[str, str]
     replica_gpu_assignments: dict[str, list[int]]

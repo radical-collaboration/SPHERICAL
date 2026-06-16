@@ -72,6 +72,20 @@ sgdes = [
     "sentencepiece>=0.1.99",
 ]
 
+# ADR bridge — drive campaign scheduling from a radical.adr Policy.
+# radical.adr is not yet on PyPI; install editable:  pip install -e ../radical.adr
+# The LLM policy additionally needs the `llm` extra below.
+adr = [
+    "radical.adr",
+    "pydantic>=2",
+]
+
+# LLM-driven scheduling policy (LLMSchedulingPolicy)
+llm = [
+    "openai>=1.0.0",
+    "instructor>=1.0.0",
+]
+
 # Development dependencies
 dev = [
     "pytest>=7.0.0",
@@ -120,7 +134,12 @@ indent-style = "space"
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-asyncio_mode = "auto"
+# Two async styles coexist in the suite: most tests use anyio (the `anyio`
+# marker + anyio_backend fixture, handled by anyio's pytest plugin), while the
+# inference/server/utils tests use pytest-asyncio's `asyncio` marker.  Use
+# strict mode so pytest-asyncio only claims tests explicitly marked @asyncio,
+# leaving anyio-marked tests untouched (auto mode double-handles them).
+asyncio_mode = "strict"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",

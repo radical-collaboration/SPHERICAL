@@ -192,13 +192,16 @@ class CampaignMetrics:
         self,
         chosen_groups: list[str],
         eligible_groups: list[str],
-        bandit_scores: dict[str, float],
+        bandit_scores: Optional[dict[str, float]] = None,
         bandit_means: Optional[dict[str, float]] = None,
     ) -> None:
+        # bandit_* are legacy fields (the in-loop scheduling bandit was removed;
+        # adaptive priority is now driven by the ADR layer). Kept optional so
+        # older telemetry consumers still parse, defaulting to empty.
         self.scheduling_events.append(SchedulingEvent(
             chosen_groups=chosen_groups,
             eligible_groups=eligible_groups,
-            bandit_scores=bandit_scores,
+            bandit_scores=bandit_scores or {},
             bandit_means=bandit_means or {},
             timestamp=time.time(),
         ))

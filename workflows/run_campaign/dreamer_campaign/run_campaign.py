@@ -231,7 +231,80 @@ def _build_registry(config: dict) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main(config_file: str) -> None:
+def _build_adr_operator(cm, asyncflow, adr_cfg: dict, policy_override=None,
+                        config_dir=None):
+    """Build a CampaignOperator + policy for ADR supervision, or (None, None).
+
+    Policy source precedence: --policy CLI override > cm.adr.policy config.
+    kind ∈ {none, rule, bandit, llm}. 'none' = no ADR supervision (the scheduler
+    uses static group priorities; the in-loop bandit was removed).
+    """
+    kind = (policy_override or adr_cfg.get("policy", "none") or "none").lower()
+    if kind in ("none", "off", ""):
+        return None, None
+
+    from src.campaign.adr import (
+        CampaignView, CampaignOperator, PolicyRecorder, make_scheduling_policy,
+        resolve_system_prompt,
+    )
+
+    # The CM has no in-loop scheduling bandit; the scheduler orders eligible
+    # groups purely by group.priority, which the ADR policy drives via its
+    # set_priority lever.
+    view = CampaignView(cm)
+
+    # Optional per-cycle decision recorder (for plot_policy_comparison.py).
+    recorder = None
+    record_path = adr_cfg.get("record")
+    if record_path in (True, "auto"):
+        record_path = f"adr-decisions-{kind}.jsonl"
+    if record_path:
+        recorder = PolicyRecorder(record_path, policy_kind=kind)
+
+    op = CampaignOperator(view, engine=asyncflow, observer=recorder)
+
+    kw, api_key = {}, None
+    if kind == "bandit":
+        kw["warmstart"] = bool(adr_cfg.get("warmstart", False))
+        kw["seed"] = adr_cfg.get("seed", 0)
+    elif kind == "llm":
+        import os
+        api_key = os.environ.get(
+            adr_cfg.get("llm_api_key_env", "OPENROUTER_API_KEY"), "")
+        # Any OpenAI-compatible endpoint works (OpenRouter, HuggingFace router,
+        # a local Ollama/llama.cpp server). Set cm.adr.base_url to switch.
+        if adr_cfg.get("base_url"):
+            kw["base_url"] = adr_cfg["base_url"]
+        if adr_cfg.get("llm_timeout_s") is not None:
+            kw["timeout_s"] = float(adr_cfg["llm_timeout_s"])
+        if adr_cfg.get("llm_max_retries") is not None:
+            kw["instructor_retries"] = int(adr_cfg["llm_max_retries"])
+        # Local endpoints (Ollama/llama.cpp) need no real key; AsyncOpenAI still
+        # requires a non-empty string, so supply a placeholder for localhost.
+        # Remote endpoints keep the empty key so make_scheduling_policy raises a
+        # clear "kind='llm' requires llm_api_key" instead of failing every call.
+        bu = adr_cfg.get("base_url", "") or ""
+        if not api_key and ("localhost" in bu or "127.0.0.1" in bu):
+            api_key = "sk-noauth"
+        # User-tweakable system prompt (cm.adr.system_prompt or system_prompt_file);
+        # falls back to DEFAULT_SCHEDULING_PROMPT when unset.
+        prompt = resolve_system_prompt(adr_cfg, config_dir)
+        if prompt:
+            kw["system_prompt"] = prompt
+    op.policy = make_scheduling_policy(
+        op, kind=kind, llm_api_key=api_key,
+        model=adr_cfg.get("model", "openai/gpt-4o-mini"), **kw)
+    if recorder is not None:
+        recorder.bind(view=view, policy=op.policy)
+        print(f"ADR decision recorder → {record_path}")
+    # The LLM policy gets its own (slower) tick so free, rate-limited models
+    # don't get throttled; falls back to tick_s when llm_tick_s isn't set.
+    default_tick = float(adr_cfg.get("tick_s", 1.0))
+    tick = float(adr_cfg.get("llm_tick_s", default_tick)) if kind == "llm" else default_tick
+    return op, tick
+
+
+async def main(config_file: str, policy_override=None, record_override=None) -> None:
     config_path = Path(config_file)
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_file}")
@@ -282,17 +355,24 @@ async def main(config_file: str) -> None:
         asyncflow = await WorkflowEngine.create(backend)
         print("ConcurrentExecutionBackend started")
 
-    # ── Telemetry ─────────────────────────────────────────────────────────────
+    # ── Telemetry (optional) ────────────────────────────────────────────────────
+    # Asyncflow telemetry needs the opentelemetry SDK; it's an optional extra and
+    # the campaign (and ADR operator, which doesn't use it) runs fine without it.
+    # Degrade gracefully if the dep is missing rather than crashing the run.
     tel_cfg   = config.get("telemetry", {})
     telemetry = None
     if tel_cfg.get("collect_telemetry", False):
         telemetry_dir = tel_cfg.get("telemetry_dir", "telemetry-results")
         if hasattr(asyncflow, "start_telemetry"):
-            telemetry = await asyncflow.start_telemetry(
-                resource_poll_interval=0.5,
-                checkpoint_path=telemetry_dir,
-            )
-            print(f"Asyncflow telemetry started → {telemetry_dir}")
+            try:
+                telemetry = await asyncflow.start_telemetry(
+                    resource_poll_interval=0.5,
+                    checkpoint_path=telemetry_dir,
+                )
+                print(f"Asyncflow telemetry started → {telemetry_dir}")
+            except ImportError as exc:
+                print(f"Telemetry disabled (missing optional dep: {exc}). "
+                      f"Install with: pip install opentelemetry-sdk")
 
     # ── Campaign ──────────────────────────────────────────────────────────────
     registry = _build_registry(config)
@@ -314,9 +394,23 @@ async def main(config_file: str) -> None:
         )
     )
 
+    # ── ADR supervision (optional) ────────────────────────────────────────────
+    adr_cfg = dict(config.get("cm", {}).get("adr", {}))
+    if record_override is not None:
+        adr_cfg["record"] = record_override
+    operator, tick_s = _build_adr_operator(cm, asyncflow, adr_cfg, policy_override,
+                                           config_dir=config_dir)
+
     try:
         await cm.start()
-        await cm.wait()
+        if operator is not None:
+            from src.campaign.adr import run_supervised
+            kind = (policy_override or adr_cfg.get("policy", "?")).lower()
+            print(f"ADR supervision active: policy={kind}  tick={tick_s}s "
+                  f"(ADR policy drives scheduling priority)")
+            await run_supervised(cm, operator, tick_s=tick_s)
+        else:
+            await cm.wait()
     finally:
         await cm.close()
         if telemetry:
@@ -340,5 +434,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SPHERICAL dreamer campaign runner")
     parser.add_argument("--config", default="config.yaml",
                         help="Path to YAML config (flat or plan format)")
+    parser.add_argument("--policy", default=None,
+                        choices=["none", "rule", "bandit", "llm"],
+                        help="ADR scheduling policy (overrides cm.adr.policy). "
+                             "'none' = no ADR supervision (static priorities).")
+    parser.add_argument("--record", nargs="?", const="auto", default=None,
+                        help="Record per-cycle ADR decisions to JSONL "
+                             "(bare flag → adr-decisions-<policy>.jsonl).")
     args = parser.parse_args()
-    asyncio.run(main(args.config))
+    asyncio.run(main(args.config, policy_override=args.policy,
+                     record_override=args.record))

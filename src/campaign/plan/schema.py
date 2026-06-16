@@ -21,7 +21,7 @@ CampaignPlan
 │   └── (budget_node_hours, threshold_top_fraction, concurrency_floor/cap, ...)
 ├── edges:     list[EdgeSpec]          # profile + backpressure per edge
 ├── replan:    ReplanThresholds        # Monitor escalation thresholds
-└── features:  dict[str, bool]         # sharder/backpressure/bandit/monitor toggles
+└── features:  dict[str, bool]         # sharder/backpressure/monitor toggles
 """
 
 from __future__ import annotations

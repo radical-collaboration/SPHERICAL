@@ -12,7 +12,7 @@ Notes
   discovery therefore do not happen via this wrapper; pass total_cpus /
   total_gpus explicitly.
 - ``from_config`` delegates to AsyncCampaignManager.from_config so all
-  feature flags (backpressure, sharder, monitor, bandit) are wired through.
+  feature flags (backpressure, sharder, monitor) are wired through.
 """
 
 import asyncio
@@ -114,7 +114,7 @@ class CampaignManager:
         """Build a sync CampaignManager from a config dict.
 
         Delegates to AsyncCampaignManager.from_config so every feature
-        (backpressure, sharder, monitor, scheduling bandit, candidate log)
+        (backpressure, sharder, monitor, candidate log)
         is wired up identically to the async path.  Without this delegation,
         the sync wrapper silently dropped all features keyed under
         ``features:`` in the config.
