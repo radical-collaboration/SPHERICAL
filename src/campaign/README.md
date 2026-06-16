@@ -3,8 +3,16 @@
 RADICAL asyncflow-native orchestrator for multi-workflow HPC campaigns.  Runs
 concurrent replicas of heterogeneous workflows inside a single `asyncio` event
 loop backed by `radical.asyncflow`, with priority-based scheduling,
-sliding-window concurrency caps, resource-pool gating, and adaptive cascading
+sliding-window concurrency caps, resource-pool gating, and data-driven
 dependency signalling.
+
+The CM is **topology-agnostic**: workflow groups form an arbitrary directed
+acyclic graph (DAG) wired entirely through config. It supports linear chains,
+fan-out (one group feeding many), fan-in / joins (one group waiting on several
+upstreams), and diamonds — not just linear cascades. A *cascade* (the
+SPHERICAL "dreamer" antigen-discovery pipeline `s1→s2→s3→s4→s5`) is simply one
+common DAG shape; nothing in the scheduler or dependency model assumes
+linearity.
 
 ---
 
@@ -38,6 +46,13 @@ src/campaign/
 ├── plan/                 # Structured campaign-plan schema + loader
 │   ├── schema.py         #   CampaignPlan, StageSpec, EdgeSpec, SurrogateSpec, ...
 │   └── loader.py         #   load_plan() — structured + legacy config support
+│
+├── adr/                  # ADR agent layer (enabled via cm.adr) — drives scheduling priority
+│   ├── view.py           #   CampaignView — observation + levers (only CM-coupled code)
+│   ├── operator.py       #   CampaignOperator + run_supervised()
+│   ├── policies.py       #   DownstreamFirst / Bandit / LLM scheduling policies
+│   ├── telemetry.py      #   TelemetrySubscriber — folds asyncflow telemetry into observations
+│   └── recorder.py       #   PolicyRecorder — per-cycle decision JSONL
 └── __init__.py           # re-exports the public API
 ```
 
@@ -130,7 +145,28 @@ replica finishes.
 
 ---
 
-## Adaptive cascading dependency model
+## Dependency model — arbitrary DAGs
+
+Groups and their `dependencies` edges form a directed acyclic graph. The
+scheduler treats every group independently, so any DAG shape works:
+
+| Topology | How to express it | Behaviour |
+|----------|-------------------|-----------|
+| **Chain** (`a→b→c`) | each group lists its single upstream in `dependencies` | classic cascade |
+| **Fan-out** (`a→{b,c,d}`) | `b`, `c`, `d` each list `a` | `a`'s `_signal_done()` routes +1 replica to **all** of them |
+| **Fan-in / join** (`{a,b}→c`) | `c: dependencies: [a, b]` | `c` becomes eligible only when **all** upstreams are ready (AND semantics) |
+| **Diamond** (`a→{b,c}→d`) | `d: dependencies: [b, c]` | combines fan-out + join; each edge gated independently |
+
+The join (AND) semantics live in `_deps_satisfied_locked` (scheduler.py): a
+group is eligible only when *every* entry in its `dependencies` is ready, so a
+join stage never starts on a partial set of inputs. Dependency-chain *depth*
+(used for depth-ordered scheduling priors) is computed as `1 + max(depth of
+deps)`, which is correct for diamonds and joins, not just chains.
+
+> The optional ADR goal metric (`CampaignView`) infers a single "terminal"
+> stage as the deepest leaf for its hit-count goal. For a DAG with **multiple**
+> terminal outputs, pass `CampaignView(cm, terminal="...")` explicitly to pick
+> which leaf the goal tracks (or leave the goal off — it only drives early-stop).
 
 ### Two group modes
 
@@ -337,6 +373,39 @@ resources:
 # ── Execution backend ────────────────────────────────────────────────────────
 engine: dragon    # "dragon" or "concurrent" (falls back to concurrent if Dragon unavailable)
 
+# ── Telemetry (optional; needs the opentelemetry SDK) ─────────────────────────
+telemetry:
+  collect_telemetry: true
+  telemetry_dir: "telemetry-results"
+  resource_poll_interval: 0.5   # seconds between ResourceUpdate events (HPC)
+
+# ── Campaign Manager runtime + ADR agent layer ───────────────────────────────
+cm:
+  # Optional feature flags (each wires an adaptive component into the scheduler):
+  features:
+    backpressure: false   # per-edge hysteresis queue-depth controller
+    sharder:      false   # buffered, priority-ranked batch dispatch
+    monitor:      false   # periodic health checks + drift alerts
+  monitor_interval_s: 30
+
+  # ADR agent layer — drives cross-stage scheduling priority each tick.
+  # Omit (or policy: none) to use static group.priority only.
+  adr:
+    policy: rule        # none | rule | bandit | llm   (override with --policy)
+    tick_s: 2.0         # operator decision cadence (seconds)
+    # LLM policy (policy: llm): any OpenAI-compatible endpoint via instructor
+    model:            openai/gpt-4o-mini
+    base_url:         https://openrouter.ai/api/v1
+    llm_api_key_env:  OPENROUTER_API_KEY
+    # system_prompt_file: prompts/scheduling_system_prompt.txt   # user-tweakable
+
+# ── Workflow registry — maps group names to "module.ClassName" ────────────────
+workflow_registry:
+  md:        my_workflows.MDWorkflow
+  miniapps:  my_workflows.MiniAppsWorkflow
+  inference: my_workflows.InferenceWorkflow
+  dummy:     my_workflows.DummyWorkflow
+
 # ── Workflow groups ──────────────────────────────────────────────────────────
 #
 # Two modes — controlled by whether 'replicas' is present:
@@ -389,14 +458,35 @@ workflows:
     required_cpus: 4
     required_gpus: 0
     dependencies:  [inference] # dependent: inference triggers via _trigger_dependent
+
+  aggregate:                   # fan-in / JOIN: waits for BOTH branches
+    priority:      4
+    concurrency_cap:  1
+    required_cpus: 2
+    dependencies:  [miniapps, dummy]   # eligible only once miniapps AND dummy are ready
 ```
 
-Config keys consumed by the CM and stripped before forwarding to `workflow.config`:
+The example above is itself a small DAG, not a single chain: two independent
+branches (`md→miniapps` and `inference→dummy`) that a final `aggregate` group
+**joins**. Swap the edges in `dependencies` to express any other DAG shape — no
+workflow code changes.
+
+Per-group keys consumed by the CM and stripped before forwarding the rest to
+`workflow.config`:
 
 ```
 replicas  dependencies  dependency_threshold  priority
 concurrency_floor  concurrency_cap  required_cpus  required_gpus
 ```
+
+Any other per-group keys (plus the injected `assigned_gpu_ids` / `group_gpu_ids`)
+are passed through untouched as `self.config`. A group may also use
+`config_file: "${VAR}/path.yaml"` to merge an external per-workflow YAML
+(`${VAR}` expanded at load time); scheduling keys in the main config win.
+
+> This is the **flat** config shape. The CM also accepts a typed **structured
+> plan** (`stages:` + `edges:`) resolved by `load_plan()` — see the *Structured
+> plan schema* section below. Both produce the same registration form.
 
 ---
 
@@ -453,14 +543,13 @@ plain blocking calls.  Same `from_config` / `register_workflow` / `start` /
 
 ### Optional feature components
 
-These are enabled per-campaign via `cm.features` flags (see CLAUDE.md and the
+Enabled per-campaign via `cm.features` flags (see CLAUDE.md and the
 Configuration section) and wired into the scheduler/executor by the CM.
 
 | Component | File | Role |
 |-----------|------|------|
 | `Sharder` / `ShardingSpec` | `sharder.py` | Buffer upstream triggers and batch-dispatch downstream, ranked by priority score (stratify `off`/`soft`/`strict`). |
 | `BackpressureNegotiator` | `backpressure.py` | Per-edge hysteresis state machine (HOLD → THROTTLE → WIDEN) that throttles dispatch when a downstream queue floods. |
-| `SchedulingBandit` | `bandit.py` | Thompson-sampling (one Beta arm per stage). **Not wired into the CM scheduler** — consumed by the ADR `BanditSchedulingPolicy` (`adr/policies.py`); the scheduler orders eligible groups by `group.priority`. |
 | `Surrogate` | `surrogate.py` | Cheap predictor of a candidate's downstream score (`Null`/`Random`/`Correlated`), plus `RecallTracker`. Used by Triage. |
 | `Triage` | `triage.py` | Per-candidate gate: `RUN`, `DISCARD` (low score), or `ADVANCE` (skip compute on confident leads), using the surrogate prediction. |
 | `BudgetController` | `budget_controller.py` | Proportional feedback loop on `burn_ratio` vs the plan budget; nudges Triage score cutoffs within plan-set bounds to keep spend on plan. |
@@ -469,6 +558,32 @@ Configuration section) and wired into the scheduler/executor by the CM.
 | `CandidateLog` / `CandidateHistory` | `candidate_log.py` | Tracks upstream results so the Sharder can rank candidates. |
 | `ProfileWeights` | `profiles.py` | Named ranking profiles (score, uncertainty, age, diversity weights). |
 | `CampaignMetrics` | `metrics.py` | In-process event recording (timing, BP transitions, scheduling/budget events). |
+
+### ADR agent layer (`adr/`)
+
+The **ADR (Autonomous Decision Runtime) bridge** is the adaptive scheduling
+layer, enabled via `cm.adr` (not `cm.features`). A `radical.adr` `Operator`
+runs an Observe → Decide → Act loop *alongside* the live CM and nudges its
+levers — chiefly cross-stage **`group.priority`** (which the two-pass scheduler
+orders by) and, optionally, sharder batch sizes. The CM keeps owning
+scheduling, execution, and resources; the ADR layer only observes and advises
+(the "sacred boundary"). Select the decision policy with `cm.adr.policy` (or
+`--policy {none|rule|bandit|llm}`).
+
+| Component | File | Role |
+|-----------|------|------|
+| `CampaignView` | `adr/view.py` | The only CM-coupled code: turns `cm.state` into an observation dict (per-stage `running`/`pending`/`starved`/`bp_state`, …) and exposes `set_priority` / `set_batch_size` / `trigger` levers. |
+| `CampaignOperator` | `adr/operator.py` | The `radical.adr` Operator (`@observe`/`@act`/`@goals`); `run_supervised(cm, op)` drives it alongside `cm.wait()`. |
+| `DownstreamFirstPolicy` (`rule`) | `adr/policies.py` | Deterministic depth-ordered priorities each cycle — the strong default baseline. |
+| `BanditSchedulingPolicy` (`bandit`) | `adr/policies.py` | Wraps the Thompson-sampling `SchedulingBandit` (`bandit.py`) as an ADR policy; learns stage value from a backpressure-derived reward. |
+| `LLMSchedulingPolicy` (`llm`) | `adr/policies.py` | LLM-driven (OpenAI-compatible via `instructor`); reasons over the full observation. Composed as `Policy(primary=LLM, fallback=rule)`. Prompt is config-tweakable (`cm.adr.system_prompt[_file]`). |
+| `TelemetrySubscriber` | `adr/telemetry.py` | Folds live asyncflow telemetry (GPU/CPU/mem util, task latency, fail rate) into the observation on real HPC runs; no-op when telemetry is off. |
+| `PolicyRecorder` | `adr/recorder.py` | ADR observer that logs each decision cycle to JSONL for `plot_policy_comparison.py`. |
+
+> `SchedulingBandit` (`bandit.py`) is **not** wired into the CM scheduler — the
+> scheduler orders eligible groups purely by `group.priority`. The bandit is
+> consumed only by the ADR `BanditSchedulingPolicy` above. Install the layer
+> with `pip install -e ".[adr]"` (the `llm` policy also needs `".[llm]"`).
 
 ### Structured plan schema (`plan/`)
 

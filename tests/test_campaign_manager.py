@@ -286,6 +286,49 @@ class TestAsyncCampaignManager:
         assert s["groups"]["a"]["ready"] is True
         assert s["groups"]["b"]["status"] == "done"
 
+    async def test_dag_join_waits_for_all_upstreams(self, acm):
+        """Fan-in / join: a group depending on [a, b] must wait for BOTH (AND semantics).
+
+        Confirms the CM is a general DAG orchestrator, not just a linear cascade —
+        the join stage runs only after every upstream is satisfied.
+        """
+        order = []
+
+        class Rec(BaseWorkflow):
+            workflow_id = "rec"
+
+            async def run(self, replica_id: str) -> None:
+                order.append(replica_id.split("_")[0])
+
+        acm.register_workflow("a", Rec, replicas=1)
+        acm.register_workflow("b", Rec, replicas=1)
+        acm.register_workflow("join", Rec, replicas=1,
+                              dependencies=["a", "b"], dep_threshold=1)
+        await acm.start()
+        assert await acm.wait(timeout=3.0)
+
+        # join must appear only after BOTH a and b have run.
+        join_idx = order.index("join")
+        assert "a" in order[:join_idx] and "b" in order[:join_idx]
+        assert acm.status()["groups"]["join"]["status"] == "done"
+
+    async def test_dag_fanout_signal_done_activates_all_dependents(self, acm):
+        """Fan-out: one upstream _signal_done() routes +1 replica to every dependent."""
+        acm.register_workflow("root", SignalDoneWorkflow, replicas=1)
+        acm.register_workflow("left",  NullWorkflow, replicas=0,
+                              dependencies=["root"], dep_threshold=999)
+        acm.register_workflow("right", NullWorkflow, replicas=0,
+                              dependencies=["root"], dep_threshold=999)
+        await acm.start()
+        assert await acm.wait(timeout=3.0)
+
+        s = acm.status()
+        # both branches were activated and completed off the single signal.
+        assert s["groups"]["left"]["status"] == "done"
+        assert s["groups"]["right"]["status"] == "done"
+        assert s["groups"]["left"]["replicas_finished"] == 1
+        assert s["groups"]["right"]["replicas_finished"] == 1
+
     async def test_trigger_dependent_activates_group(self, acm):
         """Parent workflow calls _trigger_dependent to start a replicas=0 group."""
         acm.register_workflow("upstream", TriggerWorkflow, replicas=1)

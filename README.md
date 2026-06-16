@@ -24,9 +24,10 @@ spherical/
 ├── src/
 │   ├── campaign/                    # AsyncCampaignManager + BaseWorkflow + ResourcePool
 │   │   ├── campaign_manager.py      # core: scheduler/executor/monitor mixins
-│   │   ├── sharder.py · backpressure.py · bandit.py     # quality routing, flow control, learning
+│   │   ├── sharder.py · backpressure.py · bandit.py     # quality routing, flow control, Thompson bandit
 │   │   ├── triage.py · surrogate.py · budget_controller.py  # surrogate-gated selective execution
 │   │   ├── replanning.py · monitor.py · candidate_log.py    # drift handling + tracking
+│   │   ├── adr/                     # ADR agent bridge: CampaignView + Operator + rule/bandit/llm policies
 │   │   └── plan/                    # CampaignPlan/StageSpec schema + load_plan()
 │   ├── inference/                   # InferenceService base, orchestrator, server
 │   │   ├── esm2_service/            # ESM2InferenceService + ESM2Client
@@ -42,12 +43,15 @@ spherical/
 │   ├── esm2_inference/              # Standalone ESM2 inference runner
 │   │   ├── run_esm2_infern.py
 │   │   └── config.yaml
-│   ├── run_campaign/                # Multi-workflow campaign (DDSim + Inference)
-│   │   ├── run_campaing.py
-│   │   ├── inference_workflow.py
-│   │   ├── ddmd_workflow.py
+│   ├── run_campaign/                # Multi-workflow campaigns
 │   │   ├── plot_cm_timeline.py         # Gantt timeline + resource chart from SLURM log
-│   │   └── config.yaml
+│   │   ├── esm2_ddsim_campaign/        # real HPC campaign: ESM2 inference + DeepDriveSim (Dragon/GPU)
+│   │   │   ├── run_campaing.py · config.yaml · gpu_sbatch.sh
+│   │   │   └── inference_workflow.py · ddmd_workflow.py · miniapps_workflow.py · dummy_workflow.py
+│   │   └── dreamer_campaign/           # in-process emulation (radical.dreamer) for benchmarking
+│   │       ├── run_campaign.py · config*.yaml
+│   │       ├── benchmark.py · benchmark_adr.py    # feature-flag + ADR-policy benchmarks
+│   │       └── plot_optimizations.py · plot_policy_comparison.py · plot_deadline_yield.py
 │   └── sgdes/                       # SGDES protein engineering
 │       ├── run_workflow.py
 │       ├── sgdes_workflow.py
@@ -113,8 +117,17 @@ service_python: "${VE_HOME}/esm2/bin/python"   # resolved at load time
 
 ### Multi-workflow Campaign
 
+Two campaigns ship under `workflows/run_campaign/`:
+
 ```bash
-python workflows/run_campaign/run_campaing.py --config workflows/run_campaign/config.yaml
+# Real HPC campaign (ESM2 inference + DeepDriveSim) — Dragon backend, real GPUs:
+cd workflows/run_campaign/esm2_ddsim_campaign
+dragon run_campaing.py --config config.yaml
+# local smoke test (no Dragon): python run_campaing.py --config config.yaml --engine concurrent
+
+# Emulated campaign (radical.dreamer, in-process) — for benchmarking scheduling policies:
+cd workflows/run_campaign/dreamer_campaign
+python run_campaign.py --config config.yaml --policy rule    # none | rule | bandit | llm
 ```
 
 Config structure:
@@ -123,6 +136,12 @@ Config structure:
 resources:
   total_cpus: 128
   total_gpus: 4
+
+# Optional ADR agent layer — drives cross-stage scheduling priority each tick.
+cm:
+  adr:
+    policy: rule        # none | rule | bandit | llm  (override with --policy)
+    tick_s: 2.0
 
 workflows:
   ddsim:
@@ -167,11 +186,11 @@ class MyWorkflow(BaseWorkflow):
 
     async def run(self, replica_id: str) -> None:
         await do_work(self.asyncflow, self.config)
-        await self._signal_ready()          # unblock dependent groups immediately
+        await self._signal_done()            # unblock all groups listing this one in `dependencies`
 
     async def on_replica_done(self, replica_id, cm, final_state):
         if final_state == "done":
-            await cm.add_replicas("downstream", n=1)
+            await self._trigger_dependent("downstream", replicas=1)   # explicit, count-controlled
 ```
 
 ### Runner pattern
@@ -262,7 +281,7 @@ panel (GPU/CPU in use over time) and a campaign config summary table.
 
 ```bash
 python workflows/run_campaign/plot_cm_timeline.py slurm-<jobid>.out \
-    [--config workflows/run_campaign/config.yaml] \
+    [--config workflows/run_campaign/esm2_ddsim_campaign/config.yaml] \
     [--out timeline.png]
 ```
 
@@ -340,8 +359,8 @@ python workflows/run_campaign/dreamer_campaign/plot_budget_control.py \
 The dreamer runner can drive scheduling from a swappable `radical.adr` policy
 (`--policy {none|rule|bandit|llm}`) and record each decision cycle to JSONL with
 `--record`. `plot_policy_comparison.py` then plots the policies side by side —
-assigned priority per workflow over cycles, plus the bandit's posterior learning
-curve.
+assigned priority per workflow over cycles — so the rule/llm stable downstream-first
+ladder contrasts visually with the bandit's still-exploring (reshuffling) priorities.
 
 ```bash
 cd workflows/run_campaign/dreamer_campaign
@@ -373,6 +392,14 @@ python workflows/run_campaign/dreamer_campaign/benchmark_adr.py \
 Cross-stage scheduling priority is owned entirely by the ADR policy (the CM has
 no in-loop scheduling bandit); `--policy bandit` runs the same Thompson-sampling
 bandit wrapped as an ADR agent.
+
+`benchmark_adr.py` also supports a **deadline-yield** objective (`--mode
+deadline-yield --deadline 60`): instead of time-to-N-leads, it measures how many
+terminal leads each policy produces within a fixed wall-clock window (higher is
+better — the realistic HPC framing). `plot_deadline_yield.py` renders the
+leads-per-policy figure with per-run spread. For the full analysis of when each
+policy wins and why downstream-first is hard to beat, see
+[docs/scheduling_policy_comparison.md](docs/scheduling_policy_comparison.md).
 
 ---
 
