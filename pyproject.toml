@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spherical"
 version = "0.1.0"
-description = "Multi-GPU Inference Service Framework with Worker Pool Management"
+description = "Multi-GPU Inference Service Framework — ESM2 inference service and SGDES workflow"
 
 authors = [
     {name = "Masha", email = "mg2347@soe.rutgers.edu"},
@@ -29,23 +29,23 @@ Homepage = "https://github.com/masha/spherical"
 Issues = "https://github.com/masha/spherical/issues"
 
 [project.optional-dependencies]
-# ESM2 model support
+# ESM2 model support (torch + transformers)
 esm2 = [
     "torch>=2.0.0,<2.4.0",
     "transformers>=4.30.0",
     "numpy>=1.24.0,<2.0.0",
 ]
 
-# Dragon/RADICAL support
+# Dragon/RADICAL HPC backend
 dragon = [
     "dragonhpc>=0.13.2",
     "rhapsody-py>=0.2.0",
     "nvidia-ml-py"
 ]
 
-# SGDES workflow (examples/sgdes) — PyPI-available deps only.
+# SGDES workflow — PyPI-available deps only.
 # PyTorch+CUDA and foldseek/seqkit binaries must be installed separately;
-# see examples/sgdes/requirements.txt and delta_env_setup.sh / bridges2_env_setup.sh.
+# see workflows/sgdes/requirements.txt and delta_env_setup.sh / bridges2_env_setup.sh.
 sgdes = [
     "biopython>=1.81",
     "scikit-learn>=1.4.0",
@@ -72,20 +72,6 @@ sgdes = [
     "sentencepiece>=0.1.99",
 ]
 
-# ADR bridge — drive campaign scheduling from a radical.adr Policy.
-# radical.adr is not yet on PyPI; install editable:  pip install -e ../radical.adr
-# The LLM policy additionally needs the `llm` extra below.
-adr = [
-    "radical.adr",
-    "pydantic>=2",
-]
-
-# LLM-driven scheduling policy (LLMSchedulingPolicy)
-llm = [
-    "openai>=1.0.0",
-    "instructor>=1.0.0",
-]
-
 # Development dependencies
 dev = [
     "pytest>=7.0.0",
@@ -103,15 +89,9 @@ doc = [
     "mkdocstrings[python]>=0.24.0",
 ]
 
-# Plotting/metrics visualization
-plotting = [
-    "matplotlib>=3.7.0",
-    "numpy>=1.24.0,<2.0.0",
-]
-
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*", "examples*"]
+include = ["src*"]
 
 [tool.pyright]
 pythonVersion = "3.10"
@@ -134,11 +114,6 @@ indent-style = "space"
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-# Two async styles coexist in the suite: most tests use anyio (the `anyio`
-# marker + anyio_backend fixture, handled by anyio's pytest plugin), while the
-# inference/server/utils tests use pytest-asyncio's `asyncio` marker.  Use
-# strict mode so pytest-asyncio only claims tests explicitly marked @asyncio,
-# leaving anyio-marked tests untouched (auto mode double-handles them).
 asyncio_mode = "strict"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -148,7 +123,7 @@ markers = [
 
 [tool.coverage.run]
 source = ["src"]
-omit = ["tests/*", "example/*"]
+omit = ["tests/*"]
 
 [tool.coverage.report]
 exclude_lines = [
