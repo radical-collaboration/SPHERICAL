@@ -368,7 +368,7 @@ class SGDESWorkflow:
             import subprocess as _sp
 
             pattern_file = kwargs["pattern_file"]
-            input_fasta  = kwargs["input_fasta"]
+            input_fasta = kwargs["input_fasta"]
             output_fasta = kwargs["output_fasta"]
             cmd = f"seqkit grep --pattern-file {pattern_file} {input_fasta}"
             print(f"[seqkit_grep] cmd: {cmd}", flush=True)
@@ -405,9 +405,7 @@ class SGDESWorkflow:
                 raise RuntimeError(
                     f"seqkit stats failed (rc={result.returncode}): {result.stderr[-500:]}"
                 )
-            with _tf.NamedTemporaryFile(
-                mode="w", suffix=".stats.tsv", delete=False
-            ) as _tmp:
+            with _tf.NamedTemporaryFile(mode="w", suffix=".stats.tsv", delete=False) as _tmp:
                 _tmp.write(result.stdout)
                 return _tmp.name
 
