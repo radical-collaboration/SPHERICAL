@@ -55,6 +55,11 @@ outputs/
 # Large generated files — not tracked in git
 *.bak
 *.pptx
-workflows/run_campaign/dreamer_campaign/*.json
-workflows/run_campaign/dreamer_campaign/log
-workflows/run_campaign/dreamer_campaign/plots/
+
+# Runtime output directories (campaign artifacts)
+workflows/esm2_inference/ESM2
+workflows/esm2_inference/cache/
+workflows/*/telemetry*/
+workflows/*/*.npy
+workflows/*/ddict_*
+workflows/sgdes/mayv_output/

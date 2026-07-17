@@ -22,7 +22,7 @@ fi
 
 # ── Parse optional overrides ──────────────────────────────────────────────────
 ENV_DIR="${ENV_DIR:-/u/${USER}/ve/sgdes}"
-SGDES_DIR="${SGDES_DIR:-/scratch/bblj/${USER}/SGDES}"
+SGDES_DIR="${SGDES_DIR:-/scratch/bblj/${USER}/sgdes}"
 SPHERICAL_DIR="${SPHERICAL_DIR:-/scratch/bblj/${USER}/SPHERICAL}"
 
 while [[ $# -gt 0 ]]; do
