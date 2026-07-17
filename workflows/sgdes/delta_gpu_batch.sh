@@ -1,13 +1,16 @@
 #!/bin/sh -l
+#
+# SGDES Campaign — SLURM GPU batch script (Dragon backend)
+#
+# Account: set SBATCH_ACCOUNT=<project>-delta-gpu before calling sbatch
 
-#SBATCH -A ***-delta-gpu 
 #SBATCH --partition=gpuA40x4
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --gpus-per-node=4
 #xSBATCH --exclusive
-#SBATCH --time=01:30:00
+#SBATCH --time=00:30:00
 #SBATCH --job-name=sgdes
 #SBATCH --mail-user=mariya.goliyad@rutgers.edu
 #SBATCH --mail-type=ALL
@@ -18,10 +21,23 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 export TF_FORCE_GPU_ALLOW_GROWTH=true
 export JAX_PLATFORMS=cpu
 
-export SGDES_DIR=/scratch/***/${USER}/SGDES
-export SPHERICAL_DIR=/scratch/***/${USER}/SPHERICAL
+# ── Environment ───────────────────────────────────────────────────────────────
+if [ -z "${SBATCH_ACCOUNT:-}${SLURM_JOB_ACCOUNT:-}" ]; then
+    echo "WARNING: SBATCH_ACCOUNT is not set — job may be charged to default account."
+    echo "         Set it with: export SBATCH_ACCOUNT=<project>-delta-gpu"
+fi
+echo "Account: ${SLURM_JOB_ACCOUNT:-unknown}"
 
-cd $SPHERICAL_DIR/examples/sgdes
+if [ -z "${SCRATCH:-}" ]; then
+    echo "ERROR: SCRATCH is not set."
+    echo "       export SCRATCH=/scratch/<allocation> && sbatch delta_gpu_batch.sh"
+    exit 1
+fi
+
+export SGDES_DIR="${SGDES_DIR:-${SCRATCH}/${USER}/sgdes}"
+export SPHERICAL_DIR="${SPHERICAL_DIR:-${SCRATCH}/${USER}/SPHERICAL}"
+
+cd $SPHERICAL_DIR/workflows/sgdes
 # ── Clean previous run artifacts ──────────────────────────────────────────────
 rm -rf mayv_output tmp*
 

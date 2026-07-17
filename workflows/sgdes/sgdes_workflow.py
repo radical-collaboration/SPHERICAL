@@ -6,15 +6,17 @@ subprocess.run calls, enabling concurrent execution of multiple mutations.
 
 Task types
 ----------
-executable_task — trill embed/fold, foldseek createdb, seqkit grep/stats;
-                  Dragon launches each as a subprocess with GPU affinity and
-                  HOST_NAME placement via task_description.
-function_task   — foldseek_search only; runs via subprocess.run to avoid the
-                  ggml-CUDA context conflict that occurs when foldseek easy-search
-                  runs as a direct Dragon executable_task subprocess.
-_run_des        — plain async method on SGDESWorkflow; orchestrates the DES
-                  loop (solver.propose → foldseek scoring → population.add_samples)
-                  using the registered tasks.
+function_task — all shell commands (trill embed/fold, foldseek createdb/search,
+                seqkit grep/stats) run via subprocess.run() inside a Dragon
+                function_task.  This avoids the Dragon executable_task
+                completion-delivery deadlock: the subprocess runs successfully
+                but asyncflow's TaskCompleted event never fires, permanently
+                blocking the await.  The same GPU/CUDA context conflict that
+                was documented for foldseek_search also applies to trill and
+                foldseek createdb.
+_run_des      — plain async method on SGDESWorkflow; orchestrates the DES
+                loop (solver.propose → foldseek scoring → population.add_samples)
+                using the registered tasks.
 
 All environment variables (CUDA_HOME, SGDES_DIR, SPHERICAL_DIR, JAX_PLATFORMS,
 TF_FORCE_GPU_ALLOW_GROWTH) are set in the sbatch script.
@@ -34,9 +36,10 @@ import warnings
 from datetime import datetime
 
 # amortized_bo imports JAX at module level, making this process multithreaded.
-# Dragon then uses os.fork() to spawn executable_task subprocesses (trill embed),
-# which triggers Python's fork-after-threads warning.  The warning is harmless —
-# trill runs in its own fresh subprocess and completes normally.
+# Dragon's function_task workers inherit this state and may trigger the
+# fork-after-threads warning when Dragon internally forks to run a worker.
+# The warning is suppressed because it is harmless: subprocess.run() inside
+# each function_task creates its own clean subprocess via the shell.
 warnings.filterwarnings(
     "ignore",
     message="os.fork\\(\\) was called.*JAX is multithreaded",
@@ -226,29 +229,47 @@ class SGDESWorkflow:
             _TD_HOST = {}  # noqa: N806
 
         # ── trill embed ────────────────────────────────────────────────────────
-        @flow.executable_task
+        # NOTE: function_task (not executable_task) to avoid the Dragon executable_task
+        # completion-delivery deadlock: the subprocess runs successfully but
+        # asyncflow's TaskCompleted event never fires, blocking the await forever.
+        # The same issue affects all GPU/CUDA tasks; subprocess.run() sidesteps it.
+        @flow.function_task
         async def embed(task_description=_TD_GPU, **kwargs):
-            """Run trill embed esm2_t33_650M as an executable_task.
+            """Run trill embed esm2_t33_650M via subprocess.run (function_task).
             kwargs: name, GPUs, seed, outdir, query
             """
+            import subprocess as _sp
+
             name = kwargs["name"]
             gpus = kwargs["GPUs"]
             seed = kwargs["seed"]
             outdir = kwargs["outdir"]
             query = kwargs["query"]
             cmd = (
+                f"env -u SLURM_NTASKS -u SLURM_PROCID -u SLURM_NODEID -u SLURM_LOCALID "
                 f"trill {name} {gpus} --RNG_seed {seed} --outdir {outdir} "
                 f"embed esm2_t33_650M {query} --avg"
             )
             print(f"[embed] cmd: {cmd}", flush=True)
-            return cmd
+            result = _sp.run(cmd, shell=True, capture_output=True, text=True)
+            if result.stdout:
+                print(result.stdout, flush=True)
+            if result.stderr:
+                print(result.stderr, flush=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"trill embed failed (rc={result.returncode}): {result.stderr[-500:]}"
+                )
 
         # ── trill fold (ESMFold, slow path only) ───────────────────────────────
-        @flow.executable_task
+        # NOTE: function_task for the same reason as embed above.
+        @flow.function_task
         async def fold(task_description=_TD_GPU, **kwargs):
-            """Run trill fold ESMFold as an executable_task.
+            """Run trill fold ESMFold via subprocess.run (function_task).
             kwargs: name, GPUs, seed, outdir, query, batch_size
             """
+            import subprocess as _sp
+
             name = kwargs["name"]
             gpus = kwargs["GPUs"]
             seed = kwargs["seed"]
@@ -256,18 +277,30 @@ class SGDESWorkflow:
             query = kwargs["query"]
             batch_size = kwargs["batch_size"]
             cmd = (
+                f"env -u SLURM_NTASKS -u SLURM_PROCID -u SLURM_NODEID -u SLURM_LOCALID "
                 f"trill {name} {gpus} --RNG_seed {seed} --outdir {outdir} "
                 f"fold ESMFold {query} --batch_size {batch_size}"
             )
             print(f"[fold] cmd: {cmd}", flush=True)
-            return cmd
+            result = _sp.run(cmd, shell=True, capture_output=True, text=True)
+            if result.stdout:
+                print(result.stdout, flush=True)
+            if result.stderr:
+                print(result.stderr, flush=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"trill fold failed (rc={result.returncode}): {result.stderr[-500:]}"
+                )
 
         # ── foldseek createdb ─────────────────────────────────────────────────
-        @flow.executable_task
+        # NOTE: function_task for the same reason as embed above (GPU/ProstT5 path).
+        @flow.function_task
         async def foldseek_createdb(task_description=_TD_GPU, **kwargs):
-            """Run foldseek createdb as an executable_task.
+            """Run foldseek createdb via subprocess.run (function_task).
             kwargs: fasta, db_path, prostt5_model (optional)
             """
+            import subprocess as _sp
+
             fasta = kwargs["fasta"]
             db_path = kwargs["db_path"]
             prostt5_model = kwargs.get("prostt5_model", "")
@@ -275,7 +308,15 @@ class SGDESWorkflow:
             gpu_flag = " --gpu 1" if prostt5_model else ""
             cmd = f"foldseek createdb {fasta} {db_path} {model_flag}{gpu_flag}".strip()
             print(f"[foldseek_createdb] cmd: {cmd}", flush=True)
-            return cmd
+            result = _sp.run(cmd, shell=True, capture_output=True, text=True)
+            if result.stdout:
+                print(result.stdout, flush=True)
+            if result.stderr:
+                print(result.stderr, flush=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"foldseek createdb failed (rc={result.returncode}): {result.stderr[-500:]}"
+                )
 
         # ── foldseek easy-search ──────────────────────────────────────────────
         # NOTE: function_task (not executable_task) to avoid the ggml-CUDA context
@@ -314,28 +355,61 @@ class SGDESWorkflow:
                     f"foldseek easy-search failed (rc={result.returncode}): {result.stderr[-500:]}"
                 )
 
-        # ── seqkit grep → file (stdout redirected via ProcessTemplate) ───────
-        @flow.executable_task
+        # ── seqkit grep → writes matching FASTA to output_fasta, returns path ──
+        # Dragon V3's return_value channel does not preserve large strings
+        # (the future resolves to an int instead).  Writing directly to the
+        # caller-supplied output path sidesteps that channel entirely.
+        @flow.function_task
         async def seqkit_grep(task_description=_TD_HOST, **kwargs):
-            """Run seqkit grep; Dragon writes stdout to output_fasta via task_description.
-            kwargs: pattern_file, input_fasta
+            """Run seqkit grep; writes stdout (FASTA) to kwargs['output_fasta'].
+            kwargs: pattern_file, input_fasta, output_fasta
+            Returns the output path so the caller can confirm the file exists.
             """
+            import subprocess as _sp
+
             pattern_file = kwargs["pattern_file"]
-            input_fasta = kwargs["input_fasta"]
+            input_fasta  = kwargs["input_fasta"]
+            output_fasta = kwargs["output_fasta"]
             cmd = f"seqkit grep --pattern-file {pattern_file} {input_fasta}"
             print(f"[seqkit_grep] cmd: {cmd}", flush=True)
-            return cmd
+            result = _sp.run(cmd, shell=True, capture_output=True, text=True)
+            if result.stderr:
+                print(result.stderr, flush=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"seqkit grep failed (rc={result.returncode}): {result.stderr[-500:]}"
+                )
+            with open(output_fasta, "w") as _f:
+                _f.write(result.stdout)
+            return output_fasta
 
-        # ── seqkit stats → returns TSV via stdout ─────────────────────────────
-        @flow.executable_task
+        # ── seqkit stats → writes TSV to temp file, returns path ─────────────
+        # Dragon V3's return_value channel does not preserve large strings
+        # (the future resolves to an int instead).  Writing to a temp file
+        # and returning the path sidesteps that channel entirely.
+        @flow.function_task
         async def seqkit_stats(task_description=_TD_HOST, **kwargs):
-            """Run seqkit stats -a -T; stdout is returned by asyncflow as a string.
+            """Run seqkit stats -a -T; writes TSV to a temp file, returns path.
             kwargs: input_fasta
             """
+            import subprocess as _sp
+            import tempfile as _tf
+
             input_fasta = kwargs["input_fasta"]
             cmd = f"seqkit stats -a -T {input_fasta}"
             print(f"[seqkit_stats] cmd: {cmd}", flush=True)
-            return cmd
+            result = _sp.run(cmd, shell=True, capture_output=True, text=True)
+            if result.stderr:
+                print(result.stderr, flush=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"seqkit stats failed (rc={result.returncode}): {result.stderr[-500:]}"
+                )
+            with _tf.NamedTemporaryFile(
+                mode="w", suffix=".stats.tsv", delete=False
+            ) as _tmp:
+                _tmp.write(result.stdout)
+                return _tmp.name
 
         return types.SimpleNamespace(
             embed=embed,
@@ -654,7 +728,21 @@ class SGDESWorkflow:
                     )
                     logger.info(f"[{mutation}] Fold done ({time.time() - t0:.1f}s)")
 
-                stats_out = await tasks.seqkit_stats(input_fasta=query)
+                # Run seqkit stats directly (not via Dragon) — the Dragon
+                # function_task return-value channel hangs on string results.
+                # seqkit stats is host-pinned, fast (<1 s), and needs no GPU.
+                _stats_proc = await asyncio.create_subprocess_shell(
+                    f"seqkit stats -a -T {query}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _stats_stdout, _stats_stderr = await _stats_proc.communicate()
+                if _stats_proc.returncode != 0:
+                    raise RuntimeError(
+                        f"seqkit stats failed (rc={_stats_proc.returncode}): "
+                        f"{_stats_stderr.decode()[-500:]}"
+                    )
+                stats_out = _stats_stdout.decode()
                 df_stats = pd.read_csv(io.StringIO(stats_out), sep="\t")
                 median = df_stats.Q2.values
                 logger.info(f"[{mutation}] Sequence length median={median[0]}  (from {query})")
@@ -840,13 +928,21 @@ class SGDESWorkflow:
             #     }
             # )
 
-            res = await tasks.seqkit_grep(
-                # task_description=_grep_td,
-                pattern_file=labels_file,
-                input_fasta=cleaned,
+            # Run seqkit grep directly (not via Dragon) for the same reason
+            # as seqkit stats above: the Dragon return-value channel hangs.
+            _grep_proc = await asyncio.create_subprocess_shell(
+                f"seqkit grep --pattern-file {labels_file} {cleaned}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            with open(output_fasta, "w+") as output_file:
-                output_file.write(res)
+            _grep_stdout, _grep_stderr = await _grep_proc.communicate()
+            if _grep_proc.returncode != 0:
+                raise RuntimeError(
+                    f"seqkit grep failed (rc={_grep_proc.returncode}): "
+                    f"{_grep_stderr.decode()[-500:]}"
+                )
+            with open(output_fasta, "w") as _gf:
+                _gf.write(_grep_stdout.decode())
 
             # ── Save per-sequence metrics ──────────────────────────────────────
             tmp_input_df = pd.read_csv(

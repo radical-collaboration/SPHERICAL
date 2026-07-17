@@ -6,7 +6,6 @@ HPC workflow orchestration framework for multi-GPU protein inference and enginee
 
 - **AsyncCampaignManager** — async-native orchestrator for concurrent multi-workflow campaigns with priority scheduling, resource pools, and dependency signalling
 - **Adaptive Optimization Layers** — opt-in, config-driven: quality routing (Sharder), flow control (Backpressure), surrogate-gated Triage (RUN/DISCARD/ADVANCE), and a BudgetController that keeps spend on plan; drift-driven Replanning. Cross-stage scheduling priority is driven by the **ADR agent layer** (rule / bandit / LLM policies), not an in-CM bandit
-- **Structured Campaign Plans** — typed `CampaignPlan`/`StageSpec` schema (`src/campaign/plan/`) alongside the legacy flat config, resolved by a single `load_plan()`
 - **Multi-GPU Inference** — worker pool per GPU with automatic load balancing; aiohttp HTTP server/client
 - **ESM2 Inference Workflow** — standalone or campaign-embedded ESM2-650M embedding service
 - **SGDES Workflow** — Structure-Guided Deep Evolution Solver for iterative protein sequence optimisation
@@ -22,13 +21,6 @@ HPC workflow orchestration framework for multi-GPU protein inference and enginee
 ```
 spherical/
 ├── src/
-│   ├── campaign/                    # AsyncCampaignManager + BaseWorkflow + ResourcePool
-│   │   ├── campaign_manager.py      # core: scheduler/executor/monitor mixins
-│   │   ├── sharder.py · backpressure.py · bandit.py     # quality routing, flow control, Thompson bandit
-│   │   ├── triage.py · surrogate.py · budget_controller.py  # surrogate-gated selective execution
-│   │   ├── replanning.py · monitor.py · candidate_log.py    # drift handling + tracking
-│   │   ├── adr/                     # ADR agent bridge: CampaignView + Operator + rule/bandit/llm policies
-│   │   └── plan/                    # CampaignPlan/StageSpec schema + load_plan()
 │   ├── inference/                   # InferenceService base, orchestrator, server
 │   │   ├── esm2_service/            # ESM2InferenceService + ESM2Client
 │   │   ├── inference_client.py
@@ -57,7 +49,6 @@ spherical/
 │       ├── sgdes_workflow.py
 │       └── config.yaml
 └── tests/
-    ├── test_campaign_manager.py
     ├── test_inference_service.py
     ├── test_client.py
     ├── test_server.py
@@ -169,40 +160,6 @@ sbatch workflows/sgdes/delta_gpu_sbatch.sh
 ```
 
 See [workflows/sgdes/README.md](workflows/sgdes/README.md) for full setup, configuration, and scaling results.
-
----
-
-## Campaign Manager
-
-`AsyncCampaignManager` orchestrates heterogeneous workflow groups inside a single `asyncio` event loop.
-
-### Authoring a workflow
-
-```python
-from src.campaign import BaseWorkflow
-
-class MyWorkflow(BaseWorkflow):
-    workflow_id = "my_wf"
-
-    async def run(self, replica_id: str) -> None:
-        await do_work(self.asyncflow, self.config)
-        await self._signal_done()            # unblock all groups listing this one in `dependencies`
-
-    async def on_replica_done(self, replica_id, cm, final_state):
-        if final_state == "done":
-            await self._trigger_dependent("downstream", replicas=1)   # explicit, count-controlled
-```
-
-### Runner pattern
-
-```python
-cm = AsyncCampaignManager.from_config(config, WORKFLOW_REGISTRY)
-await cm.start()
-await cm.wait()
-await cm.close()
-```
-
-See [src/campaign/README.md](src/campaign/README.md) for full API reference, scheduler details, and a live run trace.
 
 ---
 
