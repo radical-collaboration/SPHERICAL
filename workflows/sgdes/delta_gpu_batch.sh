@@ -5,10 +5,10 @@
 # Account: set SBATCH_ACCOUNT=<project>-delta-gpu before calling sbatch
 
 #SBATCH --partition=gpuA40x4
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=1
 #xSBATCH --exclusive
 #SBATCH --time=00:30:00
 #SBATCH --job-name=sgdes
